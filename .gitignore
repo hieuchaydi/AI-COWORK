@@ -1,0 +1,67 @@
+# secrets
+.env
+google-tokens.json
+google-oauth.json
+
+# logs
+logs/
+
+# Claude Code local session (permission grants, hooks history)
+.claude/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# node
+node_modules/
+
+# venvs (repos have their own too)
+.venv/
+
+# editor
+.vscode/
+.idea/
+*.swp
+
+# telegram MTProto bridge
+bridge/.tg_session*
+bridge/.tg_creds.json
+
+# Chromium persistent user data (cookies + cache from browser tool)
+bridge/.browser_state/
+**/.browser_state/
+
+# upstream repo — full source INCLUDED (private repo), but heavy artifacts out
+# You must rename its nested .git → _git_bak first so git can traverse into it.
+connect-ai/_git_bak/
+connect-ai/.git/
+
+# Python venvs / caches inside upstream (very large)
+connect-ai/.venv/
+**/.venv/
+**/venv/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Node / Vite build cache
+**/node_modules/
+**/.next/
+**/dist/
+**/build/
+
+# Playwright / browser binaries
+**/playwright/driver/
+**/playwright-browsers/
+
+# Openworker runtime
+connect-ai/**/tmp/
+connect-ai/**/*.db
+connect-ai/**/*.sqlite
+
+# transient render outputs / caches
+artifacts/
+outputs/
+memory-store.json

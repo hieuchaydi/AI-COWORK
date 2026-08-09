@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "AI cowork — ingest",
+  "version": "1.0.0",
+  "description": "Lets the local agent collect data through YOUR normal Chrome session, so sites that block automation still work.",
+  "permissions": ["alarms", "storage"],
+  "host_permissions": [
+    "https://shopee.vn/*",
+    "http://127.0.0.1:8766/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "AI cowork — ingest (đang chờ job)" }
+}
