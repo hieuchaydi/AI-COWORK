@@ -56,7 +56,14 @@ class ToolRegistry:
     def get(self, name: str) -> Optional[ToolSpec]:
         return self._tools.get(name)
 
-    def schemas(self) -> list[dict[str, Any]]:
+    def schemas(
+        self, active_names: Optional[set[str] | list[str]] = None
+    ) -> list[dict[str, Any]]:
+        if active_names is not None:
+            names_set = set(active_names)
+            return [
+                spec.schema for name, spec in self._tools.items() if name in names_set
+            ]
         return [spec.schema for spec in self._tools.values()]
 
     def execute(self, name: str, arguments: Optional[dict[str, Any]] = None) -> Any:

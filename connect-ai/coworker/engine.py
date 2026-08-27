@@ -30,7 +30,7 @@ from .providers.errors import (
     classify_model_error,
     friendly_model_error,
 )
-from .tools import ToolRegistry
+from .tools import ToolRegistry, route_tools_for_context
 
 # Quota/rate-limit recovery (connect-AI patch). Running out of quota mid-turn used
 # to end the turn with a red error and a Retry button — on a free Gemini tier that
@@ -148,6 +148,7 @@ class TurnEngine:
         self._exhausted_models: set[str] = set()
         self._quota_waited = 0.0  # seconds this turn spent parked on a limit
         self._quota_attempts = 0
+        self.agent_family: Optional[str] = None
 
     # -- external controls ------------------------------------------------------
     def request_interrupt(self) -> None:
@@ -534,7 +535,12 @@ class TurnEngine:
         thread + queue, so text deltas surface live without blocking the event loop."""
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
-        tools = self.registry.schemas() or None
+        active_names = route_tools_for_context(
+            self.registry,
+            self.messages,
+            agent_family=self.agent_family,
+        )
+        tools = self.registry.schemas(active_names=active_names) or None
         model, messages, settings = (
             self.model,
             self._outbound_messages(),

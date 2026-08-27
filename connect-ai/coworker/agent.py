@@ -378,6 +378,7 @@ def build_engine(
     engine.executor = executor  # type: ignore[attr-defined]
     engine.todo = todo  # type: ignore[attr-defined]
     engine.agent_name = agent.name  # type: ignore[attr-defined]
+    engine.agent_family = agent.family  # type: ignore[attr-defined]
     engine.roots = root_list  # type: ignore[attr-defined]  # shared list; Slice C mutates in place
     engine.audit_context = {
         "session_id": session_id or "",
