@@ -560,17 +560,14 @@ DESCRIPTORS: list[ProviderDescriptor] = [
         env_key="META_API_KEY",
         endpoint_help="Prefilled with the Meta Model API endpoint (public preview, US-only as of 2026-07).",
     ),
-    # Groq — extremely fast inference for Llama/Mixtral. Same OpenAI-compat pattern.
-    # NOTE: the free tier can't run this agent at all. Measured 2026-08-08 on a fresh
-    # on_demand key: llama-3.3-70b-versatile caps at 12k TPM and llama-3.1-8b-instant at
-    # 6k — while one agent turn (persona + tool schemas) is already >14k, so every call
-    # comes back 413 rate_limit_exceeded no matter which model you pick. Short one-shot
-    # chats are fine; agent work needs the Dev tier.
+    # Groq — extremely fast LPU inference. Same OpenAI-compat pattern. Model ids updated
+    # 2026-08-28: llama-3.3/qwen3 deprecated, GPT-OSS series is the current primary.
+    # NOTE: the free tier's TPM caps still make agent turns tight — Dev tier recommended.
     _compat(
         "groq",
         "Groq",
         base_url="https://api.groq.com/openai/v1",
-        recommended_model="llama-3.3-70b-versatile",
+        recommended_model="openai/gpt-oss-120b",
         env_key="GROQ_API_KEY",
     ),
     # Cerebras — wafer-scale inference, very fast. OpenAI-compatible. Free tier gives 65k

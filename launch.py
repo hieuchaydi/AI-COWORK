@@ -119,14 +119,13 @@ API_TOKEN = os.environ.get("CONNECT_AI_API_TOKEN") or os.environ.get(
 )
 API_HOST = "127.0.0.1"
 API_PORT = "8765"
-# Gemini 2.5 Flash — cloud, fast, generous free tier, follows language
+# Gemini 3.7 Flash — cloud, fast, generous free tier, follows language
 # instructions cleanly (Qwen tends to slip into Chinese on ambiguous prompts).
 # Alternatives:
 #   "ollama:qwen2.5:7b"              local, free, no rate limits (but Chinese-biased)
-#   "groq:llama-3.3-70b-versatile"   cloud, very fast, but the free tier's 12k TPM is
-#                                    below one agent turn — every call 413s (2026-08-08)
+#   "groq:openai/gpt-oss-120b"       cloud, very fast, free tier has TPM caps
 #   "cloudflare:@cf/openai/gpt-oss-120b"  free neuron allocation, 128k ctx, real tool calls
-OW_MODEL = "gemini:gemini-3.1-flash-lite"
+OW_MODEL = "gemini:gemini-3.5-flash-lite"
 GUI_PORT = "1420"
 HELPER_PORT = 8766  # tiny sidecar: Google/connectors wizards + outputs/artifacts serving
 
@@ -1498,21 +1497,15 @@ def _seed_runtime_state() -> None:
     # 1. Model picker — everything the user might switch to. Add is idempotent (re-add
     # of an existing id is a no-op inside OpenWorker).
     picker = [
-        "gemini:gemini-2.5-flash",                # DEFAULT — best tool-use / VN language handling
-        "gemini:gemini-3.1-flash-lite",
-        "gemini:gemini-3.1-flash-lite-preview",
-        "gemini:gemini-3.5-flash-lite",
-        "gemini:gemini-2.5-pro",                  # bigger reasoning
-        "gemini:gemini-3.1-pro-preview",          # free-tier quota=0 but visible
-        # groq:llama-3.3-70b-versatile RE-ENABLED (2026-08-09). The 400 (Groq caps `tools`
-        # at 128, we ship ~190) is now handled provider-side — OpenAIProvider trims the
-        # tool list to the cap for api.groq.com (see providers/openai_provider.py). Kept
-        # LAST so quota failover only lands here after the free models. CAVEAT: on the free
-        # tier the 12k TPM limit still 413s a >14k agent turn — needs a Dev-tier key.
-        "groq:llama-3.3-70b-versatile",
-        # ollama:qwen2.5:7b REMOVED from picker — the 7B tier hallucinates tool
-        # calls (writes pseudo Node.js instead of calling save_csv / browser_open),
-        # so users who leave it on end up with fake artifacts and links to nowhere.
+        "gemini:gemini-3.7-flash",                # DEFAULT — newest Flash, GA 2026-08-13
+        "gemini:gemini-3.6-flash",                 # previous gen Flash, GA 2026-07-21
+        "gemini:gemini-3.5-flash-lite",            # cost-efficient, high throughput
+        "gemini:gemini-3.1-pro-preview",           # bigger reasoning
+        # Groq GPT-OSS — replaces llama-3.3-70b-versatile (deprecated 2026-08-16).
+        # Free tier, 128k context, OpenAI-compat. Still subject to TPM caps on free
+        # accounts — Dev-tier key recommended for agent work.
+        "groq:openai/gpt-oss-120b",               # best tool-use on Groq
+        "groq:openai/gpt-oss-20b",                 # lighter, faster fallback
     ]
     # Cerebras — very fast OpenAI-compatible inference. Only seed when the key is present
     # (compat providers fail on first use without a key). gpt-oss-120b = best tool use.
@@ -1553,9 +1546,17 @@ def _seed_runtime_state() -> None:
     for model in picker:
         _ow_post("/v1/settings/models/add", {"model": model})
 
-    # 1b. Hide gemini-3.6-flash (no quota anywhere in the user's tier) + qwen 7B
-    # (produces fake tool calls — see picker comment above).
-    hide = ["gemini:gemini-3.6-flash", "ollama:qwen2.5:7b"]
+    # 1b. Hide deprecated models — Gemini 2.5 (shutdown 2026-10-16), old Groq llama,
+    # and qwen 7B (produces fake tool calls — see picker comment above). Hides clean
+    # up entries seeded by earlier boots that would otherwise poison the failover chain.
+    hide = [
+        "gemini:gemini-2.5-flash",             # deprecated, shutdown 2026-10-16
+        "gemini:gemini-2.5-pro",               # deprecated, shutdown 2026-10-16
+        "gemini:gemini-3.1-flash-lite",        # superseded by 3.5-flash-lite
+        "gemini:gemini-3.1-flash-lite-preview",
+        "groq:llama-3.3-70b-versatile",        # deprecated 2026-08-16
+        "ollama:qwen2.5:7b",
+    ]
     # Cloudflare partner models bill against an AI Gateway balance and 402 while it's
     # empty. Skipping the add is NOT enough: models/add persists, so an entry seeded by
     # an earlier boot (or a hand-run curl) survives forever and keeps poisoning the
@@ -1566,7 +1567,7 @@ def _seed_runtime_state() -> None:
     for model in hide:
         _ow_post("/v1/settings/models/remove", {"model": model})
 
-    # 1c. Pin default model: Claude Haiku > Cloudflare gpt-oss-120b > Gemini 2.5 Flash.
+    # 1c. Pin default model: Claude Haiku > Cloudflare gpt-oss-120b > Gemini 3.7 Flash.
     # Pinned every boot so a fresh chat can't inherit qwen from a stale session (the
     # original cause of "why is my agent writing fake code").
     # gpt-oss-120b sits above Gemini deliberately (2026-08-08): the Gemini free tier here
@@ -1578,7 +1579,7 @@ def _seed_runtime_state() -> None:
     elif "cloudflare:@cf/openai/gpt-oss-120b" in picker:
         default_model = "cloudflare:@cf/openai/gpt-oss-120b"
     else:
-        default_model = "gemini:gemini-2.5-flash"
+        default_model = "gemini:gemini-3.7-flash"
     _ow_post("/v1/settings/default-model", {"model": default_model})
 
     # 1c-bis. Global AGENTS.md. SETUP told the user to copy this into the state dir by

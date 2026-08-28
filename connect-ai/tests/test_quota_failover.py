@@ -70,22 +70,22 @@ def _types(events):
 
 
 def test_quota_fails_over_to_next_model(tmp_path):
-    provider = FlakyProvider({"gemini:gemini-2.5-flash": QUOTA_EXC})
+    provider = FlakyProvider({"gemini:gemini-3.7-flash": QUOTA_EXC})
     engine = _engine(
         tmp_path,
         provider,
-        fallbacks=["gemini:gemini-2.5-flash", "groq:llama-3.3-70b"],
+        fallbacks=["gemini:gemini-3.7-flash", "groq:openai/gpt-oss-120b"],
     )
     events = _collect(engine)
 
     assert EventType.ERROR not in _types(events)
     assert EventType.MODEL_FAILOVER in _types(events)
     failover = next(e for e in events if e.type == EventType.MODEL_FAILOVER)
-    assert failover.data["from"] == "gemini:gemini-2.5-flash"
-    assert failover.data["to"] == "groq:llama-3.3-70b"
+    assert failover.data["from"] == "gemini:gemini-3.7-flash"
+    assert failover.data["to"] == "groq:openai/gpt-oss-120b"
     # The turn finished on the healthy model, and the answer is the real one.
-    assert engine.model == "groq:llama-3.3-70b"
-    assert provider.models_called == ["gemini:gemini-2.5-flash", "groq:llama-3.3-70b"]
+    assert engine.model == "groq:openai/gpt-oss-120b"
+    assert provider.models_called == ["gemini:gemini-3.7-flash", "groq:openai/gpt-oss-120b"]
     assert events[-1].data["status"] == "completed"
 
 

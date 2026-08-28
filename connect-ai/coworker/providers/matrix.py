@@ -72,18 +72,18 @@ MATRIX: dict[str, ModelEntry] = {
         "Claude Haiku 4.5 · Anthropic", _AGENTIC_VISION, 200_000
     ),
     # Gemini 3 (thought signatures required in tool loops — carried via the `_gemini`
-    # message sidecar, see gemini_provider.py; ids from the vendor catalog 2026-07-22).
+    # message sidecar, see gemini_provider.py; ids from the vendor catalog 2026-08-28).
+    "gemini:gemini-3.7-flash": ModelEntry(
+        "Gemini 3.7 Flash · Google", _AGENTIC_VISION, 1_048_576
+    ),
     "gemini:gemini-3.1-pro-preview": ModelEntry(
         "Gemini 3.1 Pro · Google", _AGENTIC_VISION, 1_048_576
     ),
     "gemini:gemini-3.6-flash": ModelEntry(
         "Gemini 3.6 Flash · Google", _AGENTIC_VISION, 1_048_576
     ),
-    "gemini:gemini-2.5-pro": ModelEntry(
-        "Gemini 2.5 Pro · Google", _AGENTIC_VISION, 1_048_576
-    ),
-    "gemini:gemini-2.5-flash": ModelEntry(
-        "Gemini 2.5 Flash · Google", _AGENTIC_VISION, 1_048_576
+    "gemini:gemini-3.5-flash-lite": ModelEntry(
+        "Gemini 3.5 Flash-Lite · Google", _AGENTIC_VISION, 1_048_576
     ),
     # -- direct OpenAI-compatible vendors ----------------------------------------
     # Muse Spark (Meta Model API, public preview 2026-07-09): multimodal + tools via
@@ -163,6 +163,14 @@ MATRIX: dict[str, ModelEntry] = {
     ),
     "cloudflare:google/gemini-3.6-flash": ModelEntry(
         "Gemini 3.6 Flash · via Cloudflare", _AGENTIC, 1_048_576
+    ),
+    # Groq — LPU inference, free tier. Model ids updated 2026-08-28: llama-3.3 deprecated,
+    # GPT-OSS series is the current primary offering. Tool cap 128 handled provider-side.
+    "groq:openai/gpt-oss-120b": ModelEntry(
+        "GPT-OSS 120B · via Groq", _AGENTIC, 128_000
+    ),
+    "groq:openai/gpt-oss-20b": ModelEntry(
+        "GPT-OSS 20B · via Groq", _AGENTIC, 128_000
     ),
     # -- cloud accounts (models running in the user's own AWS/GCP) ----------------
     # Bedrock ids carry a family segment (claude/ → native Anthropic path, other/ →
