@@ -1,0 +1,145 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Browser Control Plane (BCP) Protocol",
+  "version": "1.0.0",
+  "envelopes": {
+    "request": {
+      "type": "object",
+      "required": ["id", "method"],
+      "properties": {
+        "id": { "type": ["string", "integer"] },
+        "method": { "type": "string" },
+        "params": { "type": "object" },
+        "timeoutMs": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "response": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": { "type": ["string", "integer"] },
+        "result": { "type": "object" },
+        "error": {
+          "type": "object",
+          "required": ["kind", "message"],
+          "properties": {
+            "kind": { "type": "string" },
+            "message": { "type": "string" },
+            "retryable": { "type": "boolean" },
+            "details": {}
+          }
+        }
+      }
+    },
+    "event": {
+      "type": "object",
+      "required": ["event"],
+      "properties": {
+        "event": { "type": "string" },
+        "params": { "type": "object" }
+      }
+    }
+  },
+  "errors": {
+    "BAD_REQUEST": { "code": 4000, "retryable": false },
+    "UNAUTHENTICATED": { "code": 4010, "retryable": false },
+    "UNSUPPORTED": { "code": 4050, "retryable": false },
+    "PAYLOAD_TOO_LARGE": { "code": 4130, "retryable": false },
+    "TARGET_NOT_FOUND": { "code": 4041, "retryable": false },
+    "TARGET_CRASHED": { "code": 5001, "retryable": true },
+    "FRAME_DETACHED": { "code": 4042, "retryable": true },
+    "HANDLE_INVALID": { "code": 4002, "retryable": false },
+    "NAVIGATION_ABORTED": { "code": 4091, "retryable": true },
+    "TIMEOUT": { "code": 4080, "retryable": true },
+    "CANCELLED": { "code": 4990, "retryable": false },
+    "JS_EXCEPTION": { "code": 4003, "retryable": false },
+    "ELEMENT_NOT_FOUND": { "code": 4043, "retryable": true },
+    "ELEMENT_NOT_ACTIONABLE": { "code": 4092, "retryable": true },
+    "NETWORK_ERROR": { "code": 5020, "retryable": true },
+    "TRANSPORT_CLOSED": { "code": 5031, "retryable": true },
+    "INTERNAL": { "code": 5000, "retryable": true }
+  },
+  "methods": {
+    "agent.hello": { "params": {}, "result": { "properties": { "version": { "type": "string" } } } },
+    "agent.ping": { "params": {}, "result": {} },
+    "agent.stats": { "params": {}, "result": { "type": "object" } },
+    "agent.shutdown": { "params": {}, "result": {} },
+
+    "target.list": { "params": {}, "result": { "properties": { "targets": { "type": "array" } } } },
+    "target.create": { "params": { "properties": { "url": { "type": "string" }, "incognito": { "type": "boolean" } } }, "result": { "properties": { "targetId": { "type": "string" } } } },
+    "target.activate": { "params": { "properties": { "targetId": { "type": "string" } }, "required": ["targetId"] }, "result": {} },
+    "target.close": { "params": { "properties": { "targetId": { "type": "string" } }, "required": ["targetId"] }, "result": {} },
+
+    "page.navigate": { "params": { "properties": { "targetId": { "type": "string" }, "url": { "type": "string" }, "waitUntil": { "type": "string" }, "referrer": { "type": "string" } }, "required": ["targetId", "url"] }, "result": {} },
+    "page.reload": { "params": {}, "result": {} },
+    "page.goBack": { "params": {}, "result": {} },
+    "page.goForward": { "params": {}, "result": {} },
+    "page.waitForLoadState": { "params": { "properties": { "state": { "type": "string" } }, "required": ["state"] }, "result": {} },
+    "page.content": { "params": { "properties": { "frameId": { "type": "string" } } }, "result": { "properties": { "content": { "type": "string" } } } },
+    "page.screenshot": { "params": { "properties": { "format": { "type": "string" }, "quality": { "type": "integer" }, "fullPage": { "type": "boolean" }, "clip": { "type": "object" } }, "required": ["format"] }, "result": { "properties": { "data": { "type": "string" } } } },
+    "page.setViewport": { "params": { "properties": { "width": { "type": "integer" }, "height": { "type": "integer" }, "dpr": { "type": "number" }, "mobile": { "type": "boolean" } }, "required": ["width", "height"] }, "result": {} },
+    "page.frames": { "params": {}, "result": { "properties": { "frames": { "type": "array" } } } },
+    "page.handleDialog": { "params": { "properties": { "action": { "type": "string" }, "promptText": { "type": "string" } }, "required": ["action"] }, "result": {} },
+    "page.setDownloadBehavior": { "params": { "properties": { "mode": { "type": "string" }, "path": { "type": "string" } }, "required": ["mode"] }, "result": {} },
+
+    "runtime.evaluate": { "params": { "properties": { "frameId": { "type": "string" }, "world": { "type": "string" }, "expression": { "type": "string" }, "awaitPromise": { "type": "boolean" }, "returnByValue": { "type": "boolean" } }, "required": ["expression"] }, "result": { "properties": { "result": {}, "exceptionDetails": {} } } },
+    "runtime.callFunction": { "params": { "properties": { "handleId": { "type": "string" }, "functionDeclaration": { "type": "string" }, "args": { "type": "array" } }, "required": ["handleId", "functionDeclaration"] }, "result": {} },
+    "runtime.releaseHandle": { "params": { "properties": { "handleId": { "type": "string" } }, "required": ["handleId"] }, "result": {} },
+    "runtime.addInitScript": { "params": { "properties": { "source": { "type": "string" }, "world": { "type": "string" } }, "required": ["source"] }, "result": {} },
+
+    "dom.query": { "params": { "properties": { "frameId": { "type": "string" }, "selector": { "type": "string" }, "engine": { "enum": ["css", "xpath", "text"] } }, "required": ["selector", "engine"] }, "result": { "properties": { "handleId": { "type": "string" } } } },
+    "dom.queryAll": { "params": { "properties": { "frameId": { "type": "string" }, "selector": { "type": "string" }, "engine": { "enum": ["css", "xpath", "text"] } }, "required": ["selector", "engine"] }, "result": { "properties": { "handleIds": { "type": "array" } } } },
+    "dom.waitForSelector": { "params": { "properties": { "selector": { "type": "string" }, "state": { "enum": ["attached", "visible", "hidden", "detached"] } }, "required": ["selector", "state"] }, "result": {} },
+    "dom.attributes": { "params": { "properties": { "handleId": { "type": "string" } }, "required": ["handleId"] }, "result": { "properties": { "attributes": { "type": "object" } } } },
+    "dom.text": { "params": { "properties": { "handleId": { "type": "string" } }, "required": ["handleId"] }, "result": { "properties": { "text": { "type": "string" } } } },
+    "dom.html": { "params": { "properties": { "handleId": { "type": "string" } }, "required": ["handleId"] }, "result": { "properties": { "html": { "type": "string" } } } },
+    "dom.boundingBox": { "params": { "properties": { "handleId": { "type": "string" } }, "required": ["handleId"] }, "result": { "properties": { "x": { "type": "number" }, "y": { "type": "number" }, "width": { "type": "number" }, "height": { "type": "number" } } } },
+    "dom.scrollIntoView": { "params": { "properties": { "handleId": { "type": "string" } }, "required": ["handleId"] }, "result": {} },
+    "dom.snapshot": { "params": { "properties": { "frameId": { "type": "string" }, "mode": { "enum": ["flat", "accessibility"] }, "maxNodes": { "type": "integer" } }, "required": ["mode"] }, "result": { "properties": { "nodes": { "type": "array" } } } },
+
+    "input.click": { "params": { "properties": { "handleId": { "type": "string" }, "point": { "type": "object" }, "button": { "type": "string" }, "clickCount": { "type": "integer" }, "modifiers": { "type": "array" } } }, "result": {} },
+    "input.hover": { "params": { "properties": { "handleId": { "type": "string" }, "point": { "type": "object" } } }, "result": {} },
+    "input.type": { "params": { "properties": { "text": { "type": "string" }, "delayMs": { "type": "integer" } }, "required": ["text"] }, "result": {} },
+    "input.press": { "params": { "properties": { "key": { "type": "string" }, "code": { "type": "string" }, "modifiers": { "type": "array" } } }, "result": {} },
+    "input.scroll": { "params": { "properties": { "dx": { "type": "number" }, "dy": { "type": "number" }, "point": { "type": "object" } }, "required": ["dx", "dy"] }, "result": {} },
+    "input.dragAndDrop": { "params": { "properties": { "from": { "type": "object" }, "to": { "type": "object" } }, "required": ["from", "to"] }, "result": {} },
+    "input.uploadFiles": { "params": { "properties": { "handleId": { "type": "string" }, "paths": { "type": "array" } }, "required": ["handleId", "paths"] }, "result": {} },
+
+    "network.enable": { "params": { "properties": { "captureBodies": { "enum": ["none", "text", "all"] }, "maxBodyBytes": { "type": "integer" } }, "required": ["captureBodies"] }, "result": {} },
+    "network.disable": { "params": {}, "result": {} },
+    "network.getBody": { "params": { "properties": { "requestId": { "type": "string" } }, "required": ["requestId"] }, "result": { "properties": { "body": { "type": "string" }, "base64Encoded": { "type": "boolean" } } } },
+    "network.setInterception": { "params": { "properties": { "patterns": { "type": "array" } }, "required": ["patterns"] }, "result": {} },
+    "network.continue": { "params": { "properties": { "requestId": { "type": "string" } }, "required": ["requestId"] }, "result": {} },
+    "network.fulfill": { "params": { "properties": { "requestId": { "type": "string" } }, "required": ["requestId"] }, "result": {} },
+    "network.abort": { "params": { "properties": { "requestId": { "type": "string" } }, "required": ["requestId"] }, "result": {} },
+
+    "storage.getCookies": { "params": { "properties": { "urls": { "type": "array" } } }, "result": { "properties": { "cookies": { "type": "array" } } } },
+    "storage.setCookies": { "params": { "properties": { "cookies": { "type": "array" } }, "required": ["cookies"] }, "result": {} },
+    "storage.clearCookies": { "params": {}, "result": {} },
+    "storage.getLocal": { "params": { "properties": { "frameId": { "type": "string" } } }, "result": { "properties": { "data": { "type": "object" } } } },
+    "storage.setLocal": { "params": { "properties": { "data": { "type": "object" } }, "required": ["data"] }, "result": {} },
+    "storage.getSession": { "params": {}, "result": { "properties": { "data": { "type": "object" } } } },
+    "storage.exportState": { "params": {}, "result": { "properties": { "state": { "type": "object" } } } },
+    "storage.importState": { "params": { "properties": { "state": { "type": "object" } }, "required": ["state"] }, "result": {} }
+  },
+  "events": {
+    "target.created": { "params": {} },
+    "target.destroyed": { "params": {} },
+    "target.crashed": { "params": {} },
+    "page.lifecycle": { "params": { "properties": { "phase": { "type": "string" } }, "required": ["phase"] } },
+    "page.frameAttached": { "params": {} },
+    "page.frameNavigated": { "params": {} },
+    "page.frameDetached": { "params": {} },
+    "page.dialog": { "params": { "properties": { "type": { "type": "string" }, "message": { "type": "string" } }, "required": ["type", "message"] } },
+    "page.download": { "params": { "properties": { "suggestedFilename": { "type": "string" }, "url": { "type": "string" }, "state": { "type": "string" } }, "required": ["suggestedFilename", "url", "state"] } },
+    "page.console": { "params": { "properties": { "level": { "type": "string" }, "text": { "type": "string" }, "args": { "type": "array" } }, "required": ["level", "text"] } },
+    "page.pageError": { "params": { "properties": { "message": { "type": "string" }, "stack": { "type": "string" } }, "required": ["message"] } },
+    "runtime.contextCreated": { "params": {} },
+    "runtime.contextDestroyed": { "params": {} },
+    "network.request": { "params": {} },
+    "network.response": { "params": {} },
+    "network.finished": { "params": {} },
+    "network.failed": { "params": {} },
+    "agent.eventsDropped": { "params": { "properties": { "count": { "type": "integer" }, "sinceSeq": { "type": "integer" } }, "required": ["count", "sinceSeq"] } }
+  }
+}

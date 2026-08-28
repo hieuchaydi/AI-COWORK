@@ -1,0 +1,9 @@
+{
+    "url": "https://vnexpress.net/test-article-photo-123457.html",
+    "title": "Test Article Photo",
+    "lead": "This is a photo lead.",
+    "published_at": "2023-01-02T10:00:00+07:00",
+    "body_html": "<article class=\"fck_detail\">\n<p class=\"Normal\">Content of photo article.</p>\n<figure class=\"tplCaption\"><img src=\"photo.jpg\"/></figure>\n<p class=\"Normal\"><strong>Author Two</strong></p>\n</article>",
+    "body_text": "Content of photo article.\nAuthor Two",
+    "authors": "Author Two"
+}

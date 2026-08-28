@@ -1,0 +1,9 @@
+{
+    "url": "https://vnexpress.net/test-article-standard-123456.html",
+    "title": "Test Article Standard",
+    "lead": "This is a standard lead.",
+    "published_at": "2023-01-01T10:00:00+07:00",
+    "body_html": "<article class=\"fck_detail\">\n<p class=\"Normal\">Content of standard article.</p>\n<p class=\"Normal\"><strong>Author One</strong></p>\n</article>",
+    "body_text": "Content of standard article.\nAuthor One",
+    "authors": "Author One"
+}

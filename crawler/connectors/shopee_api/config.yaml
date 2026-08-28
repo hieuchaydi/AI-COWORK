@@ -1,0 +1,23 @@
+source_id: shopee_api
+access_class: api
+authorization_ref: "docs/shopee-api-authorization.md"
+enabled: true
+user_agent: "ShopOwnerBot/1.0 (+https://example.com/bot)"
+politeness:
+  max_concurrency_per_host: 1
+  min_interval_ms: 1000
+  respect_crawl_delay: true
+  max_retries: 3
+  timeout_seconds: 30.0
+api:
+  base_url: "https://partner.shopeemobile.com"
+  # Sandbox: https://partner.test-stable.shopeemobile.com
+  partner_id: ${SHOPEE_PARTNER_ID}
+  partner_key: ${SHOPEE_PARTNER_KEY}
+  # [VERIFY exact endpoint versions against current Open Platform docs]
+fetch:
+  default_rung: 0  # API (Rung 0 = structured API)
+sink:
+  table: articles
+  on_conflict: upsert_by_dedup_key
+  version_on_content_change: true

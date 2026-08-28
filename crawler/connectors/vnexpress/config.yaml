@@ -1,0 +1,36 @@
+source_id: vnexpress
+access_class: public
+enabled: true
+user_agent: "AcmeBot/1.0 (+https://acme.example/bot)"
+politeness:
+  max_concurrency_per_host: 1
+  min_interval_ms: 1000
+  respect_crawl_delay: true
+  timeout_seconds: 30.0
+discovery:
+  - kind: rss
+    urls:
+      - "https://vnexpress.net/rss/tin-moi-nhat.rss"
+      - "https://vnexpress.net/rss/the-gioi.rss"
+      - "https://vnexpress.net/rss/thoi-su.rss"
+    interval: "5m"
+  - kind: sitemap_index
+    url: "https://vnexpress.net/sitemap.xml"
+    interval: "30m"
+    incremental_by: lastmod
+fetch:
+  default_rung: 1
+  overrides:
+    - url_pattern: "^https://vnexpress\\.net/interactive/"
+      rung: 4
+      justification_doc: "connectors/vnexpress/why-browser.md"
+identity:
+  id_regex: "-(\\d{6,9})\\.html$"
+  dedup_key: "match:1"
+extract:
+  record: Article
+  rules_file: "crawler/connectors/vnexpress/article.rules.yaml"
+sink:
+  table: articles
+  on_conflict: upsert_by_dedup_key
+  version_on_content_change: true

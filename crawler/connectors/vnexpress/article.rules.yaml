@@ -1,0 +1,31 @@
+rules:
+  title:
+    fallback_chain:
+      - jsonld: NewsArticle.headline
+      - meta: og:title
+      - css: "h1.title-detail"
+  lead:
+    fallback_chain:
+      - meta: og:description
+      - css: "p.description"
+  published_at:
+    fallback_chain:
+      - jsonld: NewsArticle.datePublished
+      - meta: "article:published_time"
+      - css: "span.date"
+    parse: vn_datetime
+  body_html:
+    css: "article.fck_detail"
+    html: true
+    remove:
+      - "script"
+      - "style"
+      - ".box-tinlienquan"
+      - "figure.tplCaption > figcaption"
+      - ".box-comment"
+  body_text:
+    css: "article.fck_detail"
+    text: true
+  authors:
+    css: "p.Normal strong"
+    text: true
