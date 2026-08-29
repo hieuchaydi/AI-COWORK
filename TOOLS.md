@@ -161,6 +161,62 @@ Endpoint của job queue:
 
 ---
 
+## Dynamic Tools — agent tự viết và gọi tool mới
+
+Không cần deploy hay restart. Agent sinh code Python, đăng ký qua helper, gọi ngay trong cùng turn.
+
+**Luồng hoạt động:**
+
+```
+1. Agent viết hàm Python run(args) → dict
+2. web_fetch /tools/register?name=…&desc=…&code=<url-encoded>
+3. web_fetch /tools/call?name=…&args={"key":"value"}
+4. Helper chạy code trong subprocess riêng (timeout 30s), trả JSON
+```
+
+**Endpoints (tất cả GET — web_fetch được):**
+
+| Endpoint | Việc |
+|---|---|
+| `GET /tools/list` | Liệt kê tools đã đăng ký (name, desc, số dòng, thời gian) |
+| `GET /tools/register?name=N&desc=D&code=C` | Đăng ký tool mới (code phải URL-encode) |
+| `GET /tools/call?name=N&args={...}&timeout=30` | Gọi tool, args là JSON URL-encoded |
+| `GET /tools/delete?name=N` | Xoá tool khỏi registry + disk |
+
+**Quy tắc viết code:**
+- Code **phải** định nghĩa hàm `run(args: dict) -> dict`
+- Có thể `import` bất kỳ thư viện nào đã cài trong venv
+- Trả về `dict` — helper serialize thành JSON cho agent đọc
+- Timeout mặc định 30s, tối đa 120s (truyền `&timeout=60`)
+- Tool **persist** sang `outputs/dynamic_tools/` — sống qua restart
+
+**Ví dụ — tool đọc tỷ giá USD/VND:**
+
+```python
+import urllib.request, json
+
+def run(args: dict) -> dict:
+    url = "https://open.er-api.com/v6/latest/USD"
+    with urllib.request.urlopen(url, timeout=10) as r:
+        data = json.loads(r.read())
+    vnd = data["rates"].get("VND", "N/A")
+    return {"usd_to_vnd": vnd, "updated": data.get("time_last_update_utc")}
+```
+
+```
+# Đăng ký (code phải urllib.parse.quote)
+web_fetch("http://127.0.0.1:8766/tools/register?name=usd_vnd&desc=Tỷ+giá+USD/VND&code=<encoded>")
+
+# Gọi ngay
+web_fetch("http://127.0.0.1:8766/tools/call?name=usd_vnd&args={}")
+```
+
+> **Lưu ý bảo mật**: Code chạy trong subprocess Python riêng biệt với timeout —
+> cùng quyền với process launcher, không bị sandbox OS. Dùng cho internal tools,
+> không expose ra internet.
+
+---
+
 ## MCP bridges
 
 ### `telegram-bot` — 91 tool
