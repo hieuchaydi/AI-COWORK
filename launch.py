@@ -732,6 +732,13 @@ class _HelperHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        # /ping — keepalive for the browser extension's MV3 service worker.
+        # The extension pings this every 20 s while a job is running to prevent Chrome
+        # from killing the idle worker (MV3 workers are terminated when no fetch is pending).
+        if self.path.split("?", 1)[0] == "/ping":
+            self._json(200, {"ok": True})
+            return
+
         # /ingest/job?url=… — the agent queues work here. GET, not POST, purely because
         # the agent's only HTTP tool is web_fetch and web_fetch cannot POST.
         if self.path.split("?", 1)[0] == "/ingest/job":

@@ -14,6 +14,16 @@ const PAGE_SIZE = 50;
 const MAX_REVIEWS = 3000;
 const PACE_MS = 700; // between pages — a burst is what gets a session flagged
 
+// ── FIX A: keepalive ──────────────────────────────────────────────────────────
+// MV3 service workers are killed when idle (no pending fetch). We keep the worker
+// alive during a long job by pinging /ping every 20 s. The interval is cleared in
+// the finally block, so a crash still lets Chrome eventually GC the worker.
+function startKeepalive() {
+  return setInterval(() => {
+    fetch(`${HELPER}/ping`).catch(() => {});
+  }, 20_000);
+}
+
 function idsFrom(url) {
   const u = new URL(url);
   // Explicit ids in the query string — the agent sometimes queues API-style urls like
@@ -190,8 +200,11 @@ async function collectReviews(url) {
     return { itemid, rows };
   } catch (bgErr) {
     console.warn("[ingest] background fetch failed:", bgErr.message);
-    // 403/429 = Shopee blocks the background context → fall back to tab
-    if (!/403|429|Shopee error/.test(bgErr.message)) throw bgErr;
+    // ── FIX B: mở rộng fallback condition ──────────────────────────────
+    // Trước đây chỉ catch 403|429|Shopee error — thiếu các lỗi network/worker
+    // bị kill (TypeError, Failed to fetch, NetworkError, v.v.)
+    // Giờ: fallback về tab với MỌI lỗi để tránh bỏ sót.
+    console.log("[ingest] falling back to tab (any error triggers fallback)");
   }
 
   // ── Try 2: open a real tab on shopee.vn and fetch from page context ─
@@ -230,10 +243,15 @@ async function _fetchRatingsBackground(shopid, itemid) {
   return rows;
 }
 
-// Tab fetch — opens a real shopee.vn tab and runs the paginated fetch loop
-// INSIDE the page context (world: MAIN). The script re-reads shopid/itemid from
-// the loaded page — this is critical because Shopee may redirect the URL, making
-// the pre-resolved IDs wrong. Mirrors the approach in launch.py's bookmarklet.
+// ── FIX C: Tab fetch với inject + polling thay vì async executeScript ─────────
+//
+// VẤN ĐỀ CŨ: chrome.scripting.executeScript với `func: async () => { ... }` KHÔNG
+// await async function — nó chỉ nhận Promise object (unresolved), không phải giá trị
+// thực → data luôn là undefined → tab đóng ngay, không lấy được review nào.
+//
+// CÁCH FIX: inject một script đồng bộ vào page, script đó tự khởi động async crawl
+// và ghi kết quả vào window.__ingestResult. Background poll window.__ingestResult
+// mỗi 2 giây cho đến khi có data hoặc timeout.
 async function _fetchRatingsViaTab(fallbackShopid, fallbackItemid, productUrl) {
   const tab = await chrome.tabs.create({ url: productUrl, active: false });
   const tabId = tab.id;
@@ -257,74 +275,139 @@ async function _fetchRatingsViaTab(fallbackShopid, fallbackItemid, productUrl) {
     // Give CSR time to hydrate — reviews won't be in the DOM without this.
     await new Promise((s) => setTimeout(s, 3000));
 
-    const results = await chrome.scripting.executeScript({
+    // ── Step 1: inject script khởi động crawl (không dùng async func) ──
+    // Inject một IIFE đồng bộ vào page. IIFE đó kick-off async crawl ngầm
+    // và ghi kết quả vào window.__ingestResult khi xong.
+    await chrome.scripting.executeScript({
       target: { tabId },
       world: "MAIN",
       args: [fallbackShopid, fallbackItemid],
-      func: async (fbShopid, fbItemid) => {
-        // ── Step 1: extract shopid + itemid from the LOADED page ──────
-        let shopid, itemid;
+      func: (fbShopid, fbItemid) => {
+        // Reset trạng thái cho lần chạy này
+        window.__ingestResult = undefined;  // undefined = chưa xong; null = lỗi
 
-        // Try URL patterns (after any redirect)
-        let m = location.pathname.match(/\/product\/(\d+)\/(\d+)/);
-        if (m) { shopid = m[1]; itemid = m[2]; }
-        if (!shopid || !itemid) {
-          m = location.href.match(/i\.(\d+)\.(\d+)/);
+        // Kick-off async crawl — KHÔNG await ở đây (executeScript không đợi được)
+        (function startCrawl() {
+          // ── Extract shopid + itemid từ page đã load ──────────────────
+          let shopid, itemid;
+          let m = location.pathname.match(/\/product\/(\d+)\/(\d+)/);
           if (m) { shopid = m[1]; itemid = m[2]; }
-        }
-        // Try embedded JSON in the rendered HTML
-        if (!shopid || !itemid) {
-          const html = document.documentElement.innerHTML;
-          shopid = shopid || (html.match(/"shopid"\s*:\s*"?(\d+)/) || [])[1];
-          itemid = itemid || (html.match(/"itemid"\s*:\s*"?(\d+)/) || [])[1];
-        }
-        // Last resort: use the values the extension pre-resolved
-        shopid = shopid || fbShopid;
-        itemid = itemid || fbItemid;
-
-        if (!shopid || !itemid)
-          return { error: "no shopid/itemid on page: " + location.href };
-
-        // ── Step 2: paginate the ratings API (same-origin, no headers) ─
-        const rows = [];
-        for (let offset = 0; offset < 3000; offset += 50) {
-          const r = await fetch(
-            `/api/v2/item/get_ratings?itemid=${itemid}&shopid=${shopid}` +
-              `&type=0&filter=0&limit=50&offset=${offset}`
-          );
-          if (!r.ok)
-            return { error: `HTTP ${r.status} at offset ${offset}`, shopid, itemid };
-          const j = await r.json();
-          if (j && j.error)
-            return { error: `Shopee error ${j.error}`, shopid, itemid };
-          const batch = (j.data && j.data.ratings) || [];
-          for (const x of batch) {
-            rows.push({
-              user: x.author_username || "",
-              sao: x.rating_star,
-              noi_dung: (x.comment || "").replace(/\s+/g, " ").trim(),
-              thoi_gian: new Date((x.ctime || 0) * 1000)
-                .toISOString()
-                .slice(0, 19)
-                .replace("T", " "),
-              phan_loai: (x.product_items || [])
-                .map((p) => p.model_name)
-                .filter(Boolean)
-                .join("|"),
-              so_anh: (x.images || []).length,
-              huu_ich: x.like_count || 0,
-            });
+          if (!shopid || !itemid) {
+            m = location.href.match(/i\.(\d+)\.(\d+)/);
+            if (m) { shopid = m[1]; itemid = m[2]; }
           }
-          if (batch.length < 50) break;
-          await new Promise((s) => setTimeout(s, 700));
-        }
-        return { shopid, itemid, rows };
+          if (!shopid || !itemid) {
+            const html = document.documentElement.innerHTML;
+            shopid = shopid || (html.match(/"shopid"\s*:\s*"?(\d+)/) || [])[1];
+            itemid = itemid || (html.match(/"itemid"\s*:\s*"?(\d+)/) || [])[1];
+          }
+          shopid = shopid || fbShopid;
+          itemid = itemid || fbItemid;
+
+          if (!shopid || !itemid) {
+            window.__ingestResult = { error: "no shopid/itemid on page: " + location.href };
+            return;
+          }
+
+          // ── Paginate ratings API ─────────────────────────────────────
+          const rows = [];
+          let offset = 0;
+          const PAGE = 50;
+          const MAX = 3000;
+          const PACE = 700;
+
+          function fetchPage() {
+            fetch(
+              `/api/v2/item/get_ratings?itemid=${itemid}&shopid=${shopid}` +
+                `&type=0&filter=0&limit=${PAGE}&offset=${offset}`
+            )
+              .then((r) => {
+                if (!r.ok) {
+                  window.__ingestResult = { error: `HTTP ${r.status} at offset ${offset}`, shopid, itemid };
+                  return;
+                }
+                return r.json();
+              })
+              .then((j) => {
+                if (!j) return; // error already set above
+                if (j && j.error) {
+                  window.__ingestResult = { error: `Shopee error ${j.error}`, shopid, itemid };
+                  return;
+                }
+                const batch = (j.data && j.data.ratings) || [];
+                for (const x of batch) {
+                  rows.push({
+                    user: x.author_username || "",
+                    sao: x.rating_star,
+                    noi_dung: (x.comment || "").replace(/\s+/g, " ").trim(),
+                    thoi_gian: new Date((x.ctime || 0) * 1000)
+                      .toISOString().slice(0, 19).replace("T", " "),
+                    phan_loai: (x.product_items || [])
+                      .map((p) => p.model_name).filter(Boolean).join("|"),
+                    so_anh: (x.images || []).length,
+                    huu_ich: x.like_count || 0,
+                  });
+                }
+                offset += PAGE;
+                if (batch.length < PAGE || offset >= MAX) {
+                  // Done — publish result
+                  window.__ingestResult = { shopid, itemid, rows };
+                } else {
+                  // Next page after pace delay
+                  setTimeout(fetchPage, PACE);
+                }
+              })
+              .catch((e) => {
+                window.__ingestResult = { error: String(e.message || e), shopid, itemid };
+              });
+          }
+
+          fetchPage();
+        })();
       },
     });
 
-    const data = results && results[0] && results[0].result;
+    // ── Step 2: poll window.__ingestResult mỗi 2s, timeout 180s ────────
+    // 180s = 3000 reviews / 50 per page * 700ms + buffer ≈ 42s thực tế,
+    // 180s là safety net cho mạng chậm.
+    const POLL_INTERVAL = 2000;
+    const POLL_TIMEOUT = 180_000;
+    const pollStart = Date.now();
+
+    let data = null;
+    while (true) {
+      await new Promise((s) => setTimeout(s, POLL_INTERVAL));
+
+      if (Date.now() - pollStart > POLL_TIMEOUT) {
+        throw new Error("tab-based fetch timed out after 180s");
+      }
+
+      let pollResult;
+      try {
+        const pr = await chrome.scripting.executeScript({
+          target: { tabId },
+          world: "MAIN",
+          func: () => window.__ingestResult,
+        });
+        pollResult = pr && pr[0] && pr[0].result;
+      } catch (e) {
+        // Tab may have navigated away or been closed — treat as error
+        throw new Error("tab poll failed: " + e.message);
+      }
+
+      if (pollResult === undefined || pollResult === null) {
+        // Still running — log progress if rows are counting up
+        console.log("[ingest] tab crawl in progress, polling…");
+        continue;
+      }
+
+      data = pollResult;
+      break;
+    }
+
     if (!data) throw new Error("tab script returned no data");
     if (data.error) throw new Error(data.error);
+
     console.log(
       "[ingest] tab fetch got", data.rows.length,
       "reviews (shopid:", data.shopid, "itemid:", data.itemid, ")"
@@ -351,6 +434,13 @@ async function report(job, body) {
 async function runJob(job) {
   console.log("[ingest] ▶ starting job", job.id, "→", job.url);
   setBadge("...", "#1a73e8");
+
+  // ── FIX A: keepalive để MV3 service worker không bị Chrome kill ──────
+  // Khi job đang chạy (tab load + paginate = 30–120s), không có request nào
+  // pending → Chrome kill worker → tab bị đóng đột ngột. Ping /ping mỗi
+  // 20s giữ worker sống suốt quá trình. Cleared trong finally block.
+  const keepalive = startKeepalive();
+
   try {
     const { itemid, rows } = await collectReviews(job.url);
     await report(job, { itemid, rows });
@@ -360,6 +450,8 @@ async function runJob(job) {
     console.error("[ingest] ✘ job", job.id, "failed:", e.message);
     await report(job, { error: String(e.message || e) });
     setBadge("err", "#d93025");
+  } finally {
+    clearInterval(keepalive);
   }
   setTimeout(() => setBadge(""), 20000);
 }
