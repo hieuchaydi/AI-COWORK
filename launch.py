@@ -145,6 +145,87 @@ _INGEST_JOB_EVENT = threading.Event()
 # guessing when to look for the file (and can see the error when a job fails).
 _INGEST_RESULTS: dict[str, dict] = {}
 
+# ── Dynamic Tool Registry ─────────────────────────────────────────────────────
+# Agent tự viết tool mới qua GET /tools/register?name=…&desc=…&code=…
+# Tool được persist sang disk (outputs/dynamic_tools/) và load lại khi khởi động.
+# Mỗi lần gọi /tools/call chạy code trong subprocess Python riêng (timeout 30s).
+_DYNAMIC_TOOLS: dict[str, dict] = {}   # name → {name, description, code, registered_at}
+_DYNAMIC_TOOLS_LOCK = threading.Lock()
+
+
+def _dynamic_tools_dir() -> Path:
+    d = _outputs_root() / "dynamic_tools"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _persist_tool(tool: dict) -> None:
+    """Ghi tool ra disk dưới dạng JSON để survive restart."""
+    try:
+        p = _dynamic_tools_dir() / f"{tool['name']}.json"
+        p.write_text(json.dumps(tool, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as e:
+        print(f"[dynamic_tools] warn: cannot persist {tool['name']}: {e}", file=sys.stderr)
+
+
+def _load_persisted_tools() -> None:
+    """Load tất cả tool đã được lưu từ lần chạy trước."""
+    d = _dynamic_tools_dir()
+    count = 0
+    for p in d.glob("*.json"):
+        try:
+            tool = json.loads(p.read_text(encoding="utf-8"))
+            if tool.get("name") and tool.get("code"):
+                with _DYNAMIC_TOOLS_LOCK:
+                    _DYNAMIC_TOOLS[tool["name"]] = tool
+                count += 1
+        except Exception as e:  # noqa: BLE001
+            print(f"[dynamic_tools] warn: skip {p.name}: {e}", file=sys.stderr)
+    if count:
+        print(f"[dynamic_tools] loaded {count} tool(s) from disk", file=sys.stderr)
+
+
+def _run_tool_in_sandbox(code: str, args: dict, timeout: int = 30) -> dict:
+    """Chạy code trong subprocess Python riêng biệt.
+
+    code phải định nghĩa hàm ``run(args: dict) -> dict``.
+    Trả về {"ok": True, "result": ...} hoặc {"ok": False, "error": "..."}.
+    """
+    runner_script = (
+        "import sys, json, traceback\n"
+        "args = json.loads(sys.argv[1])\n"
+        "try:\n"
+        + "\n".join("    " + line for line in code.splitlines())
+        + "\n"
+        "    result = run(args)\n"
+        "    print(json.dumps({'ok': True, 'result': result}))\n"
+        "except Exception as e:\n"
+        "    print(json.dumps({'ok': False, 'error': traceback.format_exc()}))\n"
+    )
+    try:
+        proc = subprocess.run(
+            [str(VENV_PY), "-c", runner_script, json.dumps(args)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+        )
+        stdout = proc.stdout.strip()
+        if not stdout:
+            stderr_snippet = proc.stderr.strip()[:500] if proc.stderr else "(no output)"
+            return {"ok": False, "error": f"tool produced no output. stderr: {stderr_snippet}"}
+        return json.loads(stdout)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"tool timed out after {timeout}s"}
+    except json.JSONDecodeError as e:
+        return {"ok": False, "error": f"tool output is not valid JSON: {e}"}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+
+
+# Load persisted tools ngay khi module import (helper đang khởi động)
+_load_persisted_tools()
+
 
 def _queue_ingest_job(url: str, kind: str) -> dict:
     job = {
@@ -739,9 +820,120 @@ class _HelperHandler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True})
             return
 
+        # ── Dynamic Tools ─────────────────────────────────────────────────────
+        # Agent tự viết tool Python mới, đăng ký, và gọi ngay trong turn hiện tại.
+        # Tất cả đều dùng GET vì web_fetch của agent không POST được.
+        #
+        # /tools/list                   → liệt kê tools đã đăng ký
+        # /tools/register?name=…&desc=…&code=…  → đăng ký tool mới
+        # /tools/call?name=…&args=…     → gọi tool (args là JSON URL-encoded)
+
+        if self.path.split("?", 1)[0] == "/tools/list":
+            with _DYNAMIC_TOOLS_LOCK:
+                tools_info = [
+                    {
+                        "name": t["name"],
+                        "description": t.get("description", ""),
+                        "registered_at": t.get("registered_at", ""),
+                        "code_lines": len(t.get("code", "").splitlines()),
+                    }
+                    for t in _DYNAMIC_TOOLS.values()
+                ]
+            self._json(200, {"ok": True, "tools": tools_info, "count": len(tools_info)})
+            return
+
+        if self.path.split("?", 1)[0] == "/tools/register":
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            name = (qs.get("name", [""])[0] or "").strip()
+            desc = (qs.get("desc", [""])[0] or "").strip()
+            code = urllib.parse.unquote_plus(qs.get("code", [""])[0] or "")
+            if not name:
+                self._json(400, {"ok": False, "error": "name is required"})
+                return
+            if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", name):
+                self._json(400, {"ok": False, "error": "name must be a valid Python identifier"})
+                return
+            if not code.strip():
+                self._json(400, {"ok": False, "error": "code is required"})
+                return
+            # Validate: code phải định nghĩa hàm run(args)
+            if "def run(" not in code and "def run (" not in code:
+                self._json(400, {
+                    "ok": False,
+                    "error": "code must define a function named run(args: dict) -> dict",
+                    "hint": "Example:\ndef run(args: dict) -> dict:\n    return {'result': args.get('x', 0) * 2}",
+                })
+                return
+            tool = {
+                "name": name,
+                "description": desc,
+                "code": code,
+                "registered_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            with _DYNAMIC_TOOLS_LOCK:
+                _DYNAMIC_TOOLS[name] = tool
+            _persist_tool(tool)
+            print(f"[dynamic_tools] registered tool: {name}", file=sys.stderr)
+            self._json(200, {
+                "ok": True,
+                "tool": name,
+                "note": f"Tool '{name}' registered. Call it via GET /tools/call?name={name}&args={{...}}",
+            })
+            return
+
+        if self.path.split("?", 1)[0] == "/tools/call":
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            name = (qs.get("name", [""])[0] or "").strip()
+            args_raw = urllib.parse.unquote_plus(qs.get("args", ["{}"])[0] or "{}")
+            timeout_raw = (qs.get("timeout", ["30"])[0] or "30").strip()
+            if not name:
+                self._json(400, {"ok": False, "error": "name is required"})
+                return
+            with _DYNAMIC_TOOLS_LOCK:
+                tool = _DYNAMIC_TOOLS.get(name)
+            if not tool:
+                self._json(404, {
+                    "ok": False,
+                    "error": f"tool '{name}' not found",
+                    "available": list(_DYNAMIC_TOOLS.keys()),
+                })
+                return
+            try:
+                args = json.loads(args_raw)
+            except json.JSONDecodeError as e:
+                self._json(400, {"ok": False, "error": f"args must be valid JSON: {e}"})
+                return
+            try:
+                timeout = max(1, min(int(timeout_raw), 120))
+            except ValueError:
+                timeout = 30
+            print(f"[dynamic_tools] calling tool: {name} args={args_raw[:200]}", file=sys.stderr)
+            result = _run_tool_in_sandbox(tool["code"], args, timeout)
+            self._json(200 if result.get("ok") else 500, result)
+            return
+
+        # /tools/delete?name=… — xoá tool khỏi registry + disk
+        if self.path.split("?", 1)[0] == "/tools/delete":
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            name = (qs.get("name", [""])[0] or "").strip()
+            if not name:
+                self._json(400, {"ok": False, "error": "name is required"})
+                return
+            with _DYNAMIC_TOOLS_LOCK:
+                removed = _DYNAMIC_TOOLS.pop(name, None)
+            if removed:
+                p = _dynamic_tools_dir() / f"{name}.json"
+                p.unlink(missing_ok=True)
+                print(f"[dynamic_tools] deleted tool: {name}", file=sys.stderr)
+                self._json(200, {"ok": True, "deleted": name})
+            else:
+                self._json(404, {"ok": False, "error": f"tool '{name}' not found"})
+            return
+
         # /ingest/job?url=… — the agent queues work here. GET, not POST, purely because
         # the agent's only HTTP tool is web_fetch and web_fetch cannot POST.
         if self.path.split("?", 1)[0] == "/ingest/job":
+
             qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
             url = (qs.get("url", [""])[0] or "").strip()
             kind = (qs.get("kind", ["shopee-reviews"])[0] or "shopee-reviews").strip()
