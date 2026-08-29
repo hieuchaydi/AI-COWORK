@@ -73,7 +73,7 @@ def check():
         print(f"\n{len(violations)} violation(s) found. Fix before merging.")
         return 1
     else:
-        print("✓ No CDP symbol leaks detected outside allowed folders.")
+        print("OK: No CDP symbol leaks detected outside allowed folders.")
         return 0
 
 

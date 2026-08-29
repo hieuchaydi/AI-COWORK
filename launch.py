@@ -1862,6 +1862,15 @@ def _seed_mcp_servers() -> None:
             "enabled": True,
             "requires_approval": False,
         },
+        # Dynamic tool registry — agent tự viết Python tool, đăng ký, gọi ngay.
+        # Expose 4 MCP tools: register_tool / call_tool / list_tools / delete_tool.
+        # Tool persist sang outputs/dynamic_tools/ và load lại mỗi boot.
+        "dynamic-tools": {
+            "command": venv_py,
+            "args": [str(ROOT / "bridge" / "dynamic_tools_mcp.py")],
+            "enabled": True,
+            "requires_approval": False,
+        },
         # Slash commands (commands/*.md) — parameterized prompt templates.
         "commands": {
             "command": venv_py,
@@ -2259,11 +2268,11 @@ def main() -> None:
 
     # Verify all seeded MCPs actually landed. Retry seed once if the sidecar
     # was still finishing internal setup during the first POST batch.
-    if not _verify_mcp_seed(expected_min=6):
+    if not _verify_mcp_seed(expected_min=7):
         print("[launch] MCP seed incomplete — retrying once...", file=sys.stderr)
         time.sleep(2)
         _seed_runtime_state()
-        _verify_mcp_seed(expected_min=6, log_final=True)
+        _verify_mcp_seed(expected_min=7, log_final=True)
 
     # Kick off the Google token refresher if the user has stored a refresh
     # token. Runs as a daemon so it dies with the launcher — no leak.

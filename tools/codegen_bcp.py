@@ -43,12 +43,17 @@ def gen_types(schema: dict) -> str:
         class_base = method_name.replace(".", "_").replace("-", "_")
 
         # Params class
-        params = method_def.get("params", {})
-        if params:
-            lines.append(f"class {class_base.title().replace('_', '')}Params(BaseModel):")
-            for field_name, field_def in params.items():
+        params_schema = method_def.get("params") or {}
+        params_props = params_schema.get("properties", {}) if isinstance(params_schema, dict) else {}
+        params_required = set(params_schema.get("required", [])) if isinstance(params_schema, dict) else set()
+        if params_props:
+            cls_name = class_base.replace("_", " ").title().replace(" ", "") + "Params"
+            lines.append(f"class {cls_name}(BaseModel):")
+            for field_name, field_def in params_props.items():
+                if not isinstance(field_def, dict):
+                    field_def = {}
                 field_type = _py_type(field_def)
-                required = field_def.get("required", True)
+                required = field_name in params_required
                 if required:
                     lines.append(f"    {snake(field_name)}: {field_type}")
                 else:
@@ -56,16 +61,16 @@ def gen_types(schema: dict) -> str:
             lines.append("")
 
         # Result class
-        result = method_def.get("result", {})
-        if result:
-            lines.append(f"class {class_base.title().replace('_', '')}Result(BaseModel):")
-            for field_name, field_def in result.items():
+        result_schema = method_def.get("result") or {}
+        result_props = result_schema.get("properties", {}) if isinstance(result_schema, dict) else {}
+        if result_props:
+            cls_name = class_base.replace("_", " ").title().replace(" ", "") + "Result"
+            lines.append(f"class {cls_name}(BaseModel):")
+            for field_name, field_def in result_props.items():
+                if not isinstance(field_def, dict):
+                    field_def = {}
                 field_type = _py_type(field_def)
-                required = field_def.get("required", True)
-                if required:
-                    lines.append(f"    {snake(field_name)}: {field_type}")
-                else:
-                    lines.append(f"    {snake(field_name)}: Optional[{field_type}] = None")
+                lines.append(f"    {snake(field_name)}: Optional[{field_type}] = None")
             lines.append("")
 
     return "\n".join(lines)
