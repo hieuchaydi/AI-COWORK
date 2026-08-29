@@ -144,6 +144,8 @@ _INGEST_JOB_EVENT = threading.Event()
 # job id → what /ingest received for it, so the agent can block on completion instead of
 # guessing when to look for the file (and can see the error when a job fails).
 _INGEST_RESULTS: dict[str, dict] = {}
+_INGEST_PROGRESS: dict[str, dict] = {}
+_INGEST_PROGRESS_LOCK = threading.Lock()
 
 # ── Dynamic Tool Registry ─────────────────────────────────────────────────────
 # Agent tự viết tool mới qua GET /tools/register?name=…&desc=…&code=…
@@ -236,9 +238,34 @@ def _queue_ingest_job(url: str, kind: str) -> dict:
     }
     with _INGEST_JOBS_LOCK:
         _INGEST_JOBS.append(job)
+    _update_ingest_progress(
+        job["id"],
+        {
+            "status": "queued",
+            "stage": "queued",
+            "message": "Đã xếp job, chờ Chrome extension nhận",
+            "percent": 0,
+            "rows": 0,
+            "kind": kind,
+            "url": url,
+        },
+    )
     _INGEST_JOB_EVENT.set()
     print(f"[ingest] job queued: {kind} {url}", file=sys.stderr)
     return job
+
+
+def _update_ingest_progress(job_id: str, patch: dict) -> dict | None:
+    if not job_id:
+        return None
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    with _INGEST_PROGRESS_LOCK:
+        current = dict(_INGEST_PROGRESS.get(job_id) or {})
+        current.update({k: v for k, v in patch.items() if v is not None})
+        current["job"] = job_id
+        current["updated_at"] = now
+        _INGEST_PROGRESS[job_id] = current
+        return dict(current)
 
 
 def _claim_ingest_jobs(wait_seconds: float) -> list[dict]:
@@ -296,6 +323,189 @@ def _write_ingest_csv(json_name: str, rows: list) -> str | None:
     return f"outputs/csv/{target.name}"
 
 
+_SHOPEE_REVIEW_COLUMNS = [
+    "thoi_gian",
+    "sao",
+    "noi_dung",
+    "phan_loai",
+    "user",
+    "huu_ich",
+    "anh",
+    "so_anh",
+    "anh_urls",
+    "image_files",
+    "video",
+    "so_video",
+    "video_urls",
+    "video_files",
+    "media_urls",
+    "media_files",
+    "media_dir",
+    "media_errors",
+]
+
+
+def _split_ingest_urls(value: object) -> list[str]:
+    if isinstance(value, list):
+        raw = value
+    else:
+        raw = str(value or "").replace("\n", "|").split("|")
+    urls: list[str] = []
+    for item in raw:
+        text = str(item or "").strip()
+        if text and text not in urls:
+            urls.append(text)
+    return urls
+
+
+def _review_sort_time(row: dict) -> float:
+    value = row.get("thoi_gian") or row.get("time") or row.get("ctime")
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return time.mktime(time.strptime(text[:19], fmt))
+        except ValueError:
+            pass
+    return 0.0
+
+
+def _safe_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _ordered_shopee_review_row(row: dict) -> dict:
+    ordered: dict = {}
+    for key in _SHOPEE_REVIEW_COLUMNS:
+        if key in row:
+            ordered[key] = row.get(key, "")
+    for key, value in row.items():
+        if key not in ordered:
+            ordered[key] = value
+    return ordered
+
+
+def _is_allowed_ingest_media_url(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = (parsed.hostname or "").lower()
+    return "shopee" in host or host.endswith("susercontent.com")
+
+
+def _media_extension(url: str, content_type: str = "") -> str:
+    suffix = Path(urllib.parse.urlparse(url).path).suffix.lower()
+    if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".mov", ".m4v", ".webm"}:
+        return suffix
+    ctype = content_type.lower().split(";", 1)[0].strip()
+    return {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+        "video/mp4": ".mp4",
+        "video/webm": ".webm",
+        "video/quicktime": ".mov",
+    }.get(ctype, ".bin")
+
+
+def _download_ingest_media(url: str, target_without_ext: Path) -> str:
+    if not _is_allowed_ingest_media_url(url):
+        raise ValueError("blocked media host")
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://shopee.vn/",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        ext = _media_extension(url, resp.headers.get("Content-Type", ""))
+        target = target_without_ext.with_suffix(ext)
+        with target.open("wb") as fh:
+            shutil.copyfileobj(resp, fh, length=1024 * 1024)
+    return f"outputs/{target.relative_to(_outputs_root()).as_posix()}"
+
+
+def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tuple[list, str | None]:
+    if not rows or not all(isinstance(r, dict) for r in rows):
+        return rows, None
+
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", name[:-5] if name.endswith(".json") else name).strip("._")
+    if not stem:
+        stem = "shopee_reviews"
+    media_root = _outputs_root() / "shopee_reviews" / stem / "media"
+
+    sorted_rows = sorted(
+        (dict(r) for r in rows),
+        key=lambda r: (
+            _review_sort_time(r),
+            _safe_int(r.get("huu_ich")),
+            _safe_int(r.get("so_video")),
+            _safe_int(r.get("so_anh")),
+        ),
+        reverse=True,
+    )
+
+    media_total = sum(
+        len(_split_ingest_urls(r.get("anh_urls") or r.get("image_urls")))
+        + len(_split_ingest_urls(r.get("video_urls")))
+        for r in sorted_rows
+    )
+    media_saved = 0
+    media_dir_rel = None
+
+    for idx, row in enumerate(sorted_rows, start=1):
+        image_files: list[str] = []
+        video_files: list[str] = []
+        errors: list[str] = []
+        for kind, urls, bucket in (
+            ("image", _split_ingest_urls(row.get("anh_urls") or row.get("image_urls")), image_files),
+            ("video", _split_ingest_urls(row.get("video_urls")), video_files),
+        ):
+            for media_idx, url in enumerate(urls, start=1):
+                media_root.mkdir(parents=True, exist_ok=True)
+                base = media_root / f"review_{idx:05d}_{kind}_{media_idx:02d}"
+                try:
+                    rel = _download_ingest_media(url, base)
+                    bucket.append(rel)
+                    media_saved += 1
+                    media_dir_rel = media_root.relative_to(_outputs_root()).as_posix()
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{kind}:{url}:{exc}")
+                if job_id:
+                    _update_ingest_progress(
+                        job_id,
+                        {
+                            "status": "saving",
+                            "stage": "media",
+                            "message": f"Đang tải media {media_saved}/{media_total}",
+                            "media_saved": media_saved,
+                            "media_total": media_total,
+                            "percent": 99 if media_total else 98,
+                        },
+                    )
+        if image_files:
+            row["image_files"] = "|".join(image_files)
+        if video_files:
+            row["video_files"] = "|".join(video_files)
+        media_files = image_files + video_files
+        if media_files:
+            row["media_files"] = "|".join(media_files)
+            row["media_dir"] = f"outputs/{media_dir_rel}" if media_dir_rel else ""
+        if errors:
+            row["media_errors"] = " || ".join(errors[:10])
+
+    return [_ordered_shopee_review_row(r) for r in sorted_rows], media_dir_rel
+
+
 # The bookmarklet body. Runs in the user's ORDINARY Chrome — no Playwright, no CDP,
 # nothing for an anti-bot to fingerprint: it is the page's own JS calling the page's
 # own API with the page's own cookies. Pages the data out, POSTs it to /ingest, and
@@ -327,21 +537,45 @@ _INGEST_BOOKMARKLET_JS = r"""
     if (!shopid || !itemid)
       return finish('Khong doc duoc shopid/itemid tu ' + location.pathname
         + ' — mo trang san pham roi bam lai', 15000);
+    const mediaUrl = (value) => {
+      if (!value) return '';
+      if (typeof value === 'object')
+        value = value.url || value.video_url || value.play_url || value.cover || value.image_id || value.id || '';
+      value = String(value || '').trim();
+      if (!value) return '';
+      if (value.startsWith('//')) return 'https:' + value;
+      if (/^https?:\/\//i.test(value)) return value;
+      return 'https://down-vn.img.susercontent.com/file/' + value;
+    };
+    const asList = value => Array.isArray(value) ? value : (value ? [value] : []);
     const rows = [];
-    for (let off = 0; off < 3000; off += 50) {
+    for (let off = 0; off < 20000; off += 50) {
       say('Dang lay... ' + rows.length + ' danh gia');
       const r = await fetch('/api/v2/item/get_ratings?itemid=' + itemid + '&shopid=' + shopid
         + '&type=0&filter=0&limit=50&offset=' + off, { headers: { 'x-requested-with': 'XMLHttpRequest' } });
       if (!r.ok) { say('HTTP ' + r.status + ' — dung lai o ' + rows.length); break; }
       const j = await r.json();
       const batch = (j.data && j.data.ratings) || [];
-      for (const x of batch) rows.push({
+      for (const x of batch) {
+        const images = asList(x.images).map(mediaUrl).filter(Boolean);
+        const videos = asList(x.videos || x.video).map(mediaUrl).filter(Boolean);
+        const media = images.concat(videos);
+        rows.push({
         user: x.author_username || '',
         sao: x.rating_star,
         noi_dung: (x.comment || '').replace(/\s+/g, ' ').trim(),
         thoi_gian: new Date((x.ctime || 0) * 1000).toISOString().slice(0, 19).replace('T', ' '),
-        phan_loai: (x.product_items || []).map(p => p.model_name).join('|')
+        phan_loai: (x.product_items || []).map(p => p.model_name).join('|'),
+        anh: images.length ? 1 : 0,
+        so_anh: images.length,
+        anh_urls: images.join('|'),
+        video: videos.length ? 1 : 0,
+        so_video: videos.length,
+        video_urls: videos.join('|'),
+        media_urls: media.join('|'),
+        huu_ich: x.like_count || 0
       });
+      }
       if (batch.length < 50) break;
       await new Promise(s => setTimeout(s, 700));
     }
@@ -393,7 +627,9 @@ nhập. Không có cờ nào bật lên để né được.</p>
 </ol>
 <p>Xong. Từ giờ chỉ cần bảo agent <em>"cào đánh giá &lt;link&gt;"</em> — nó xếp job, extension
 chạy bằng phiên Chrome của bạn, CSV tự về. Bạn không phải bấm gì.</p>
-<p class="hint">Số trên icon extension là số đánh giá đã lấy được. Xanh lá = xong, đỏ = lỗi.</p>
+<p class="hint">Số trên icon extension là số đánh giá đã lấy được. Xanh lá = xong, đỏ = lỗi.
+Agent/UI có thể đọc tiến trình qua <code>/ingest/result?id=&lt;job id&gt;</code> hoặc
+<code>/ingest/progress?id=&lt;job id&gt;</code>.</p>
 
 <h2>Cách 2 — bookmarklet (không cài gì, bấm tay mỗi lần)</h2>
 <p><a class="bm" href="__BOOKMARKLET__">Cào đánh giá Shopee</a></p>
@@ -967,7 +1203,17 @@ class _HelperHandler(BaseHTTPRequestHandler):
             qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
             job_id = (qs.get("id", [""])[0] or "").strip()
             done = _INGEST_RESULTS.get(job_id)
-            self._json(200, {"ok": bool(done), "result": done})
+            progress = _INGEST_PROGRESS.get(job_id)
+            self._json(200, {"ok": bool(done), "result": done, "progress": progress})
+            return
+
+        # /ingest/progress?id=… — lightweight status for UIs and agents while a
+        # browser/extension job is still running.
+        if self.path.split("?", 1)[0] == "/ingest/progress":
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            job_id = (qs.get("id", [""])[0] or "").strip()
+            progress = _INGEST_PROGRESS.get(job_id)
+            self._json(200, {"ok": bool(progress), "progress": progress})
             return
 
         # /ingest — the bookmarklet + a receipt list. GET is the help page; the
@@ -1311,7 +1557,18 @@ class _HelperHandler(BaseHTTPRequestHandler):
             # would poll /ingest/result forever waiting for a run that already died.
             if isinstance(body, dict) and body.get("error"):
                 if job_id:
-                    _INGEST_RESULTS[job_id] = {"ok": False, "error": str(body["error"])[:500]}
+                    result = {"ok": False, "error": str(body["error"])[:500]}
+                    _INGEST_RESULTS[job_id] = result
+                    _update_ingest_progress(
+                        job_id,
+                        {
+                            "status": "error",
+                            "stage": "failed",
+                            "message": result["error"],
+                            "error": result["error"],
+                            "percent": 100,
+                        },
+                    )
                 _reply(200, {"ok": True, "recorded": "error"})
                 return
             rows = body.get("rows") if isinstance(body, dict) else body
@@ -1325,13 +1582,30 @@ class _HelperHandler(BaseHTTPRequestHandler):
                 name = "ingest_" + time.strftime("%Y%m%d_%H%M%S")
             if not name.endswith(".json"):
                 name += ".json"
+            source = (body.get("source") if isinstance(body, dict) else None)
+            source_text = str(source or "")
+            media_dir = None
+            if name.lower().startswith("shopee_") or "shopee.vn" in source_text.lower():
+                if job_id:
+                    _update_ingest_progress(
+                        job_id,
+                        {
+                            "status": "saving",
+                            "stage": "organize",
+                            "message": f"Đang sắp xếp {len(rows)} review và chuẩn bị tải media",
+                            "rows": len(rows),
+                            "percent": 98,
+                        },
+                    )
+                rows, media_dir = _prepare_shopee_review_rows(name, rows, job_id)
             inbox = _outputs_root() / "inbox"
             inbox.mkdir(parents=True, exist_ok=True)
             target = inbox / name
             payload = {
                 "received_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "source": (body.get("source") if isinstance(body, dict) else None),
+                "source": source,
                 "count": len(rows),
+                "media_dir": f"outputs/{media_dir}" if media_dir else None,
                 "rows": rows,
             }
             try:
@@ -1354,10 +1628,36 @@ class _HelperHandler(BaseHTTPRequestHandler):
                 "path": f"outputs/inbox/{name}",
                 "url": f"/outputs/inbox/{name}",
                 "csv": csv_rel,
+                "media_dir": f"outputs/{media_dir}" if media_dir else None,
             }
             if job_id:
                 _INGEST_RESULTS[job_id] = result
+                _update_ingest_progress(
+                    job_id,
+                    {
+                        "status": "done",
+                        "stage": "saved",
+                        "message": f"Đã lưu {len(rows)} dòng",
+                        "rows": len(rows),
+                        "count": len(rows),
+                        "path": result["path"],
+                        "csv": csv_rel,
+                        "media_dir": result.get("media_dir"),
+                        "percent": 100,
+                    },
+                )
             _reply(200, result)
+            return
+
+        if path_only == "/ingest/progress":
+            body = _read_json()
+            job_id = (body.get("job") if isinstance(body, dict) else "") or ""
+            if not job_id:
+                _reply(400, {"ok": False, "error": "job is required"})
+                return
+            patch = body.get("progress") if isinstance(body.get("progress"), dict) else body
+            progress = _update_ingest_progress(job_id, patch)
+            _reply(200, {"ok": True, "progress": progress})
             return
 
         if path_only == "/google/refresh":

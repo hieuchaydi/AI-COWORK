@@ -11,8 +11,21 @@
 
 const HELPER = "http://127.0.0.1:8766";
 const PAGE_SIZE = 50;
-const MAX_REVIEWS = 3000;
+const MAX_REVIEWS = 20000; // emergency cap; normal completion is batch < PAGE_SIZE.
 const PACE_MS = 700; // between pages — a burst is what gets a session flagged
+
+async function reportProgress(job, progress) {
+  if (!job || !job.id) return;
+  try {
+    await fetch(`${HELPER}/ingest/progress`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job: job.id, progress }),
+    });
+  } catch (e) {
+    console.warn("[ingest] progress report failed:", e.message);
+  }
+}
 
 // ── FIX A: keepalive ──────────────────────────────────────────────────────────
 // MV3 service workers are killed when idle (no pending fetch). We keep the worker
@@ -22,6 +35,60 @@ function startKeepalive() {
   return setInterval(() => {
     fetch(`${HELPER}/ping`).catch(() => {});
   }, 20_000);
+}
+
+function mediaUrl(value, kind = "image") {
+  if (!value) return "";
+  if (typeof value === "object") {
+    value = value.url || value.video_url || value.play_url || value.cover || value.image_id || value.id || "";
+  }
+  value = String(value || "").trim();
+  if (!value) return "";
+  if (value.startsWith("//")) return "https:" + value;
+  if (/^https?:\/\//i.test(value)) return value;
+  const base = kind === "video" ? "https://down-vn.img.susercontent.com/file/" : "https://down-vn.img.susercontent.com/file/";
+  return base + value;
+}
+
+function asList(value) {
+  if (Array.isArray(value)) return value;
+  return value ? [value] : [];
+}
+
+function normaliseRating(x) {
+  const imageUrls = asList(x.images).map((v) => mediaUrl(v, "image")).filter(Boolean);
+  const videoUrls = asList(x.videos || x.video)
+    .map((v) => mediaUrl(v, "video"))
+    .filter(Boolean);
+  const mediaUrls = [...imageUrls, ...videoUrls];
+  return {
+    user: x.author_username || "",
+    sao: x.rating_star,
+    noi_dung: (x.comment || "").replace(/\s+/g, " ").trim(),
+    thoi_gian: new Date((x.ctime || 0) * 1000).toISOString().slice(0, 19).replace("T", " "),
+    phan_loai: (x.product_items || []).map((p) => p.model_name).filter(Boolean).join("|"),
+    anh: imageUrls.length ? 1 : 0,
+    so_anh: imageUrls.length,
+    anh_urls: imageUrls.join("|"),
+    video: videoUrls.length ? 1 : 0,
+    so_video: videoUrls.length,
+    video_urls: videoUrls.join("|"),
+    media_urls: mediaUrls.join("|"),
+    huu_ich: x.like_count || 0,
+  };
+}
+
+function ratingTotal(j) {
+  const data = j && j.data;
+  const summary = data && (data.item_rating_summary || data.product_rating_summary || data.rating_summary);
+  const total = data && (data.total || data.count || (summary && (summary.rating_total || summary.total_count || summary.count)));
+  const n = Number(total);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function crawlPercent(rows, total, base, span) {
+  if (total) return Math.min(95, base + Math.floor((Math.min(rows, total) / total) * span));
+  return Math.min(95, base + Math.floor((rows / MAX_REVIEWS) * span));
 }
 
 function idsFrom(url) {
@@ -41,8 +108,9 @@ function idsFrom(url) {
   return any ? { shopid: null, itemid: any[1] } : {};
 }
 
-async function resolveShopId(itemid, originalUrl) {
+async function resolveShopId(itemid, originalUrl, progress) {
   console.log("[ingest] resolveShopId: item", itemid, "url", originalUrl);
+  if (progress) await progress({ stage: "resolve-shop", message: "Đang tìm shopid", itemid, percent: 10 });
 
   // ── helper: pull shopid out of any string blob ──────────────────────
   function scrape(text) {
@@ -66,7 +134,10 @@ async function resolveShopId(itemid, originalUrl) {
       if (j && j.data) {
         const d = j.data.item || j.data;
         const sid = d && (d.shop_id || d.shopid);
-        if (sid) return String(sid);
+        if (sid) {
+          if (progress) await progress({ stage: "resolve-shop", message: "Đã tìm shopid qua PDP API", shopid: String(sid), percent: 18 });
+          return String(sid);
+        }
       }
       if (j && j.error) console.warn("[ingest] pdp error:", j.error);
     } catch (e) {
@@ -91,12 +162,14 @@ async function resolveShopId(itemid, originalUrl) {
       const rm = r.url.match(/i\.(\d+)\.(\d+)/);
       if (rm && rm[2] === itemid) {
         console.log("[ingest] shopid from redirect:", rm[1]);
+        if (progress) await progress({ stage: "resolve-shop", message: "Đã tìm shopid qua redirect", shopid: rm[1], percent: 18 });
         return rm[1];
       }
       const html = await r.text();
       const sid = scrape(html);
       if (sid) {
         console.log("[ingest] shopid from HTML:", sid);
+        if (progress) await progress({ stage: "resolve-shop", message: "Đã tìm shopid trong HTML", shopid: sid, percent: 18 });
         return sid;
       }
       console.warn("[ingest] no shopid in HTML of", r.url);
@@ -117,7 +190,10 @@ async function resolveShopId(itemid, originalUrl) {
       j ? JSON.stringify(j).slice(0, 500) : "(parse failed)");
     const d = j && (j.item || (j.data && j.data));
     const sid = d && (d.shopid || d.shop_id);
-    if (sid) return String(sid);
+    if (sid) {
+      if (progress) await progress({ stage: "resolve-shop", message: "Đã tìm shopid qua item API", shopid: String(sid), percent: 18 });
+      return String(sid);
+    }
   } catch (e) {
     console.warn("[ingest] item/get error:", e.message);
   }
@@ -173,6 +249,7 @@ async function resolveShopId(itemid, originalUrl) {
     const sid = results && results[0] && results[0].result;
     if (sid) {
       console.log("[ingest] shopid from tab:", sid);
+      if (progress) await progress({ stage: "resolve-shop", message: "Đã tìm shopid bằng tab thật", shopid: String(sid), percent: 18 });
       chrome.tabs.remove(tabId).catch(() => {});
       return String(sid);
     }
@@ -186,20 +263,23 @@ async function resolveShopId(itemid, originalUrl) {
   return null;
 }
 
-async function collectReviews(url) {
+async function collectReviews(url, progress) {
   console.log("[ingest] collectReviews:", url);
   let { shopid, itemid } = idsFrom(url);
   console.log("[ingest] parsed ids → shopid:", shopid, "itemid:", itemid);
   if (!itemid) throw new Error("không đọc được itemid từ " + url);
-  if (!shopid) shopid = await resolveShopId(itemid, url);
+  if (progress) await progress({ stage: "parse-url", message: "Đã đọc itemid từ URL", itemid, shopid, percent: shopid ? 18 : 8 });
+  if (!shopid) shopid = await resolveShopId(itemid, url, progress);
   if (!shopid) throw new Error("không đọc được shopid cho item " + itemid);
+  if (progress) await progress({ stage: "fetch-background", message: "Đang lấy review bằng background fetch", itemid, shopid, percent: 20 });
 
   // ── Try 1: fetch ratings from the background service worker ─────────
   try {
-    const rows = await _fetchRatingsBackground(shopid, itemid);
+    const rows = await _fetchRatingsBackground(shopid, itemid, progress);
     return { itemid, rows };
   } catch (bgErr) {
     console.warn("[ingest] background fetch failed:", bgErr.message);
+    if (progress) await progress({ stage: "fallback-tab", message: "Background fetch lỗi, chuyển qua tab thật: " + bgErr.message, itemid, shopid, percent: 25 });
     // ── FIX B: mở rộng fallback condition ──────────────────────────────
     // Trước đây chỉ catch 403|429|Shopee error — thiếu các lỗi network/worker
     // bị kill (TypeError, Failed to fetch, NetworkError, v.v.)
@@ -209,12 +289,13 @@ async function collectReviews(url) {
 
   // ── Try 2: open a real tab on shopee.vn and fetch from page context ─
   console.log("[ingest] falling back to tab-based ratings fetch…");
-  return await _fetchRatingsViaTab(shopid, itemid, url);
+  return await _fetchRatingsViaTab(shopid, itemid, url, progress);
 }
 
 // Background fetch — fast when Shopee trusts the service-worker origin.
-async function _fetchRatingsBackground(shopid, itemid) {
+async function _fetchRatingsBackground(shopid, itemid, progress) {
   const rows = [];
+  let total = null;
   for (let offset = 0; offset < MAX_REVIEWS; offset += PAGE_SIZE) {
     const r = await fetch(
       `https://shopee.vn/api/v2/item/get_ratings?itemid=${itemid}&shopid=${shopid}` +
@@ -224,19 +305,26 @@ async function _fetchRatingsBackground(shopid, itemid) {
     if (!r.ok) throw new Error(`HTTP ${r.status} ở offset ${offset}`);
     const j = await r.json();
     if (j && j.error) throw new Error(`Shopee error ${j.error} (is_login=${j.is_login})`);
+    total = total || ratingTotal(j);
     const batch = (j.data && j.data.ratings) || [];
     for (const x of batch) {
-      rows.push({
-        user: x.author_username || "",
-        sao: x.rating_star,
-        noi_dung: (x.comment || "").replace(/\s+/g, " ").trim(),
-        thoi_gian: new Date((x.ctime || 0) * 1000).toISOString().slice(0, 19).replace("T", " "),
-        phan_loai: (x.product_items || []).map((p) => p.model_name).filter(Boolean).join("|"),
-        so_anh: (x.images || []).length,
-        huu_ich: x.like_count || 0,
-      });
+      rows.push(normaliseRating(x));
     }
     setBadge(String(rows.length));
+    if (progress) {
+      const percent = crawlPercent(rows.length, total, 25, 70);
+      await progress({
+        status: "running",
+        stage: "fetch-background",
+        message: `Đã lấy ${rows.length} review`,
+        rows: rows.length,
+        total,
+        offset,
+        itemid,
+        shopid,
+        percent,
+      });
+    }
     if (batch.length < PAGE_SIZE) break;
     await new Promise((s) => setTimeout(s, PACE_MS));
   }
@@ -252,9 +340,10 @@ async function _fetchRatingsBackground(shopid, itemid) {
 // CÁCH FIX: inject một script đồng bộ vào page, script đó tự khởi động async crawl
 // và ghi kết quả vào window.__ingestResult. Background poll window.__ingestResult
 // mỗi 2 giây cho đến khi có data hoặc timeout.
-async function _fetchRatingsViaTab(fallbackShopid, fallbackItemid, productUrl) {
-  const tab = await chrome.tabs.create({ url: productUrl, active: false });
+async function _fetchRatingsViaTab(fallbackShopid, fallbackItemid, productUrl, progress) {
+  const tab = await chrome.tabs.create({ url: productUrl, active: true });
   const tabId = tab.id;
+  if (progress) await progress({ status: "running", stage: "tab-opened", message: "Đã mở tab Chrome thật để crawl", tabId, percent: 30 });
 
   try {
     // Wait for the tab to finish loading
@@ -273,6 +362,7 @@ async function _fetchRatingsViaTab(fallbackShopid, fallbackItemid, productUrl) {
       ),
     ]);
     // Give CSR time to hydrate — reviews won't be in the DOM without this.
+    if (progress) await progress({ status: "running", stage: "tab-loaded", message: "Tab đã load, chờ hydrate dữ liệu", tabId, percent: 35 });
     await new Promise((s) => setTimeout(s, 3000));
 
     // ── Step 1: inject script khởi động crawl (không dùng async func) ──
@@ -285,6 +375,22 @@ async function _fetchRatingsViaTab(fallbackShopid, fallbackItemid, productUrl) {
       func: (fbShopid, fbItemid) => {
         // Reset trạng thái cho lần chạy này
         window.__ingestResult = undefined;  // undefined = chưa xong; null = lỗi
+        window.__ingestProgress = { rows: 0, offset: 0, shopid: fbShopid, itemid: fbItemid };
+
+        let box = document.getElementById("__aiCoworkIngestProgress");
+        if (!box) {
+          box = document.createElement("div");
+          box.id = "__aiCoworkIngestProgress";
+          box.style.cssText = "position:fixed;z-index:2147483647;right:16px;bottom:16px;"
+            + "max-width:360px;background:#111827;color:#f9fafb;font:13px system-ui;"
+            + "padding:12px 14px;border-radius:8px;box-shadow:0 12px 28px rgba(0,0,0,.35);"
+            + "border:1px solid rgba(255,255,255,.12)";
+          document.documentElement.appendChild(box);
+        }
+        const say = (text) => {
+          box.textContent = text;
+        };
+        say("AI cowork: bắt đầu crawl review...");
 
         // Kick-off async crawl — KHÔNG await ở đây (executeScript không đợi được)
         (function startCrawl() {
@@ -306,15 +412,68 @@ async function _fetchRatingsViaTab(fallbackShopid, fallbackItemid, productUrl) {
 
           if (!shopid || !itemid) {
             window.__ingestResult = { error: "no shopid/itemid on page: " + location.href };
+            say("AI cowork: lỗi đọc shopid/itemid");
             return;
           }
+          say(`AI cowork: đang lấy review cho item ${itemid}`);
 
           // ── Paginate ratings API ─────────────────────────────────────
           const rows = [];
           let offset = 0;
           const PAGE = 50;
-          const MAX = 3000;
+          const MAX = 20000;
           const PACE = 700;
+          let total = null;
+
+          function mediaUrl(value, kind = "image") {
+            if (!value) return "";
+            if (typeof value === "object") {
+              value = value.url || value.video_url || value.play_url || value.cover || value.image_id || value.id || "";
+            }
+            value = String(value || "").trim();
+            if (!value) return "";
+            if (value.startsWith("//")) return "https:" + value;
+            if (/^https?:\/\//i.test(value)) return value;
+            return "https://down-vn.img.susercontent.com/file/" + value;
+          }
+
+          function asList(value) {
+            if (Array.isArray(value)) return value;
+            return value ? [value] : [];
+          }
+
+          function normaliseRating(x) {
+            const imageUrls = asList(x.images).map((v) => mediaUrl(v, "image")).filter(Boolean);
+            const videoUrls = asList(x.videos || x.video)
+              .map((v) => mediaUrl(v, "video"))
+              .filter(Boolean);
+            const mediaUrls = [...imageUrls, ...videoUrls];
+            return {
+              user: x.author_username || "",
+              sao: x.rating_star,
+              noi_dung: (x.comment || "").replace(/\s+/g, " ").trim(),
+              thoi_gian: new Date((x.ctime || 0) * 1000)
+                .toISOString().slice(0, 19).replace("T", " "),
+              phan_loai: (x.product_items || [])
+                .map((p) => p.model_name).filter(Boolean).join("|"),
+              anh: imageUrls.length ? 1 : 0,
+              so_anh: imageUrls.length,
+              anh_urls: imageUrls.join("|"),
+              video: videoUrls.length ? 1 : 0,
+              so_video: videoUrls.length,
+              video_urls: videoUrls.join("|"),
+              media_urls: mediaUrls.join("|"),
+              huu_ich: x.like_count || 0,
+            };
+          }
+
+          function ratingTotal(j) {
+            const data = j && j.data;
+            const summary = data && (data.item_rating_summary || data.product_rating_summary || data.rating_summary);
+            const value = data && (data.total || data.count || (summary && (summary.rating_total || summary.total_count || summary.count)));
+            const n = Number(value);
+            return Number.isFinite(n) && n > 0 ? n : null;
+          }
 
           function fetchPage() {
             fetch(
@@ -324,6 +483,7 @@ async function _fetchRatingsViaTab(fallbackShopid, fallbackItemid, productUrl) {
               .then((r) => {
                 if (!r.ok) {
                   window.__ingestResult = { error: `HTTP ${r.status} at offset ${offset}`, shopid, itemid };
+                  say(`AI cowork: lỗi HTTP ${r.status} tại offset ${offset}`);
                   return;
                 }
                 return r.json();
@@ -332,26 +492,21 @@ async function _fetchRatingsViaTab(fallbackShopid, fallbackItemid, productUrl) {
                 if (!j) return; // error already set above
                 if (j && j.error) {
                   window.__ingestResult = { error: `Shopee error ${j.error}`, shopid, itemid };
+                  say(`AI cowork: Shopee error ${j.error}`);
                   return;
                 }
                 const batch = (j.data && j.data.ratings) || [];
+                total = total || ratingTotal(j);
                 for (const x of batch) {
-                  rows.push({
-                    user: x.author_username || "",
-                    sao: x.rating_star,
-                    noi_dung: (x.comment || "").replace(/\s+/g, " ").trim(),
-                    thoi_gian: new Date((x.ctime || 0) * 1000)
-                      .toISOString().slice(0, 19).replace("T", " "),
-                    phan_loai: (x.product_items || [])
-                      .map((p) => p.model_name).filter(Boolean).join("|"),
-                    so_anh: (x.images || []).length,
-                    huu_ich: x.like_count || 0,
-                  });
+                  rows.push(normaliseRating(x));
                 }
                 offset += PAGE;
+                window.__ingestProgress = { rows: rows.length, total, offset, shopid, itemid };
+                say(`AI cowork: đã lấy ${rows.length} review`);
                 if (batch.length < PAGE || offset >= MAX) {
                   // Done — publish result
                   window.__ingestResult = { shopid, itemid, rows };
+                  say(`AI cowork: xong ${rows.length} review, đang lưu CSV...`);
                 } else {
                   // Next page after pace delay
                   setTimeout(fetchPage, PACE);
@@ -359,6 +514,7 @@ async function _fetchRatingsViaTab(fallbackShopid, fallbackItemid, productUrl) {
               })
               .catch((e) => {
                 window.__ingestResult = { error: String(e.message || e), shopid, itemid };
+                say("AI cowork: lỗi " + String(e.message || e));
               });
           }
 
@@ -398,6 +554,31 @@ async function _fetchRatingsViaTab(fallbackShopid, fallbackItemid, productUrl) {
       if (pollResult === undefined || pollResult === null) {
         // Still running — log progress if rows are counting up
         console.log("[ingest] tab crawl in progress, polling…");
+        try {
+          const pp = await chrome.scripting.executeScript({
+            target: { tabId },
+            world: "MAIN",
+            func: () => window.__ingestProgress,
+          });
+          const tabProgress = pp && pp[0] && pp[0].result;
+          if (tabProgress && progress) {
+            const percent = crawlPercent(tabProgress.rows, tabProgress.total, 35, 60);
+            await progress({
+              status: "running",
+              stage: "fetch-tab",
+              message: `Tab thật đã lấy ${tabProgress.rows} review`,
+              rows: tabProgress.rows,
+              total: tabProgress.total,
+              offset: tabProgress.offset,
+              itemid: tabProgress.itemid,
+              shopid: tabProgress.shopid,
+              tabId,
+              percent,
+            });
+          }
+        } catch (e) {
+          console.warn("[ingest] tab progress poll failed:", e.message);
+        }
         continue;
       }
 
@@ -414,7 +595,7 @@ async function _fetchRatingsViaTab(fallbackShopid, fallbackItemid, productUrl) {
     );
     return { itemid: data.itemid, rows: data.rows };
   } finally {
-    chrome.tabs.remove(tabId).catch(() => {});
+    // Keep the visible crawl tab open so the user can inspect what happened.
   }
 }
 
@@ -434,6 +615,16 @@ async function report(job, body) {
 async function runJob(job) {
   console.log("[ingest] ▶ starting job", job.id, "→", job.url);
   setBadge("...", "#1a73e8");
+  const progress = (patch) => reportProgress(job, patch);
+  await progress({
+    status: "running",
+    stage: "started",
+    message: "Extension đã nhận job",
+    percent: 5,
+    rows: 0,
+    url: job.url,
+    kind: job.kind,
+  });
 
   // ── FIX A: keepalive để MV3 service worker không bị Chrome kill ──────
   // Khi job đang chạy (tab load + paginate = 30–120s), không có request nào
@@ -442,12 +633,27 @@ async function runJob(job) {
   const keepalive = startKeepalive();
 
   try {
-    const { itemid, rows } = await collectReviews(job.url);
+    const { itemid, rows } = await collectReviews(job.url, progress);
+    await progress({
+      status: "saving",
+      stage: "saving",
+      message: `Đang lưu ${rows.length} review ra JSON/CSV`,
+      rows: rows.length,
+      itemid,
+      percent: 98,
+    });
     await report(job, { itemid, rows });
     console.log("[ingest] ✔ job", job.id, "done —", rows.length, "reviews");
     setBadge(String(rows.length), "#188038");
   } catch (e) {
     console.error("[ingest] ✘ job", job.id, "failed:", e.message);
+    await progress({
+      status: "error",
+      stage: "failed",
+      message: String(e.message || e),
+      error: String(e.message || e),
+      percent: 100,
+    });
     await report(job, { error: String(e.message || e) });
     setBadge("err", "#d93025");
   } finally {

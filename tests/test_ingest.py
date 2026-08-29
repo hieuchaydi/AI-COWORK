@@ -53,8 +53,8 @@ def _post(base: str, path: str, body) -> tuple[int, dict]:
 def test_ingest_writes_json_and_excel_ready_csv(server):
     base, outputs = server
     rows = [
-        {"user": "an", "sao": 5, "noi_dung": "hàng ngon, giao nhanh"},
-        {"user": "bình", "sao": 4, "noi_dung": "tạm ổn"},
+        {"user": "an", "sao": 5, "noi_dung": "hàng ngon, giao nhanh", "thoi_gian": "2026-01-01 08:00:00"},
+        {"user": "bình", "sao": 4, "noi_dung": "tạm ổn", "thoi_gian": "2026-02-01 08:00:00"},
     ]
     status, out = _post(base, "/ingest?name=shopee_123", {"source": "https://shopee.vn/x", "rows": rows})
     assert status == 200 and out["ok"] and out["count"] == 2
@@ -63,15 +63,41 @@ def test_ingest_writes_json_and_excel_ready_csv(server):
 
     saved = json.loads((outputs / "inbox" / "shopee_123.json").read_text(encoding="utf-8"))
     assert saved["count"] == 2
-    assert saved["rows"][1]["user"] == "bình"  # diacritics survive the round trip
+    assert saved["rows"][0]["user"] == "bình"  # newest review first, diacritics survive
     assert saved["source"] == "https://shopee.vn/x"
 
     # read_bytes, not read_text: universal newlines would hide a missing CRLF.
     raw = (outputs / "csv" / "shopee_123.csv").read_bytes()
     assert raw[:3] == b"\xef\xbb\xbf"  # BOM, else Excel renders Vietnamese as mojibake
     text = raw.decode("utf-8-sig")
-    assert text.startswith("user,sao,noi_dung\r\n")
+    assert text.startswith("thoi_gian,sao,noi_dung,user\r\n")
     assert '"hàng ngon, giao nhanh"' in text  # embedded comma quoted, not column-split
+
+
+def test_shopee_ingest_adds_local_media_paths(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORKER_OUTPUT_DIR", str(tmp_path))
+    import launch
+
+    def fake_download(url: str, target_without_ext: Path) -> str:
+        suffix = ".mp4" if url.endswith(".mp4") else ".jpg"
+        return f"outputs/{target_without_ext.with_suffix(suffix).relative_to(tmp_path).as_posix()}"
+
+    monkeypatch.setattr(launch, "_download_ingest_media", fake_download)
+    rows, media_dir = launch._prepare_shopee_review_rows(
+        "shopee_123.json",
+        [
+            {
+                "user": "an",
+                "anh_urls": "https://down-vn.img.susercontent.com/file/a",
+                "video_urls": "https://deo.shopeemobile.com/x.mp4",
+            }
+        ],
+    )
+
+    assert media_dir == "shopee_reviews/shopee_123/media"
+    assert rows[0]["image_files"].endswith("review_00001_image_01.jpg")
+    assert rows[0]["video_files"].endswith("review_00001_video_01.mp4")
+    assert rows[0]["media_dir"] == "outputs/shopee_reviews/shopee_123/media"
 
 
 def test_ingest_csv_aligns_ragged_rows_under_a_union_header(server):
@@ -177,20 +203,43 @@ def test_job_round_trip_agent_queues_extension_delivers(server):
     assert queued["job"]["kind"] == "shopee-reviews"
 
     # Nothing has run yet.
-    assert _get(base, f"/ingest/result?id={job_id}")["ok"] is False
+    pending = _get(base, f"/ingest/result?id={job_id}")
+    assert pending["ok"] is False
+    assert pending["progress"]["status"] == "queued"
+    assert pending["progress"]["stage"] == "queued"
 
     # The extension claims it; a claimed job is not handed out twice.
     jobs = _get(base, "/ingest/jobs?wait=1")["jobs"]
     assert [j["id"] for j in jobs] == [job_id]
     assert _get(base, "/ingest/jobs?wait=0")["jobs"] == []
+    _post(base, "/ingest/progress", {
+        "job": job_id,
+        "progress": {
+            "status": "running",
+            "stage": "fetch-background",
+            "message": "Đã lấy 1 review",
+            "rows": 1,
+            "percent": 45,
+        },
+    })
+    progress = _get(base, f"/ingest/progress?id={job_id}")["progress"]
+    assert progress["status"] == "running"
+    assert progress["rows"] == 1
+    assert progress["percent"] == 45
 
     _post(base, "/ingest?name=shopee_27429880257",
-          {"job": job_id, "rows": [{"user": "an", "sao": 5, "noi_dung": "tốt"}]})
+          {"job": job_id, "rows": [{"user": "an", "sao": 5, "noi_dung": "tốt", "anh": 1}]})
 
     done = _get(base, f"/ingest/result?id={job_id}")
     assert done["ok"] and done["result"]["count"] == 1
     assert done["result"]["csv"] == "outputs/csv/shopee_27429880257.csv"
+    assert done["progress"]["status"] == "done"
+    assert done["progress"]["stage"] == "saved"
+    assert done["progress"]["rows"] == 1
     assert (outputs / "csv" / "shopee_27429880257.csv").is_file()
+    csv_text = (outputs / "csv" / "shopee_27429880257.csv").read_bytes().decode("utf-8-sig")
+    assert csv_text.splitlines()[0].endswith(",anh")
+    assert csv_text.splitlines()[1].endswith(",1")
 
 
 def test_failed_job_is_recorded_so_the_agent_stops_waiting(server):
@@ -202,6 +251,8 @@ def test_failed_job_is_recorded_so_the_agent_stops_waiting(server):
     done = _get(base, f"/ingest/result?id={job_id}")
     assert done["ok"] and done["result"]["ok"] is False
     assert "90309999" in done["result"]["error"]
+    assert done["progress"]["status"] == "error"
+    assert done["progress"]["stage"] == "failed"
 
 
 def test_job_endpoint_rejects_a_non_http_url(server):
