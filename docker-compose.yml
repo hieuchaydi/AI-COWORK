@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  connect-ai:
+    build: .
+    container_name: connect-ai
+    ports:
+      - "1420:1420"
+      - "8765:8765"
+      - "8766:8766"
+    volumes:
+      # Map logs, outputs, and artifacts back to host
+      - ./logs:/app/logs
+      - ./outputs:/app/outputs
+      - ./artifacts:/app/artifacts
+      - ./bridge:/app/bridge
+      # Pass .env into the container if present locally
+      - ./.env:/app/.env
+      - ./google-tokens.json:/app/google-tokens.json
+    environment:
+      # Fallback defaults
+      - PORT=8765
+    restart: unless-stopped

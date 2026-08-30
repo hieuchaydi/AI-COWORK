@@ -1,0 +1,12 @@
+node_modules
+.venv
+__pycache__
+.pytest_cache
+*.pyc
+*.pyo
+.env
+google-tokens.json
+logs/
+outputs/
+artifacts/
+.git

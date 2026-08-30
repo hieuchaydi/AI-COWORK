@@ -59,15 +59,20 @@ def _find_venv() -> Path:
     back to that so a machine that hasn't been migrated still launches.
     """
     for candidate in (ROOT / ".venv", ROOT / "connect-ai" / ".venv"):
-        if (candidate / "Scripts" / "python.exe").exists():
+        if (candidate / "Scripts" / "python.exe").exists() or (candidate / "bin" / "python").exists():
             return candidate
-    return ROOT / ".venv"  # not created yet — the error message below names it
+    return ROOT / ".venv"  # not created yet - the error message below names it
 
 
 VENV_DIR = _find_venv()
-VENV_PY = VENV_DIR / "Scripts" / "python.exe"
-VENV_PIP = VENV_DIR / "Scripts" / "pip.exe"
-SERVER_EXE = VENV_DIR / "Scripts" / "connect-ai-server.exe"
+if sys.platform == "win32":
+    VENV_PY = VENV_DIR / "Scripts" / "python.exe"
+    VENV_PIP = VENV_DIR / "Scripts" / "pip.exe"
+    SERVER_EXE = VENV_DIR / "Scripts" / "connect-ai-server.exe"
+else:
+    VENV_PY = VENV_DIR / "bin" / "python"
+    VENV_PIP = VENV_DIR / "bin" / "pip"
+    SERVER_EXE = VENV_DIR / "bin" / "connect-ai-server"
 GUI_DIR = ROOT / "connect-ai" / "surfaces" / "gui"
 LOG_DIR = ROOT / "logs"
 ENV_FILE = ROOT / ".env"
