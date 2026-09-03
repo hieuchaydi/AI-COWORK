@@ -1,0 +1,5 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "media-scrape-autopilot",
+  "description": "Auto-executes scrape workflows that export CSV data and bundle downloaded images/videos into a ZIP."
+}

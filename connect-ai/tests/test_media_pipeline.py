@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-import zipfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -11,6 +10,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pytest
+from coworker.tools.crawl import make_crawl_tools
 from coworker.tools.media_pipeline import crawl_and_export_bundle
 
 
@@ -67,4 +67,39 @@ def test_crawl_and_export_bundle_extracts_media_from_rows(tmp_path, monkeypatch)
     assert "test_with_media_media.zip" in res["zip"]["filename"]
 
     # Cleanup CSV
+    Path(res["csv"]["path"]).unlink(missing_ok=True)
+
+
+def test_crawl_and_export_bundle_registered_as_crawl_tool(monkeypatch):
+    """The one-shot CSV + media ZIP pipeline is exposed to agents as a crawl tool."""
+    rows = [
+        {
+            "id": 1,
+            "title": "Review 1",
+            "image": "https://example.com/photo1.jpg",
+            "video": "https://example.com/clip1.mp4",
+        }
+    ]
+
+    def mock_download_and_zip(urls, zip_filename, folder_name, **kwargs):
+        assert urls == ["https://example.com/photo1.jpg", "https://example.com/clip1.mp4"]
+        return {
+            "ok": True,
+            "zip_path": f"/tmp/{zip_filename}",
+            "zip_url": f"http://localhost:8766/outputs/zips/{zip_filename}",
+            "file_count": len(urls),
+            "zip_size_mb": 0.2,
+            "media_folder": f"/tmp/{folder_name}",
+        }
+
+    monkeypatch.setattr("coworker.tools.media_pipeline._download_media_and_zip", mock_download_and_zip)
+    tools = {t.__name__: t for t in make_crawl_tools()}
+
+    assert "crawl_and_export_bundle" in tools
+
+    res = tools["crawl_and_export_bundle"](rows=rows, job_name="registered_bundle")
+    assert res["csv"]["row_count"] == 1
+    assert res["zip"]["file_count"] == 2
+    assert res["zip"]["url"].endswith("/registered_bundle_media.zip")
+
     Path(res["csv"]["path"]).unlink(missing_ok=True)

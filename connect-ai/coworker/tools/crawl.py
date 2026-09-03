@@ -735,6 +735,28 @@ def _download_media_and_zip(
     return zip_result
 
 
+def _crawl_and_export_bundle(
+    rows: list[dict[str, Any]],
+    media_urls: list[str] | None = None,
+    job_name: str = "",
+    csv_filename: str = "",
+    zip_filename: str = "",
+    headers: list[str] | None = None,
+) -> dict[str, Any]:
+    """Save crawl rows to CSV, download related media into outputs/media/,
+    zip the media folder into outputs/zips/, and return both download URLs."""
+    from .media_pipeline import crawl_and_export_bundle
+
+    return crawl_and_export_bundle(
+        rows=rows,
+        media_urls=media_urls,
+        job_name=job_name,
+        csv_filename=csv_filename,
+        zip_filename=zip_filename,
+        headers=headers,
+    )
+
+
 # ─── Factory ─────────────────────────────────────────────────────────────────
 
 def make_crawl_tools() -> list[Callable[..., Any]]:
@@ -884,6 +906,35 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
             "max_mb_per_file": {"type": "integer", "description": "Dung lượng tối đa mỗi file MB (mặc định 25)"},
         },
         ["urls"],
+        risk="low",
+    )
+
+    _add(
+        _crawl_and_export_bundle, "crawl_and_export_bundle",
+        "One-shot bundle export for scrape jobs with media: save rows as an Excel-safe CSV in "
+        "outputs/csv/, find or accept image/video URLs, download them into outputs/media/<job_name>/, "
+        "zip them into outputs/zips/<job_name>_media.zip, then return CSV and ZIP links.",
+        {
+            "rows": {
+                "type": "array",
+                "items": {"type": "object"},
+                "description": "Scraped data rows, usually a list of dictionaries",
+            },
+            "media_urls": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional image/video URLs. If omitted, URLs are extracted from rows.",
+            },
+            "job_name": {"type": "string", "description": "Output slug, for example shopee_123"},
+            "csv_filename": {"type": "string", "description": "CSV filename, defaults to <job_name>.csv"},
+            "zip_filename": {"type": "string", "description": "ZIP filename, defaults to <job_name>_media.zip"},
+            "headers": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional CSV column order",
+            },
+        },
+        ["rows"],
         risk="low",
     )
 

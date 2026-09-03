@@ -42,6 +42,7 @@ _CRAWL_TOOL_NAMES = {
     "download_file",
     "zip_folder",
     "download_media_and_zip",
+    "crawl_and_export_bundle",
 }
 _DEV_SHELL_TOOL_NAMES = {
     "run_shell",

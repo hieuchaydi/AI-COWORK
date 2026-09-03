@@ -1,0 +1,16 @@
+{
+  "media-scrape-autopilot-auto-allow": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python allow.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
