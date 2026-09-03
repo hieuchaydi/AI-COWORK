@@ -772,6 +772,19 @@ def _download_media_and_zip(
     manifest_entries: list[dict[str, Any]] = []
     unique_files: list[dict[str, Any]] = []
     duplicate_files: list[dict[str, Any]] = []
+    skipped_count = 0
+
+    # Read previous manifest if exists to reuse successful statuses
+    old_manifest_path = media_dir / "manifest.json"
+    old_manifest_by_url: dict[str, dict[str, Any]] = {}
+    if old_manifest_path.exists():
+        try:
+            old_data = json.loads(old_manifest_path.read_text(encoding="utf-8"))
+            for entry in old_data.get("files", []):
+                if isinstance(entry, dict) and "url" in entry:
+                    old_manifest_by_url[entry["url"]] = entry
+        except Exception:
+            pass
 
     cap_per_file = max(1, int(max_mb_per_file or 25)) * 1024 * 1024
     valid_urls = [u for u in urls if isinstance(u, str) and u.startswith(("http://", "https://"))][:max_files]
@@ -788,6 +801,92 @@ def _download_media_and_zip(
             fname = f"{idx:03d}_{orig_name}{ext}" if orig_name else f"media_{idx:03d}{ext}"
             dest = media_dir / fname
 
+            # ── Check Resume / Existing Files ──────────────────────────────────
+            # 1. Reuse from old manifest if status was successful and file is present
+            old_entry = old_manifest_by_url.get(u)
+            if old_entry:
+                old_dup_of = old_entry.get("duplicate_of")
+                old_fname = old_entry.get("filename") or dest.name
+                old_hash = old_entry.get("sha256")
+                old_size = old_entry.get("size", 0)
+
+                if old_dup_of:
+                    primary_path = media_dir / old_dup_of
+                    if primary_path.exists() and primary_path.stat().st_size > 0:
+                        entry = {
+                            "url": u,
+                            "filename": old_fname,
+                            "sha256": old_hash,
+                            "size": old_size,
+                            "duplicate_of": old_dup_of,
+                        }
+                        manifest_entries.append(entry)
+                        duplicate_files.append(entry)
+                        skipped_count += 1
+                        continue
+                else:
+                    target_file = media_dir / old_fname
+                    if target_file.exists() and target_file.stat().st_size > 0:
+                        entry = {
+                            "url": u,
+                            "filename": target_file.name,
+                            "sha256": old_hash,
+                            "size": target_file.stat().st_size,
+                            "duplicate_of": None,
+                        }
+                        manifest_entries.append(entry)
+                        unique_files.append(entry)
+                        if old_hash:
+                            seen_hashes[old_hash] = target_file.name
+                        skipped_count += 1
+                        continue
+
+            # 2. Check if dest (or candidate with matching index prefix) exists with size > 0
+            candidate_files = []
+            if dest.exists() and dest.stat().st_size > 0:
+                candidate_files.append(dest)
+            else:
+                for candidate in media_dir.glob(f"{idx:03d}_*"):
+                    if candidate.is_file() and candidate.stat().st_size > 0:
+                        candidate_files.append(candidate)
+                        break
+
+            if candidate_files:
+                existing_file = candidate_files[0]
+                hasher = hashlib.sha256()
+                with open(existing_file, "rb") as ef:
+                    while chunk := ef.read(64 * 1024):
+                        hasher.update(chunk)
+                file_hash = hasher.hexdigest()
+                file_size = existing_file.stat().st_size
+
+                if file_hash in seen_hashes:
+                    primary_filename = seen_hashes[file_hash]
+                    existing_file.unlink(missing_ok=True)
+                    entry = {
+                        "url": u,
+                        "filename": existing_file.name,
+                        "sha256": file_hash,
+                        "size": file_size,
+                        "duplicate_of": primary_filename,
+                    }
+                    manifest_entries.append(entry)
+                    duplicate_files.append(entry)
+                else:
+                    seen_hashes[file_hash] = existing_file.name
+                    entry = {
+                        "url": u,
+                        "filename": existing_file.name,
+                        "sha256": file_hash,
+                        "size": file_size,
+                        "duplicate_of": None,
+                    }
+                    manifest_entries.append(entry)
+                    unique_files.append(entry)
+                skipped_count += 1
+                continue
+
+            # ── Missing or previously failed: download via HTTP ───────────────
             try:
                 with c.stream("GET", u) as r:
                     r.raise_for_status()
@@ -845,7 +944,7 @@ def _download_media_and_zip(
                     dest.unlink(missing_ok=True)
                 errors.append({"url": u, "error": str(exc)})
 
-    if not downloaded:
+    if not downloaded and skipped_count == 0:
         return {"error": f"No files were successfully downloaded. Errors: {errors[:5]}"}
 
     # Generate manifest.json (contains all URLs/files with duplicate_of for duplicates)
@@ -854,6 +953,7 @@ def _download_media_and_zip(
         "created_at": datetime.now().isoformat(),
         "total_urls": len(valid_urls),
         "downloaded_count": len(downloaded),
+        "skipped_count": skipped_count,
         "unique_count": len(unique_files),
         "duplicate_count": len(duplicate_files),
         "failed_count": len(errors),
@@ -874,6 +974,7 @@ def _download_media_and_zip(
         return zip_result
 
     zip_result["downloaded_count"] = len(downloaded)
+    zip_result["skipped_count"] = skipped_count
     zip_result["unique_count"] = len(unique_files)
     zip_result["duplicate_count"] = len(duplicate_files)
     zip_result["failed_count"] = len(errors)

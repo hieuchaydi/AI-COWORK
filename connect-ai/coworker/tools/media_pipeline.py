@@ -106,6 +106,8 @@ def crawl_and_export_bundle(
                 "file_count": zip_res.get("file_count", 0),
                 "zip_size_mb": zip_res.get("zip_size_mb", 0.0),
                 "media_folder": zip_res.get("media_folder"),
+                "downloaded_count": zip_res.get("downloaded_count", 0),
+                "skipped_count": zip_res.get("skipped_count", 0),
                 "unique_count": zip_res.get("unique_count", zip_res.get("file_count", 0)),
                 "duplicate_count": zip_res.get("duplicate_count", 0),
                 "manifest_path": zip_res.get("manifest_path"),
@@ -128,12 +130,14 @@ def crawl_and_export_bundle(
     zip_info = result.get("zip")
     if zip_info:
         downloaded_count = zip_info.get("unique_count", zip_info.get("file_count", 0))
+        skipped_count = zip_info.get("skipped_count", 0)
         duplicate_count = zip_info.get("duplicate_count", 0)
         failed_count = zip_res.get("failed_count", 0) if "zip_res" in locals() else 0
         zip_urls = zip_info.get("zip_urls", [])
         top_errors = zip_res.get("errors", []) if "zip_res" in locals() else []
     else:
         downloaded_count = 0
+        skipped_count = 0
         duplicate_count = 0
         failed_count = len(unique_media) if result.get("zip_error") else 0
         zip_urls = []
@@ -148,6 +152,7 @@ def crawl_and_export_bundle(
         f"- **Tổng số dòng (rows)**: {row_count}",
         f"- **Số media tìm thấy**: {media_found}",
         f"- **Số tải thành công**: {downloaded_count}",
+        f"- **Số bỏ qua (đã có/resume)**: {skipped_count}",
         f"- **Số media trùng lặp (đã gộp)**: {duplicate_count}",
         f"- **Số tải thất bại**: {failed_count}",
         "",

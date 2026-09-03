@@ -230,3 +230,128 @@ def test_download_media_and_zip_split_when_exceeding_max_zip_mb(tmp_path, monkey
         assert not any("large_image_01" in n for n in names2)
 
 
+def test_download_media_and_zip_resume_skips_existing_files(tmp_path, monkeypatch):
+    """Verify that _download_media_and_zip skips downloading existing files and reuses
+    manifest status on resume, only re-attempting missing/failed files."""
+    u1 = "https://example.com/item1.jpg"
+    u2 = "https://example.com/item2.jpg"
+    data_1 = b"Item 1 image content"
+    data_2 = b"Item 2 image content"
+
+    requested_urls: list[str] = []
+    run2_mode = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+        requested_urls.append(url_str)
+        if "item1" in url_str:
+            return httpx.Response(200, content=data_1, headers={"content-type": "image/jpeg"})
+        elif "item2" in url_str:
+            if not run2_mode:
+                # First run fails on item2
+                return httpx.Response(500, content=b"Internal Server Error")
+            # Second run succeeds on item2
+            return httpx.Response(200, content=data_2, headers={"content-type": "image/jpeg"})
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr("coworker.tools.crawl._client", lambda: httpx.Client(transport=transport))
+
+    # ── Run 1: u1 succeeds, u2 fails ──────────────────────────────────────────
+    res1 = _download_media_and_zip(
+        urls=[u1, u2],
+        folder_name="resume_test_job",
+        output_dir=str(tmp_path),
+    )
+    assert res1.get("ok") is True
+    assert res1["downloaded_count"] == 1
+    assert res1["skipped_count"] == 0
+    assert res1["failed_count"] == 1
+    assert res1["unique_count"] == 1
+    assert len(res1["errors"]) == 1
+
+    # Verify u1 is on disk and was requested
+    assert u1 in requested_urls
+    assert u2 in requested_urls
+
+    # Reset request tracker for Run 2
+    requested_urls.clear()
+    run2_mode = True
+
+    # ── Run 2: Resume ─────────────────────────────────────────────────────────
+    # u1 already exists on disk and in manifest.json -> must be SKIPPED without HTTP request
+    # u2 failed in Run 1 -> must be downloaded
+    res2 = _download_media_and_zip(
+        urls=[u1, u2],
+        folder_name="resume_test_job",
+        output_dir=str(tmp_path),
+    )
+    assert res2.get("ok") is True
+    assert res2["downloaded_count"] == 1  # Only u2 was downloaded
+    assert res2["skipped_count"] == 1     # u1 was skipped/reused
+    assert res2["failed_count"] == 0
+    assert res2["unique_count"] == 2
+
+    # CRITICAL: u1 was NOT requested via HTTP during resume!
+    assert u1 not in requested_urls
+    assert u2 in requested_urls
+
+    # Check that final ZIP contains both files + manifest
+    zip_path = Path(res2["zip_path"])
+    assert zip_path.exists()
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        namelist = zf.namelist()
+        assert "manifest.json" in namelist
+        assert any("item1" in n for n in namelist)
+        assert any("item2" in n for n in namelist)
+
+        manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+        assert manifest["downloaded_count"] == 1
+        assert manifest["skipped_count"] == 1
+        assert manifest["failed_count"] == 0
+        assert manifest["unique_count"] == 2
+
+
+def test_download_media_and_zip_resume_from_disk_without_manifest(tmp_path, monkeypatch):
+    """Verify that even without a manifest.json, pre-existing media files on disk with size > 0
+    are recognized, hashed, and skipped from being downloaded again."""
+    u1 = "https://example.com/disk_item1.jpg"
+    u2 = "https://example.com/disk_item2.jpg"
+    data_1 = b"Disk item 1 content"
+    data_2 = b"Disk item 2 content"
+
+    # Pre-populate disk file for u1 (001_disk_item1.jpg)
+    job_dir = tmp_path / "media" / "disk_resume_job"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "001_disk_item1.jpg").write_bytes(data_1)
+
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+        requested.append(url_str)
+        if "disk_item2" in url_str:
+            return httpx.Response(200, content=data_2, headers={"content-type": "image/jpeg"})
+        elif "disk_item1" in url_str:
+            return httpx.Response(200, content=data_1, headers={"content-type": "image/jpeg"})
+        return httpx.Response(404)
+
+    monkeypatch.setattr("coworker.tools.crawl._client", lambda: httpx.Client(transport=httpx.MockTransport(handler)))
+
+    res = _download_media_and_zip(
+        urls=[u1, u2],
+        folder_name="disk_resume_job",
+        output_dir=str(tmp_path),
+    )
+    assert res.get("ok") is True
+    assert res["skipped_count"] == 1      # Pre-existing file skipped
+    assert res["downloaded_count"] == 1   # Only u2 downloaded
+    assert res["failed_count"] == 0
+    assert res["unique_count"] == 2
+
+    assert u1 not in requested
+    assert u2 in requested
+
+
+
+
