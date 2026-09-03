@@ -27,7 +27,9 @@
 [CmdletBinding()]
 param(
     # Which installer bundles to produce. Both by default.
-    [string]$Bundles = "nsis,msi"
+    [string]$Bundles = "nsis,msi",
+    # Only build the PyInstaller openworker-server.exe sidecar (skips Tauri desktop bundle).
+    [switch]$ServerOnly = $false
 )
 $ErrorActionPreference = "Stop"
 
@@ -35,6 +37,13 @@ $Here     = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Platform = Split-Path -Parent $Here
 $Gui      = Join-Path $Platform "surfaces\gui"
 $Venv     = Join-Path $Platform ".venv"
+
+if (-not (Test-Path $Venv)) {
+    $RepoRoot = Split-Path -Parent $Platform
+    if (Test-Path (Join-Path $RepoRoot ".venv")) {
+        $Venv = Join-Path $RepoRoot ".venv"
+    }
+}
 $PyInst   = Join-Path $Venv "Scripts\pyinstaller.exe"
 
 function Require-Cmd($name) {
@@ -43,14 +52,20 @@ function Require-Cmd($name) {
     }
 }
 
-Require-Cmd rustc
-Require-Cmd npm
 if (-not (Test-Path $PyInst)) {
     throw "PyInstaller not found at $PyInst. Create the venv and install deps (see header)."
 }
 
+if (-not $ServerOnly) {
+    Require-Cmd rustc
+    Require-Cmd npm
+}
+
 # Host target triple, e.g. x86_64-pc-windows-msvc — Tauri's externalBin suffix.
-$Triple = (& rustc -vV | Select-String '^host:').ToString().Split()[-1]
+$Triple = "x86_64-pc-windows-msvc"
+if (Get-Command rustc -ErrorAction SilentlyContinue) {
+    $Triple = (& rustc -vV | Select-String '^host:').ToString().Split()[-1]
+}
 $Arch   = $Triple.Split('-')[0]
 
 # A running openworker-server.exe (e.g. a prior sidecar/smoke test) locks the output exe and
@@ -80,6 +95,13 @@ if (Test-Path $Dst) { Remove-Item -Recurse -Force $Dst }
 Remove-Item -Force (Join-Path $BinDir "openworker-server-$Triple.exe") -ErrorAction SilentlyContinue
 Copy-Item -Recurse -Force $Src $Dst
 Write-Host "    -> $Dst"
+
+if ($ServerOnly) {
+    Write-Host ""
+    Write-Host "Done (-ServerOnly). Server binary built under: $Src" -ForegroundColor Green
+    Write-Host "  $(Join-Path $Src 'openworker-server.exe')"
+    return
+}
 
 Write-Host "==> [3/3] tauri build (--bundles $Bundles)" -ForegroundColor Cyan
 # Auto-update artifacts (NSIS setup .exe + minisign .sig): produced only when the updater

@@ -65,3 +65,14 @@ connect-ai/**/*.sqlite
 artifacts/
 outputs/
 memory-store.json
+
+# Chrome profile riêng của app
+chrome-profile/
+
+# PyInstaller build output
+dist/
+build/
+*.spec
+connect-ai/packaging/dist/
+connect-ai/packaging/build/
+connect-ai/surfaces/gui/src-tauri/binaries/sidecar/
