@@ -65,11 +65,19 @@ Use this skill whenever the user asks to crawl, scrape, collect, export, or anal
 
 ## Final Answer
 
-When media exists, always include both links:
+When media exists, include direct links:
 
 ```markdown
 [Tai file CSV](http://localhost:8766/outputs/csv/<job_name>.csv)
 [Tai tron bo anh/video .ZIP](http://localhost:8766/outputs/zips/<job_name>_media.zip)
+[Xem bao cao Markdown](http://localhost:8766/outputs/text/<job_name>_report.md)
+```
+
+When media is split into multiple parts (due to `max_zip_mb`), include links to all parts:
+
+```markdown
+- [Tai tron bo anh/video .ZIP (Part 1)](http://localhost:8766/outputs/zips/<job_name>_media_part01.zip)
+- [Tai tron bo anh/video .ZIP (Part 2)](http://localhost:8766/outputs/zips/<job_name>_media_part02.zip)
 ```
 
 Also include row count, downloaded media count, failed media count if available, and the local media folder path.

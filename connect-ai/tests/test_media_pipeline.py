@@ -177,3 +177,98 @@ def test_crawl_and_export_bundle_forwards_manifest_and_dedup_metadata(monkeypatc
 
     Path(res["csv"]["path"]).unlink(missing_ok=True)
 
+
+def test_crawl_and_export_bundle_supports_split_zip_urls(monkeypatch):
+    """Verify that crawl_and_export_bundle forwards max_zip_mb and returns zip_urls list."""
+    rows = [
+        {"title": "Item 1", "img": "https://example.com/item1.jpg"},
+        {"title": "Item 2", "img": "https://example.com/item2.png"},
+    ]
+
+    captured_kwargs = {}
+
+    def mock_download_and_zip(urls, zip_filename, folder_name, **kwargs):
+        captured_kwargs.update(kwargs)
+        urls_list = [
+            f"http://localhost:8766/outputs/zips/{folder_name}_media_part01.zip",
+            f"http://localhost:8766/outputs/zips/{folder_name}_media_part02.zip",
+        ]
+        return {
+            "ok": True,
+            "zip_path": f"/tmp/{folder_name}_media_part01.zip",
+            "zip_url": urls_list[0],
+            "zip_urls": urls_list,
+            "part_count": 2,
+            "file_count": 3,
+            "zip_size_mb": 1.8,
+            "media_folder": f"/tmp/{folder_name}",
+        }
+
+    monkeypatch.setattr("coworker.tools.media_pipeline._download_media_and_zip", mock_download_and_zip)
+
+    res = crawl_and_export_bundle(rows, job_name="split_job", max_zip_mb=5)
+    assert res.get("ok") is True
+    assert captured_kwargs.get("max_zip_mb") == 5
+
+    assert res["zip"] is not None
+    assert res["zip"]["part_count"] == 2
+    assert isinstance(res["zip"]["zip_urls"], list)
+    assert len(res["zip"]["zip_urls"]) == 2
+    assert res["zip_urls"] == res["zip"]["zip_urls"]
+
+    Path(res["csv"]["path"]).unlink(missing_ok=True)
+
+
+def test_crawl_and_export_bundle_generates_markdown_report(tmp_path, monkeypatch):
+    """Verify that crawl_and_export_bundle creates outputs/text/<job_name>_report.md
+    with summary stats, CSV link, ZIP link, top errors, and returns report.url."""
+    rows = [
+        {"id": 1, "title": "Good Item", "image": "https://example.com/good.jpg"},
+        {"id": 2, "title": "Bad Item", "image": "https://example.com/bad.jpg"},
+    ]
+
+    def mock_download_and_zip(urls, zip_filename, folder_name, output_dir="", **kwargs):
+        return {
+            "ok": True,
+            "zip_path": f"{output_dir}/zips/{zip_filename}",
+            "zip_url": f"http://localhost:8766/outputs/zips/{zip_filename}",
+            "zip_urls": [f"http://localhost:8766/outputs/zips/{zip_filename}"],
+            "part_count": 1,
+            "file_count": 1,
+            "unique_count": 1,
+            "duplicate_count": 0,
+            "failed_count": 1,
+            "errors": [{"url": "https://example.com/bad.jpg", "error": "404 Not Found"}],
+            "zip_size_mb": 0.3,
+            "media_folder": f"{output_dir}/media/{folder_name}",
+        }
+
+    monkeypatch.setattr("coworker.tools.media_pipeline._download_media_and_zip", mock_download_and_zip)
+
+    res = crawl_and_export_bundle(rows, job_name="demo_report_job", output_dir=str(tmp_path))
+    assert res.get("ok") is True
+
+    # 1. Verify result contains report dict with url and report.url dot-access
+    assert "report" in res
+    assert "report_url" in res
+    assert res["report"]["url"].endswith("/demo_report_job_report.md")
+    assert res["report"].url == res["report"]["url"]
+    assert "http://localhost:8766/outputs/text/" in res["report"]["url"]
+
+    # 2. Verify file on disk
+    report_file = Path(res["report"]["path"])
+    assert report_file.exists()
+    content = report_file.read_text(encoding="utf-8")
+
+    # 3. Verify report sections: rows, media count, success/failed, links, top errors
+    assert "Crawl Report: demo_report_job" in content
+    assert "**Tổng số dòng (rows)**: 2" in content
+    assert "**Số media tìm thấy**: 2" in content
+    assert "**Số tải thành công**: 1" in content
+    assert "**Số tải thất bại**: 1" in content
+    assert res["csv"]["url"] in content
+    assert res["zip"]["url"] in content
+    assert "https://example.com/bad.jpg" in content
+    assert "404 Not Found" in content
+
+

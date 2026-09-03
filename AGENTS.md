@@ -51,9 +51,10 @@
 - Khi cào bất kỳ dữ liệu nào có chứa hình ảnh, video (đánh giá sản phẩm, catalog, thư viện ảnh bài viết...):
   1. **Lưu dữ liệu bảng**: Dùng `save_csv` lưu vào `outputs/csv/<tên>.csv` (BOM UTF-8 chuẩn).
   2. **Tự động gom media**: Tải toàn bộ URL ảnh/video vào thư mục `outputs/media/<tên>/`, tự động đóng gói `.zip` bằng tool `download_media_and_zip` (hoặc `zip_folder`).
-  3. **Báo người dùng**: Luôn gửi 2 link download trực tiếp:
+  3. **Báo người dùng**: Luôn gửi các link download trực tiếp:
      - `[Tải file CSV](http://localhost:8766/outputs/csv/<tên>.csv)`
-     - `[Tải trọn bộ ảnh/video .ZIP](http://localhost:8766/outputs/zips/<tên>_media.zip)`
+     - `[Tải trọn bộ ảnh/video .ZIP](http://localhost:8766/outputs/zips/<tên>_media.zip)` (hoặc các link `_part01.zip`, `_part02.zip` nếu vượt quá `max_zip_mb`)
+     - `[Xem báo cáo Markdown](http://localhost:8766/outputs/text/<tên>_report.md)`
 
 ## Tùy chọn thư mục lưu trữ khi cào dữ liệu (Custom Output Directory)
 

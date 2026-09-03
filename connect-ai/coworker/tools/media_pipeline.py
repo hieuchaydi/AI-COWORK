@@ -116,4 +116,83 @@ def crawl_and_export_bundle(
         result["zip"] = None
         result["zip_urls"] = []
 
+    # 4. Generate Markdown report in outputs/text/<clean_job>_report.md
+    text_dir = _output_subdir("text", base_dir=output_dir)
+    report_filename = f"{clean_job}_report.md"
+    report_path = text_dir / report_filename
+
+    row_count = len(rows)
+    media_found = len(unique_media)
+    csv_url = result["csv"].get("url", "")
+
+    zip_info = result.get("zip")
+    if zip_info:
+        downloaded_count = zip_info.get("unique_count", zip_info.get("file_count", 0))
+        duplicate_count = zip_info.get("duplicate_count", 0)
+        failed_count = zip_res.get("failed_count", 0) if "zip_res" in locals() else 0
+        zip_urls = zip_info.get("zip_urls", [])
+        top_errors = zip_res.get("errors", []) if "zip_res" in locals() else []
+    else:
+        downloaded_count = 0
+        duplicate_count = 0
+        failed_count = len(unique_media) if result.get("zip_error") else 0
+        zip_urls = []
+        top_errors = [{"url": "zip_process", "error": result["zip_error"]}] if result.get("zip_error") else []
+
+    report_lines = [
+        f"# Crawl Report: {clean_job}",
+        "",
+        "## Thống kê tổng quan",
+        f"- **Job Name**: `{clean_job}`",
+        f"- **Thời gian tạo**: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))}",
+        f"- **Tổng số dòng (rows)**: {row_count}",
+        f"- **Số media tìm thấy**: {media_found}",
+        f"- **Số tải thành công**: {downloaded_count}",
+        f"- **Số media trùng lặp (đã gộp)**: {duplicate_count}",
+        f"- **Số tải thất bại**: {failed_count}",
+        "",
+        "## Liên kết dữ liệu",
+        f"- 📄 [Tải file CSV]({csv_url})",
+    ]
+
+    if zip_urls:
+        if len(zip_urls) == 1:
+            report_lines.append(f"- 📦 [Tải trọn bộ ảnh/video .ZIP]({zip_urls[0]})")
+        else:
+            report_lines.append("- 📦 **Tải trọn bộ ảnh/video .ZIP (nhiều phần)**:")
+            for part_i, u in enumerate(zip_urls, start=1):
+                report_lines.append(f"  - [Tải trọn bộ ảnh/video .ZIP (Part {part_i})]({u})")
+    else:
+        report_lines.append("- 📦 [Tải trọn bộ ảnh/video .ZIP]: *Không có media hoặc chưa nén*")
+
+    report_lines.extend(["", "## Top lỗi (Errors)"])
+    if top_errors:
+        for err in top_errors[:10]:
+            e_url = err.get("url", "unknown")
+            e_msg = err.get("error", "unknown error")
+            report_lines.append(f"- `{e_url}`: {e_msg}")
+    elif failed_count > 0:
+        report_lines.append(f"- {failed_count} file tải thất bại (xem log chi tiết).")
+    else:
+        report_lines.append("- Không có lỗi nào phát sinh.")
+
+    report_content = "\n".join(report_lines) + "\n"
+    report_path.write_text(report_content, encoding="utf-8")
+
+    report_url = f"{_OUTPUTS_BASE_URL}/text/{report_filename}"
+
+    class ReportDict(dict):
+        def __getattr__(self, name: str) -> Any:
+            try:
+                return self[name]
+            except KeyError:
+                raise AttributeError(name)
+
+    result["report"] = ReportDict({
+        "filename": report_filename,
+        "path": str(report_path),
+        "url": report_url,
+    })
+    result["report_url"] = report_url
+
     return result

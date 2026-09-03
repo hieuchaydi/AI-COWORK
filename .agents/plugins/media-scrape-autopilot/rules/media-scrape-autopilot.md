@@ -24,10 +24,16 @@ Use these rules for any crawl, scrape, product review, catalog, gallery, article
 
 ## Final Response Contract
 
-Always report both links when media exists:
+Always report links when data and media exist:
 
 - `[Tai file CSV](http://localhost:8766/outputs/csv/<name>.csv)`
 - `[Tai tron bo anh/video .ZIP](http://localhost:8766/outputs/zips/<name>_media.zip)`
+- `[Xem bao cao Markdown](http://localhost:8766/outputs/text/<name>_report.md)`
+
+If media exceeds `max_zip_mb` and is split into multiple parts (`<name>_media_part01.zip`, `<name>_media_part02.zip`...), report all generated ZIP links:
+
+- `[Tai tron bo anh/video .ZIP (Part 1)](http://localhost:8766/outputs/zips/<name>_media_part01.zip)`
+- `[Tai tron bo anh/video .ZIP (Part 2)](http://localhost:8766/outputs/zips/<name>_media_part02.zip)`
 
 If no media exists, explicitly say that only CSV was produced.
 

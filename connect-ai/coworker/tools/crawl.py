@@ -4,12 +4,12 @@ Complements web_fetch (single page) and browser_* (interactive Chromium) with
 higher-level bulk primitives an agent can dispatch in one call instead of
 looping shot-by-shot:
 
-    crawl_urls          â€” BFS crawl N pages from a seed URL, same-domain rule
-    extract_html        â€” CSS selector extraction over given URL / raw HTML
-    extract_table       â€” pull an HTML <table> as list-of-dicts JSON
-    parse_sitemap       â€” discover URLs from sitemap.xml (+ sitemapindex)
-    save_page_snapshot  â€” download HTML + inline referenced assets to a folder
-    download_file       â€” save any URL to disk
+    crawl_urls          — BFS crawl N pages from a seed URL, same-domain rule
+    extract_html        — CSS selector extraction over given URL / raw HTML
+    extract_table       — pull an HTML <table> as list-of-dicts JSON
+    parse_sitemap       — discover URLs from sitemap.xml (+ sitemapindex)
+    save_page_snapshot  — download HTML + inline referenced assets to a folder
+    download_file       — save any URL to disk
 
 All use httpx (async in-loop, no MCP), respect optional path/domain filters,
 and truncate large responses so a single tool call can't flood the LLM context.
@@ -39,19 +39,19 @@ MAX_HTML_KEEP = 200_000  # cap per-page memory
 MAX_PAGES_HARD = 200     # ceiling regardless of caller ask
 MAX_TABLE_ROWS = 500
 
-# â”€â”€â”€ Unified output directory â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# Every user-visible output (CSV/JSON/PDF/image/HTML snapshot/â€¦) lands under
+# ─── Unified output directory ────────────────────────────────────────────────
+# Every user-visible output (CSV/JSON/PDF/image/HTML snapshot/…) lands under
 # ONE folder in the project root, split into subdirs by kind. Served by
 # launch.py helper HTTP 8766 at /outputs/<kind>/<name>. Override the whole
 # tree with env COWORKER_OUTPUT_DIR.
 #
 # Layout:
 #   <project>/outputs/
-#     csv/          â†’ save_csv
-#     text/         â†’ save_artifact (md/json/txt/html/â€¦)
-#     downloads/    â†’ download_file (PDF/ZIP/binary)
-#     screenshots/  â†’ browser_screenshot
-#     snapshots/    â†’ save_page_snapshot (HTML + assets)
+#     csv/          → save_csv
+#     text/         → save_artifact (md/json/txt/html/…)
+#     downloads/    → download_file (PDF/ZIP/binary)
+#     screenshots/  → browser_screenshot
+#     snapshots/    → save_page_snapshot (HTML + assets)
 
 def _output_root() -> Path:
     """Base directory for all generated outputs. Auto-created on first use."""
@@ -88,7 +88,7 @@ _ARTIFACTS_BASE_URL = os.environ.get(
     "ARTIFACTS_BASE_URL", "http://localhost:8766/artifacts"
 )
 
-# Optional BeautifulSoup â€” stdlib parser suffices; lxml is a nice-to-have.
+# Optional BeautifulSoup — stdlib parser suffices; lxml is a nice-to-have.
 try:
     from bs4 import BeautifulSoup
     _PARSER = "html.parser"
@@ -123,7 +123,7 @@ def _schema(name: str, description: str, props: dict, required: list) -> dict:
     }
 
 
-# â”€â”€â”€ HTTP helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── HTTP helpers ────────────────────────────────────────────────────────────
 
 def _client() -> httpx.Client:
     return httpx.Client(
@@ -155,7 +155,7 @@ def _clean_text(html: str, max_chars: int) -> str:
     return text[:max_chars]
 
 
-# â”€â”€â”€ Tool implementations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Tool implementations ────────────────────────────────────────────────────
 
 def _crawl_urls(
     start_url: str,
@@ -185,7 +185,7 @@ def _crawl_urls(
                 continue
             ctype = r.headers.get("content-type", "")
             if "html" not in ctype.lower():
-                # skip non-HTML but record it â€” often useful in reports
+                # skip non-HTML but record it — often useful in reports
                 pages.append({"url": str(r.url), "status": r.status_code, "content_type": ctype, "skipped": True})
                 continue
             html = r.text[:MAX_HTML_KEEP]
@@ -293,7 +293,7 @@ def _extract_table(
     table_index: int = 0,
     header_row: int = 0,
 ) -> dict[str, Any]:
-    """Extract an HTML <table> into a list of dicts (headers â†’ cell values)."""
+    """Extract an HTML <table> into a list of dicts (headers → cell values)."""
     if BeautifulSoup is None:
         return {"error": f"beautifulsoup4 not available: {_bs_err}"}
     if source.startswith(("http://", "https://")):
@@ -340,7 +340,7 @@ def _extract_table(
 
 
 def _parse_sitemap(url: str, max_urls: int = 500) -> dict[str, Any]:
-    """Fetch sitemap.xml (or sitemapindex) â†’ return all discovered URLs."""
+    """Fetch sitemap.xml (or sitemapindex) → return all discovered URLs."""
     if not url.startswith(("http://", "https://")):
         return {"error": "url must be http(s)://"}
     try:
@@ -356,7 +356,7 @@ def _parse_sitemap(url: str, max_urls: int = 500) -> dict[str, Any]:
     urls = []
     max_urls = max(1, min(int(max_urls or 500), 5000))
     if root.tag.endswith("sitemapindex"):
-        # nested sitemaps â†’ fetch children recursively (1 level)
+        # nested sitemaps → fetch children recursively (1 level)
         with _client() as c:
             for sm in root.findall("sitemap"):
                 loc = sm.findtext("loc")
@@ -456,8 +456,8 @@ def _save_page_snapshot(url: str, save_dir: str = "") -> dict[str, Any]:
 
 
 def _kind_from_ext(filename: str) -> str:
-    """Map file extension â†’ subdir. CSV â†’ csv/, PDF/zip/binary â†’ downloads/,
-    text-y â†’ text/. Everything unknown â†’ text/."""
+    """Map file extension → subdir. CSV → csv/, PDF/zip/binary → downloads/,
+    text-y → text/. Everything unknown → text/."""
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if ext == "csv":
         return "csv"
@@ -476,11 +476,11 @@ def _save_artifact(
     output_dir: str = "",
 ) -> dict[str, Any]:
     """Save a text file into the project's outputs folder (subdir chosen by
-    extension: `.csv` â†’ outputs/csv/, `.pdf/.zip` â†’ outputs/downloads/, else
+    extension: `.csv` → outputs/csv/, `.pdf/.zip` → outputs/downloads/, else
     outputs/text/). Returns the public URL the user can click.
 
     * `filename` must be a simple name (no path components, no `..`).
-    * `add_utf8_bom=True` (default) â€” CRITICAL for CSV opened in Excel with
+    * `add_utf8_bom=True` (default) — CRITICAL for CSV opened in Excel with
       Vietnamese; without the BOM Excel guesses ANSI and shows garbled text.
     * `encoding` = "utf-8" default; use "utf-16" / "cp1258" for legacy readers.
     """
@@ -492,7 +492,7 @@ def _save_artifact(
     payload = content or ""
     try:
         if encoding.lower() in ("utf-8", "utf8") and (add_utf8_bom or is_csv):
-            data = "ï»¿" + payload  # UTF-8 BOM (Excel-safe)
+            data = "﻿" + payload  # UTF-8 BOM (Excel-safe)
         else:
             data = payload
         target.write_text(data, encoding=encoding, newline="")
@@ -505,7 +505,7 @@ def _save_artifact(
         "filename": filename,
         "kind": kind,
         "note": (
-            "Send THIS url to the user (localhost:8766, not localhost:1420 â€” "
+            "Send THIS url to the user (localhost:8766, not localhost:1420 — "
             "1420 is Vite GUI, returns index.html for unknown paths)."
         ),
     }
@@ -558,9 +558,9 @@ def _save_csv(
     headers: list = None,
     output_dir: str = "",
 ) -> dict[str, Any]:
-    """One-shot: convert list of dicts / rows â†’ CSV â†’ save to artifacts folder
+    """One-shot: convert list of dicts / rows → CSV → save to artifacts folder
     with UTF-8 BOM + CRLF line endings. Returns the public URL. Use this
-    instead of hand-building a CSV string and calling save_artifact â€” the
+    instead of hand-building a CSV string and calling save_artifact — the
     encoding + quoting are Excel-safe."""
     if not isinstance(rows, list):
         return {"error": "rows must be a list"}
@@ -716,7 +716,6 @@ def _zip_folder(
 
     # Standard single zip
     target_zip = zips_dir / base_name
-
     file_count = 0
     try:
         with zipfile.ZipFile(target_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -878,6 +877,7 @@ def _download_media_and_zip(
     zip_result["unique_count"] = len(unique_files)
     zip_result["duplicate_count"] = len(duplicate_files)
     zip_result["failed_count"] = len(errors)
+    zip_result["errors"] = errors[:10]
     zip_result["media_folder"] = str(media_dir)
     zip_result["manifest_path"] = str(manifest_path)
     zip_result["manifest"] = manifest_data
@@ -911,7 +911,7 @@ def _crawl_and_export_bundle(
     )
 
 
-# â”€â”€â”€ Factory â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Factory ─────────────────────────────────────────────────────────────────
 
 def make_crawl_tools() -> list[Callable[..., Any]]:
     tools = []
@@ -922,9 +922,9 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
 
     _add(
         _crawl_urls, "crawl_urls",
-        "BFS-crawl N page báº¯t Ä‘áº§u tá»« 1 URL seed. Follow link cÃ¹ng domain (máº·c Ä‘á»‹nh). "
-        "`follow_pattern` = regex lá»c URL. Tráº£ vá» list {url, status, title, text} â€” "
-        "dÃ¹ng cho static/HTML site. Cho SPA cáº§n Chromium: browser_open + browser_read.",
+        "BFS-crawl N page bắt đầu từ 1 URL seed. Follow link cùng domain (mặc định). "
+        "`follow_pattern` = regex lọc URL. Trả về list {url, status, title, text} — "
+        "dùng cho static/HTML site. Cho SPA cần Chromium: browser_open + browser_read.",
         {
             "start_url": {"type": "string"},
             "max_pages": {"type": "integer", "description": "default 20, max 200"},
@@ -932,18 +932,18 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
             "follow_pattern": {"type": "string", "description": "regex e.g. '/blog/'"},
             "include_text": {"type": "boolean"},
             "max_text_chars": {"type": "integer"},
-            "delay_ms": {"type": "integer", "description": "ms giá»¯a má»—i request, default 300"},
+            "delay_ms": {"type": "integer", "description": "ms giữa mỗi request, default 300"},
         },
         ["start_url"],
     )
     _add(
         _extract_html, "extract_html",
-        "CSS-selector extract tá»« URL hoáº·c raw HTML. Tráº£ text + html + attrs cho má»—i "
-        "match, hoáº·c chá»‰ 1 attribute náº¿u Ä‘Æ°a `attribute`. Bulk pull structured data.",
+        "CSS-selector extract từ URL hoặc raw HTML. Trả text + html + attrs cho mỗi "
+        "match, hoặc chỉ 1 attribute nếu đưa `attribute`. Bulk pull structured data.",
         {
-            "source": {"type": "string", "description": "URL hoáº·c raw HTML"},
+            "source": {"type": "string", "description": "URL hoặc raw HTML"},
             "selector": {"type": "string", "description": "CSS selector"},
-            "attribute": {"type": "string", "description": "chá»‰ tráº£ vá» 1 attr (href, src, ...)"},
+            "attribute": {"type": "string", "description": "chỉ trả về 1 attr (href, src, ...)"},
             "max_matches": {"type": "integer", "description": "default 100"},
         },
         ["source", "selector"],
@@ -951,10 +951,10 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
     )
     _add(
         _extract_table, "extract_table",
-        "Extract HTML `<table>` thÃ nh list-of-dicts (JSON). Auto-detect header row 0. "
-        "DÃ¹ng cho Wikipedia infobox, giÃ¡ báº£ng, sá»‘ liá»‡u tables trÃªn news/finance sites.",
+        "Extract HTML `<table>` thành list-of-dicts (JSON). Auto-detect header row 0. "
+        "Dùng cho Wikipedia infobox, giá bảng, số liệu tables trên news/finance sites.",
         {
-            "source": {"type": "string", "description": "URL hoáº·c raw HTML"},
+            "source": {"type": "string", "description": "URL hoặc raw HTML"},
             "table_index": {"type": "integer", "description": "default 0 (first table)"},
             "header_row": {"type": "integer"},
         },
@@ -963,10 +963,10 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
     )
     _add(
         _parse_sitemap, "parse_sitemap",
-        "Parse sitemap.xml (hoáº·c sitemapindex) â†’ list URL + lastmod. TÃ¬m má»i URL cÃ´ng "
-        "khai cá»§a 1 site trong 1 call, thay vÃ¬ pháº£i BFS crawl.",
+        "Parse sitemap.xml (hoặc sitemapindex) → list URL + lastmod. Tìm mọi URL công "
+        "khai của 1 site trong 1 call, thay vì phải BFS crawl.",
         {
-            "url": {"type": "string", "description": "URL tá»›i sitemap.xml"},
+            "url": {"type": "string", "description": "URL tới sitemap.xml"},
             "max_urls": {"type": "integer", "description": "default 500, max 5000"},
         },
         ["url"],
@@ -974,8 +974,8 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
     )
     _add(
         _save_page_snapshot, "save_page_snapshot",
-        "Download HTML + inline má»i <img>/<link>/<script> asset vÃ o 1 folder â€” snapshot "
-        "offline Ä‘á»ƒ phÃ¢n tÃ­ch. Tráº£ vá» dir path + sá»‘ asset Ä‘Ã£ save.",
+        "Download HTML + inline mọi <img>/<link>/<script> asset vào 1 folder — snapshot "
+        "offline để phân tích. Trả về dir path + số asset đã save.",
         {
             "url": {"type": "string"},
             "save_dir": {"type": "string", "description": "default: ./snapshots/<domain>_<ts>/"},
@@ -984,8 +984,8 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
     )
     _add(
         _download_file, "download_file",
-        "Táº£i 1 file (PDF, ZIP, image, ...) tá»« URL vá» disk. Stream, max 50MB máº·c Ä‘á»‹nh. "
-        "DÃ¹ng khi cáº§n file Ä‘á»ƒ pass tá»›i tool khÃ¡c (send_document, xlsx analyzer, ...).",
+        "Tải 1 file (PDF, ZIP, image, ...) từ URL về disk. Stream, max 50MB mặc định. "
+        "Dùng khi cần file để pass tới tool khác (send_document, xlsx analyzer, ...).",
         {
             "url": {"type": "string"},
             "save_to": {"type": "string", "description": "absolute path; default: ./downloads/<basename>"},
@@ -995,11 +995,11 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
     )
     _add(
         _save_artifact, "save_artifact",
-        "LÆ°u 1 file TEXT (CSV/JSON/MD/TXT/HTML) Ä‘á»ƒ user download qua URL. Auto add "
-        "UTF-8 BOM cho CSV/text (Excel/tiáº¿ng Viá»‡t hiá»ƒn thá»‹ Ä‘Ãºng). Tráº£ URL PUBLIC "
-        "http://localhost:8766/artifacts/<filename> â€” LUÃ”N gá»­i URL nÃ y cho user, "
-        "KHÃ”NG gá»­i localhost:1420 (Vite fallback â†’ HTML rÃ¡c). `filename` = tÃªn file "
-        "Ä‘Æ¡n giáº£n, khÃ´ng path.",
+        "Lưu 1 file TEXT (CSV/JSON/MD/TXT/HTML) để user download qua URL. Auto add "
+        "UTF-8 BOM cho CSV/text (Excel/tiếng Việt hiển thị đúng). Trả URL PUBLIC "
+        "http://localhost:8766/artifacts/<filename> — LUÔN gửi URL này cho user, "
+        "KHÔNG gửi localhost:1420 (Vite fallback → HTML rác). `filename` = tên file "
+        "đơn giản, không path.",
         {
             "content": {"type": "string"},
             "filename": {"type": "string", "description": "e.g. articles.csv, report.md"},
@@ -1011,15 +1011,15 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
     )
     _add(
         _save_csv, "save_csv",
-        "Chuyá»ƒn list rows (dict hoáº·c list) â†’ CSV Excel-safe (UTF-8 BOM + CRLF + "
-        "proper quoting) â†’ lÆ°u artifacts/ â†’ tráº£ URL public. ONE-SHOT thay cho "
-        "manual CSV build + save_artifact. Rows = list of dicts (headers auto tá»« "
-        "keys) hoáº·c list of lists (dÃ¹ng `headers` param).",
+        "Chuyển list rows (dict hoặc list) → CSV Excel-safe (UTF-8 BOM + CRLF + "
+        "proper quoting) → lưu artifacts/ → trả URL public. ONE-SHOT thay cho "
+        "manual CSV build + save_artifact. Rows = list of dicts (headers auto từ "
+        "keys) hoặc list of lists (dùng `headers` param).",
         {
             "rows": {
                 "type": "array",
                 "items": {"type": "object"},
-                "description": "list of dicts hoáº·c list of arrays",
+                "description": "list of dicts hoặc list of arrays",
             },
             "filename": {"type": "string"},
             "headers": {
@@ -1027,43 +1027,43 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
                 "items": {"type": "string"},
                 "description": "optional, override / order columns",
             },
-            "output_dir": {"type": "string", "description": "ThÆ° má»¥c lÆ°u tÃ¹y chá»‰nh (Ä‘á»ƒ trá»‘ng náº¿u dÃ¹ng máº·c Ä‘á»‹nh outputs/)"},
+            "output_dir": {"type": "string", "description": "Thư mục lưu tùy chỉnh (để trống nếu dùng mặc định outputs/)"},
         },
         ["rows", "filename"],
         risk="low",
     )
     _add(
         _zip_folder, "zip_folder",
-        "NÃ©n toÃ n bá»™ má»™t thÆ° má»¥c thÃ nh file .zip Ä‘áº·t táº¡i outputs/zips/ vÃ  tráº£ vá» "
-        "Ä‘Æ°á»ng dáº«n file zip cÃ¹ng link táº£i public (http://localhost:8766/outputs/zips/<name>.zip). "
-        "DÃ¹ng khi Ä‘Ã£ cÃ o/thu tháº­p xong má»™t thÆ° má»¥c dá»¯ liá»‡u, áº£nh hoáº·c video.",
+        "Nén toàn bộ một thư mục thành file .zip đặt tại outputs/zips/ và trả về "
+        "đường dẫn file zip cùng link tải public (http://localhost:8766/outputs/zips/<name>.zip). "
+        "Hỗ trợ tự động chia nhiều file zip nếu vượt quá max_zip_mb.",
         {
-            "folder_path": {"type": "string", "description": "ÄÆ°á»ng dáº«n thÆ° má»¥c cáº§n nÃ©n"},
-            "zip_filename": {"type": "string", "description": "TÃªn file zip (máº·c Ä‘á»‹nh: <tÃªn_thÆ°_má»¥c>.zip)"},
-            "output_dir": {"type": "string", "description": "ThÆ° má»¥c lÆ°u tÃ¹y chá»‰nh (Ä‘á»ƒ trá»‘ng náº¿u dÃ¹ng máº·c Ä‘á»‹nh outputs/)"},
-            "max_zip_mb": {"type": "integer", "description": "Dung lÆ°á»£ng tá»‘i Ä‘a má»—i file zip MB, náº¿u vÆ°á»£t quÃ¡ sáº½ chia thÃ nh part01, part02... (máº·c Ä‘á»‹nh 0: khÃ´ng chia)"},
+            "folder_path": {"type": "string", "description": "Đường dẫn thư mục cần nén"},
+            "zip_filename": {"type": "string", "description": "Tên file zip (mặc định: <tên_thư_mục>.zip)"},
+            "output_dir": {"type": "string", "description": "Thư mục lưu tùy chỉnh (để trống nếu dùng mặc định outputs/)"},
+            "max_zip_mb": {"type": "integer", "description": "Dung lượng tối đa mỗi file zip MB, nếu vượt quá sẽ chia thành part01, part02... (mặc định 0: không chia)"},
         },
         ["folder_path"],
         risk="low",
     )
     _add(
         _download_media_and_zip, "download_media_and_zip",
-        "Táº£i má»™t danh sÃ¡ch URL áº£nh/video/tÃ i liá»‡u vá» thÆ° má»¥c outputs/media/, tá»± Ä‘á»™ng "
-        "tÃ­nh mÃ£ bÄƒm SHA-256 chá»‘ng trÃ¹ng file (chá»‰ lÆ°u 1 báº£n duy nháº¥t vÃ  ghi duplicate_of "
-        "vÃ o manifest.json), nÃ©n cÃ¡c file unique + manifest thÃ nh .zip (tá»± chia nhiá»u part náº¿u vÆ°á»£t max_zip_mb) "
-        "vÃ  tráº£ vá» danh sÃ¡ch URL táº£i trá»±c tiáº¿p.",
+        "Tải một danh sách URL ảnh/video/tài liệu về thư mục outputs/media/, tự động "
+        "tính mã băm SHA-256 chống trùng file (chỉ lưu 1 bản duy nhất và ghi duplicate_of "
+        "vào manifest.json), nén các file unique + manifest thành .zip (tự chia nhiều part nếu vượt max_zip_mb) "
+        "và trả về danh sách URL tải trực tiếp.",
         {
             "urls": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Danh sÃ¡ch URL áº£nh hoáº·c video cáº§n táº£i",
+                "description": "Danh sách URL ảnh hoặc video cần tải",
             },
-            "zip_filename": {"type": "string", "description": "TÃªn file zip xuáº¥t ra (vÃ­ dá»¥: product_images.zip)"},
-            "folder_name": {"type": "string", "description": "TÃªn thÆ° má»¥c lÆ°u táº¡m cÃ¡c media (tÃ¹y chá»n)"},
-            "max_files": {"type": "integer", "description": "Sá»‘ lÆ°á»£ng file tá»‘i Ä‘a (máº·c Ä‘á»‹nh 100)"},
-            "max_mb_per_file": {"type": "integer", "description": "Dung lÆ°á»£ng tá»‘i Ä‘a má»—i file MB (máº·c Ä‘á»‹nh 25)"},
-            "output_dir": {"type": "string", "description": "ThÆ° má»¥c lÆ°u tÃ¹y chá»‰nh (Ä‘á»ƒ trá»‘ng náº¿u dÃ¹ng máº·c Ä‘á»‹nh outputs/)"},
-            "max_zip_mb": {"type": "integer", "description": "Dung lÆ°á»£ng tá»‘i Ä‘a má»—i file zip MB, tá»± chia thÃ nh part01, part02... náº¿u vÆ°á»£t quÃ¡"},
+            "zip_filename": {"type": "string", "description": "Tên file zip xuất ra (ví dụ: product_images.zip)"},
+            "folder_name": {"type": "string", "description": "Tên thư mục lưu tạm các media (tùy chọn)"},
+            "max_files": {"type": "integer", "description": "Số lượng file tối đa (mặc định 100)"},
+            "max_mb_per_file": {"type": "integer", "description": "Dung lượng tối đa mỗi file MB (mặc định 25)"},
+            "output_dir": {"type": "string", "description": "Thư mục lưu tùy chỉnh (để trống nếu dùng mặc định outputs/)"},
+            "max_zip_mb": {"type": "integer", "description": "Dung lượng tối đa mỗi file zip MB, tự chia thành part01, part02... nếu vượt quá"},
         },
         ["urls"],
         risk="low",
@@ -1093,8 +1093,8 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
                 "items": {"type": "string"},
                 "description": "Optional CSV column order",
             },
-            "output_dir": {"type": "string", "description": "ThÆ° má»¥c lÆ°u tÃ¹y chá»‰nh (Ä‘á»ƒ trá»‘ng náº¿u dÃ¹ng máº·c Ä‘á»‹nh outputs/)"},
-            "max_zip_mb": {"type": "integer", "description": "Dung lÆ°á»£ng tá»‘i Ä‘a má»—i file zip MB, tá»± chia thÃ nh part01, part02... náº¿u vÆ°á»£t quÃ¡"},
+            "output_dir": {"type": "string", "description": "Thư mục lưu tùy chỉnh (để trống nếu dùng mặc định outputs/)"},
+            "max_zip_mb": {"type": "integer", "description": "Dung lượng tối đa mỗi file zip MB, tự chia thành part01, part02... nếu vượt quá"},
         },
         ["rows"],
         risk="low",
