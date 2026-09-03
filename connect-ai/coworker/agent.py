@@ -266,6 +266,12 @@ def build_engine(
     if wake_store is not None and session_id and agent.family == "knowledge":
         registry.register_all(selfwake_tools(wake_store, session_id))
 
+    # Custom tools: auto-discover from custom_tools/ in project/workspace
+    from .tools.custom_loader import discover_custom_tools
+    custom_tools = discover_custom_tools(ws)
+    if custom_tools:
+        registry.register_all(custom_tools)
+
     instructions = f"{agent.system_prompt}\n\n{_NARRATION_GUIDANCE}"
     if ws is not None:
         instructions = f"{instructions}\n\n{environment_context(ws)}"

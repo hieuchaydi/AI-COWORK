@@ -36,6 +36,18 @@ Gửi Telegram "xong rồi nhé" tới chat 6973629128
 
 ---
 
+## Custom Tools — tự viết tool mới siêu tốc (30 giây)
+
+Bạn có thể tự bổ sung công cụ mới cho agent bất cứ lúc nào bằng 2 cách:
+1. **Thả file vào `custom_tools/`**: Viết hàm Python gắn decorator `@coworker_tool`, runtime sẽ tự quét và nạp khi khởi động. Xem hướng dẫn chi tiết tại [docs/CREATING_TOOLS.md](docs/CREATING_TOOLS.md).
+2. **Sinh code tự động qua CLI**:
+   ```bash
+   python tools/scaffold_tool.py --name my_tool --desc "Mô tả công cụ"
+   ```
+   Lệnh sẽ tự động sinh code tool chuẩn và bộ test `pytest` đi kèm.
+
+---
+
 ## Browser — 14 tool, Chromium thật, giữ đăng nhập
 
 Chromium chạy với profile bền vững: **đăng nhập một lần, các lần sau vẫn còn session**. Khác hẳn

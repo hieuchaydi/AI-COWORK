@@ -26,6 +26,7 @@ class ToolCategory(str, Enum):
     DEV_SHELL = "dev_shell"
     CONNECTORS = "connectors"
     AUTOMATION = "automation"
+    CUSTOM = "custom"
 
 
 # Patterns for categorizing tools by their function names
@@ -94,6 +95,8 @@ def categorize_tool(tool_name: str, metadata: Any = None) -> ToolCategory:
         meta_cat = getattr(metadata, "category", None)
         if meta_cat:
             meta_cat_str = str(meta_cat).lower()
+            if "custom" in meta_cat_str:
+                return ToolCategory.CUSTOM
             if "browser" in meta_cat_str:
                 return ToolCategory.BROWSER
             if "crawl" in meta_cat_str or "scrape" in meta_cat_str:
@@ -298,8 +301,8 @@ def get_active_categories(
     if 0 < total_registered_tools <= 10:
         return set(ToolCategory)
 
-    # 2. CORE is ALWAYS active
-    active: set[ToolCategory] = {ToolCategory.CORE}
+    # 2. CORE and CUSTOM are ALWAYS active
+    active: set[ToolCategory] = {ToolCategory.CORE, ToolCategory.CUSTOM}
 
     # Code-family agents default to having DEV_SHELL active
     if agent_family == "code":
