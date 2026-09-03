@@ -1,4 +1,4 @@
-"""
+r"""
 bcp-agent — Agent Entry Point & Socket Server.
 
 Supports:
@@ -10,6 +10,7 @@ Handshake: first message must be agent.hello (§4.2.5).
 Any other method before successful hello → UNAUTHENTICATED + close.
 """
 import asyncio
+import ipaddress
 import logging
 import os
 import sys
@@ -56,6 +57,10 @@ class AgentServer:
         self.profile_id = profile_id
         self.session_manager = SessionManager(token_file)
         self.backend = CdpBackend()
+
+        self.server: Optional[asyncio.Server] = None
+        self.tcp_address: Optional[tuple[str, int]] = None
+        self._active_writers: set[asyncio.StreamWriter] = set()
 
         # Managers
         self.target_manager = TargetManager(self.backend)
@@ -296,12 +301,26 @@ class AgentServer:
         raise ValueError(f"UNSUPPORTED method: {method}")
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        self._active_writers.add(writer)
         buffer = b""
         authenticated = False
-        peer = writer.get_extra_info("peername", "unknown")
+        peer = writer.get_extra_info("peername")
         logger.info("Client connected: %s", peer)
 
         try:
+            # Reject non-loopback TCP connections
+            if isinstance(peer, tuple) and len(peer) >= 2:
+                host = peer[0]
+                if isinstance(host, str):
+                    try:
+                        ip = ipaddress.ip_address(host)
+                        if not ip.is_loopback:
+                            logger.warning("Rejecting non-loopback connection from %s", host)
+                            return
+                    except ValueError:
+                        logger.warning("Rejecting invalid IP address from peer: %s", host)
+                        return
+
             while True:
                 chunk = await reader.read(65536)
                 if not chunk:
@@ -333,7 +352,6 @@ class AgentServer:
                                 "Invalid or missing token"
                             ))
                             await writer.drain()
-                            writer.close()
                             return
 
                         # Version check — reject major mismatch
@@ -343,7 +361,6 @@ class AgentServer:
                                 f"Protocol major version mismatch: got {client_version}, want {PROTOCOL_VERSION}"
                             ))
                             await writer.drain()
-                            writer.close()
                             return
 
                         authenticated = True
@@ -365,7 +382,6 @@ class AgentServer:
                             "Send agent.hello first"
                         ))
                         await writer.drain()
-                        writer.close()
                         return
 
                     # ── Dispatch ───────────────────────────────────────────
@@ -397,18 +413,37 @@ class AgentServer:
             pass
         finally:
             logger.info("Client disconnected: %s", peer)
+            self._active_writers.discard(writer)
             try:
                 writer.close()
+                await writer.wait_closed()
             except Exception:
                 pass
 
-    async def start(self):
-        """Start the agent socket server."""
-        if sys.platform == "win32":
+    async def start_listening(self, use_tcp: bool = False, tcp_host: str = "127.0.0.1", tcp_port: int = 0) -> None:
+        """Start the agent socket server without blocking."""
+        if self.server is not None:
+            raise RuntimeError("Server already started")
+
+        if use_tcp:
+            try:
+                ip = ipaddress.ip_address(tcp_host)
+            except ValueError as e:
+                raise ValueError(f"Invalid TCP host: {tcp_host}") from e
+
+            if not ip.is_loopback:
+                raise ValueError(f"TCP transport must bind to a loopback address, got {tcp_host}")
+
+            logger.warning("WARNING: TCP transport enabled. This is explicitly for dev/test only!")
+            self.server = await asyncio.start_server(
+                self.handle_client, host=tcp_host, port=tcp_port
+            )
+            sock = self.server.sockets[0]
+            self.tcp_address = sock.getsockname()[:2]
+            logger.info("bcp-agent listening on TCP loopback: %s", self.tcp_address)
+        elif sys.platform == "win32":
             pipe_name = rf"\\.\pipe\bcp-{self.profile_id}"
-            # asyncio on Windows supports named pipes via start_server with pipe kwarg
-            # but requires ProactorEventLoop which is the default on Windows 3.8+
-            server = await asyncio.start_server(
+            self.server = await asyncio.start_server(
                 self.handle_client, host=None, port=None, pipe=pipe_name
             )
             logger.info("bcp-agent listening on named pipe %s", pipe_name)
@@ -419,14 +454,43 @@ class AgentServer:
             sock_path = sock_dir / f"{self.profile_id}.sock"
             if sock_path.exists():
                 sock_path.unlink()
-            server = await asyncio.start_unix_server(
+            self.server = await asyncio.start_unix_server(
                 self.handle_client, path=str(sock_path)
             )
             sock_path.chmod(0o600)
             logger.info("bcp-agent listening on unix socket %s", sock_path)
 
+    async def serve_forever(self):
+        """Block until the server is closed."""
+        server = self.server
+        if server is None:
+            raise RuntimeError("Server not started. Call start_listening first.")
         async with server:
             await server.serve_forever()
+
+    async def close(self):
+        """Close the server and wait for it to be fully closed."""
+        server = self.server
+        self.server = None
+        self.tcp_address = None
+
+        if server is not None:
+            server.close()
+
+        writers = list(self._active_writers)
+        for w in writers:
+            w.close()
+
+        tasks = []
+        if server is not None:
+            tasks.append(server.wait_closed())
+        for w in writers:
+            tasks.append(w.wait_closed())
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        self._active_writers.clear()
 
 
 if __name__ == "__main__":
@@ -435,7 +499,23 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="bcp-agent — Browser Control Plane agent process")
     parser.add_argument("--profile-id", required=True, help="Browser profile ID")
     parser.add_argument("--token-file", required=True, help="Path to authentication token file")
+    parser.add_argument("--use-tcp", action="store_true", help="Use TCP transport (dev/test only)")
+    parser.add_argument("--tcp-host", default="127.0.0.1", help="TCP loopback host to bind (default 127.0.0.1)")
+    parser.add_argument("--tcp-port", type=int, default=0, help="TCP port to listen on (0 for random)")
     args = parser.parse_args()
 
     server = AgentServer(args.profile_id, args.token_file)
-    asyncio.run(server.start())
+
+    async def main_run():
+        try:
+            await server.start_listening(use_tcp=args.use_tcp, tcp_host=args.tcp_host, tcp_port=args.tcp_port)
+            await server.serve_forever()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await server.close()
+
+    try:
+        asyncio.run(main_run())
+    except KeyboardInterrupt:
+        pass
