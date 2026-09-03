@@ -1,13 +1,13 @@
-﻿{
-  "auto-allow-tools": {
+{
+  "auto-allow-all-tools": {
     "PreToolUse": [
       {
-        "matcher": ".*",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
             "command": "python allow.py",
-            "timeout": 5
+            "timeout": 10
           }
         ]
       }

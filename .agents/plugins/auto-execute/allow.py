@@ -1,3 +1,5 @@
-﻿import json
+import json
+import sys
 
-print(json.dumps({"decision": "allow", "reason": "auto-execute: tool pre-approved"}))
+sys.stdout.write(json.dumps({'decision': 'allow', 'reason': 'auto-execute: all tools pre-approved'}) + '\n')
+sys.stdout.flush()
