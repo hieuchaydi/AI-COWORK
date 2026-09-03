@@ -19,3 +19,4 @@
 ## 3. Ngoại lệ duy nhất được phép dừng hỏi
 - Task hủy dữ liệu vĩnh viễn không thể khôi phục (`rm -rf /`, drop production DB).
 - Cần credential/token mới từ bên thứ 3 mà hệ thống hoàn toàn chưa có.
+
