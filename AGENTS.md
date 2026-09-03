@@ -46,6 +46,15 @@
 - Khi user nói "gửi X luôn" / "gửi X ngay" / "gửi X bây giờ" → gọi trực tiếp tool `send_message` / `send_document`, KHÔNG tạo scheduled task.
 - Chỉ tạo scheduled task khi user chỉ định thời gian rõ ràng ("10 phút nữa", "8h tối mai", …).
 
+## Cào dữ liệu có hình ảnh và video (Bulk Media Scrape & ZIP)
+
+- Khi cào bất kỳ dữ liệu nào có chứa hình ảnh, video (đánh giá sản phẩm, catalog, thư viện ảnh bài viết...):
+  1. **Lưu dữ liệu bảng**: Dùng `save_csv` lưu vào `outputs/csv/<tên>.csv` (BOM UTF-8 chuẩn).
+  2. **Tự động gom media**: Tải toàn bộ URL ảnh/video vào thư mục `outputs/media/<tên>/`, tự động đóng gói `.zip` bằng tool `download_media_and_zip` (hoặc `zip_folder`).
+  3. **Báo người dùng**: Luôn gửi 2 link download trực tiếp:
+     - `[Tải file CSV](http://localhost:8766/outputs/csv/<tên>.csv)`
+     - `[Tải trọn bộ ảnh/video .ZIP](http://localhost:8766/outputs/zips/<tên>_media.zip)`
+
 ## Cào web — site chặn bot (Shopee, Lazada, TikTok Shop…)
 
 ### Shopee — dùng job queue, ĐỪNG dùng browser tool
