@@ -48,7 +48,9 @@ function Write-JsonObject($Object, [string]$Path) {
   if (Test-Path -LiteralPath $Path) {
     Copy-Item -LiteralPath $Path -Destination "$Path.bak-$stamp"
   }
-  $Object | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $Path -Encoding UTF8
+  $json = $Object | ConvertTo-Json -Depth 30
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($Path, $json + [System.Environment]::NewLine, $utf8NoBom)
 }
 
 $rules = if ($Wildcard) {
