@@ -52,14 +52,52 @@ ALL_METHODS = [
 ]
 
 
+class WindowsPipeServer:
+    """Wraps asyncio PipeServer instances on Windows to provide asyncio.Server compatibility."""
+
+    def __init__(self, servers: list, pipe_name: str):
+        self._servers = servers
+        self.pipe_name = pipe_name
+        self._closed = asyncio.Event()
+
+    def close(self) -> None:
+        for s in self._servers:
+            try:
+                s.close()
+            except Exception:
+                pass
+        self._closed.set()
+
+    async def wait_closed(self) -> None:
+        await self._closed.wait()
+
+    async def serve_forever(self) -> None:
+        try:
+            await self._closed.wait()
+        except asyncio.CancelledError:
+            self.close()
+            raise
+
+    def is_serving(self) -> bool:
+        return not self._closed.is_set()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        await self.wait_closed()
+
+
 class AgentServer:
     def __init__(self, profile_id: str, token_file: str):
         self.profile_id = profile_id
         self.session_manager = SessionManager(token_file)
         self.backend = CdpBackend()
 
-        self.server: Optional[asyncio.Server] = None
+        self.server: Optional[Any] = None
         self.tcp_address: Optional[tuple[str, int]] = None
+        self.pipe_name: Optional[str] = None
         self._active_writers: set[asyncio.StreamWriter] = set()
 
         # Managers
@@ -443,10 +481,35 @@ class AgentServer:
             logger.info("bcp-agent listening on TCP loopback: %s", self.tcp_address)
         elif sys.platform == "win32":
             pipe_name = rf"\\.\pipe\bcp-{self.profile_id}"
-            self.server = await asyncio.start_server(
-                self.handle_client, host=None, port=None, pipe=pipe_name
-            )
-            logger.info("bcp-agent listening on named pipe %s", pipe_name)
+            try:
+                loop = asyncio.get_running_loop()
+                if not hasattr(loop, "start_serving_pipe"):
+                    raise RuntimeError(
+                        f"Current event loop ({type(loop).__name__}) does not support Windows named pipes"
+                    )
+
+                def factory():
+                    reader = asyncio.StreamReader(loop=loop)
+                    return asyncio.StreamReaderProtocol(
+                        reader, client_connected_cb=self.handle_client, loop=loop
+                    )
+
+                pipe_servers = await loop.start_serving_pipe(factory, pipe_name)
+                self.server = WindowsPipeServer(pipe_servers, pipe_name)
+                self.pipe_name = pipe_name
+                logger.info("bcp-agent listening on named pipe %s", pipe_name)
+            except Exception as exc:
+                logger.warning(
+                    "Named pipe startup failed (%s): %s. Falling back to TCP loopback (127.0.0.1)",
+                    pipe_name,
+                    exc,
+                )
+                self.server = await asyncio.start_server(
+                    self.handle_client, host="127.0.0.1", port=0
+                )
+                sock = self.server.sockets[0]
+                self.tcp_address = sock.getsockname()[:2]
+                logger.info("bcp-agent listening on fallback TCP loopback: %s", self.tcp_address)
         else:
             runtime_dir = os.environ.get("RUNTIME_DIR", "/tmp")
             sock_dir = Path(runtime_dir) / "bcp"
@@ -473,6 +536,7 @@ class AgentServer:
         server = self.server
         self.server = None
         self.tcp_address = None
+        self.pipe_name = None
 
         if server is not None:
             server.close()

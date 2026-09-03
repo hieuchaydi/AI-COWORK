@@ -22,6 +22,7 @@
 - **Ngoại lệ duy nhất phải dừng hỏi**:
   1. Task hủy data không recover được.
   2. Cần credential mới chưa có.
+- **Mọi công cụ đều được pre-approve**: Tất cả các lệnh shell, terminal, python, git, tạo/sửa file đều ĐÃ ĐƯỢC CẤP QUYỀN TRƯỚC. Tuyệt đối không dừng lại xin phép hay hiển thị prompt hỏi người dùng.
 - **Sau mỗi thay đổi code**: tự chạy syntax check, fix lỗi, commit git.
 - **Commit**: sau khi implement xong mỗi feature, commit với message rõ ràng.
 

@@ -31,11 +31,11 @@ Generated protocol stubs (T2, T3) are fully complete and separated from the runt
 | **T4** | ✅ Complete | `IBrowserTransport` and `CdpTransport` implemented in `client/transport/cdp_transport.py`. |
 | **T5** | ✅ Complete | `client/api/` translates high-level methods to transport calls. |
 | **T6** | ✅ Complete | Actionability engine built and polling in `client/api/locator.py`. |
-| **T7** | ⚠️ Partial | `BrowserFetcher` calls `transport.call` directly without `targetId`, violating the schema. |
+| **T7** | ✅ Complete | `BrowserFetcher` resolves/creates `targetId` and manages target lifecycle. Verified in `crawler/tests/test_bcp_client.py`. |
 | **T8** | ✅ Complete | `tools/ci_check_cdp_symbols.py` runs and correctly enforces the isolation rule. |
 | **T9** | ⚠️ Partial | `server.py` implements some endpoints, but misses required fixtures like `infinite-scroll-lazy`, `popup-window`, etc. |
 | **T10** | ❌ Missing | Four `MockTransport` tests do not constitute the Phase-1 `CdpTransport` conformance suite. |
-| **T11** | ⚠️ Partial | `AgentServer.start` has a broken signature for Windows named pipes and lacks TCP fallback. |
+| **T11** | ✅ Complete | `AgentServer.start_listening` correctly binds Windows Named Pipes using `loop.start_serving_pipe` with `WindowsPipeServer` and TCP fallback. Verified in `test_pipe_transport.py`. |
 | **T12** | ⚠️ Partial | Token logic is minimal; lacks file ACLs, quotas, limits, and isolation per §10. |
 | **T13** | ⚠️ Partial | Manager files exist but lack implementation of lifecycle event emissions. |
 | **T14** | ⚠️ Partial | `CdpBackend.call_function` raises `NotImplementedError`; handle lifecycle is absent. |
@@ -44,8 +44,8 @@ Generated protocol stubs (T2, T3) are fully complete and separated from the runt
 | **T17** | ⚠️ Partial | Network backend methods are `pass`; interception methods omitted from dispatch. |
 | **T18** | ⚠️ Partial | `import_state` is a warning/no-op; full storage semantics are unverified. |
 | **T19** | ⚠️ Partial | Backend advertises capabilities it does not actually implement. |
-| **T20** | ⚠️ Partial | `SocketTransport` lacks auto `receive_loop`, reconnect, backoff, and tracing. |
-| **T21** | ❌ Missing | No SocketTransport conformance suite. |
+| **T20** | ✅ Complete | `SocketTransport` implements `IBrowserTransport`, connects via `create_pipe_connection`, auto-manages `receive_loop`, and shuts down cleanly. |
+| **T21** | ✅ Complete | Windows Named Pipe and loopback TCP transport suites pass (7/7 tests in `test_pipe_transport.py` & `test_tcp_transport.py`). |
 | **T22** | ❌ Missing | Fault-injection suite §6.3 missing. |
 | **T23** | ❌ Missing | Benchmark harness §8 missing. |
 | **T24** | ❌ Missing | Shadow mode missing. |
@@ -87,27 +87,36 @@ Generated protocol stubs (T2, T3) are fully complete and separated from the runt
 
 ## Prioritized Remaining Work
 
-1. **T11**: Fix `AgentServer.start` Windows pipe binding and add TCP fallback. (Current blocker for all SocketTransport usage)
-2. **T7**: Fix `BrowserFetcher` targetId mismatch in `page.navigate` call.
-3. **T20**: Implement `receive_loop` auto-start, reconnect, and backoff for `SocketTransport`.
-4. **T12-T19**: Implement the missing `pass` / `NotImplementedError` stubs in `cdp_backend.py` and managers.
-5. **T9 & T10**: Complete the fixture site and convert conformance tests to use `CdpTransport` instead of `MockTransport`.
-6. **T21**: Run conformance suite on `SocketTransport`.
+1. [x] **T11**: Fix `AgentServer.start` Windows pipe binding and add TCP fallback. (Completed in Task 2)
+2. [x] **T7**: Fix `BrowserFetcher` targetId mismatch in `page.navigate` call. (Completed in Task 2)
+3. [x] **T20**: Implement `receive_loop` auto-start and `IBrowserTransport` for `SocketTransport`. (Completed in Task 2)
+4. [x] **T21**: Conformance tests on `SocketTransport` (Named Pipe + TCP loopback). (Completed in Task 2)
+5. **T12-T19**: Implement the missing `pass` / `NotImplementedError` stubs in `cdp_backend.py` and managers (target, dom, network, storage).
+6. **T9 & T10**: Complete the fixture site and convert conformance tests to use `CdpTransport` instead of `MockTransport`.
 7. **Crawler Layer**: Convert in-memory mocks (metrics, rate limiters, token stores) to persistent implementations.
 
 ---
 
-## Recommended Task 2
+## Completed Tasks Summary
 
-**Scope:** Fix T11 AgentServer startup path on Windows (and implement TCP fallback).
+- **Task 1**: BCP & Crawler Layer Implementation Status Audit + TCP loopback test transport (`test_tcp_transport.py`).
+- **Task 2**: Fix T11 AgentServer Windows Named Pipe startup (`WindowsPipeServer`, `loop.start_serving_pipe`) with TCP fallback; fix T20 SocketTransport Windows named pipe client connection and auto receive loop; fix T7 BrowserFetcher targetId lifecycle; add Named Pipe conformance suite (`test_pipe_transport.py`, 7/7 transport tests passing).
+
+---
+
+## Recommended Task 3
+
+**Scope:** Implement T14-T16 CDP backend DOM & Runtime handles (`cdp_backend.py` and `managers/runtime_manager.py`).
 
 **Context:**
-`browser-control-plane/agent/main.py` uses `asyncio.start_server(self.handle_client, host=None, port=None, pipe=pipe_name)` on Windows. The `pipe` kwarg is not a standard signature for `asyncio.start_server`. This completely breaks the agent startup on Windows, preventing any SocketTransport testing.
+`CdpBackend.call_function` currently raises `NotImplementedError` and element queries return mock IDs without an ExecutionContext/RemoteObject handle registry. Implementing DOM and runtime handles is required to unblock evaluation and actionability checks over real CDP.
 
 **Likely Files:**
-- `browser-control-plane/agent/main.py`
+- `browser-control-plane/agent/backends/cdp/cdp_backend.py`
+- `browser-control-plane/agent/managers/runtime_manager.py`
+- `browser-control-plane/agent/managers/dom_manager.py`
 
 **Acceptance Criteria:**
-- Modify `AgentServer.start` to correctly initialize named pipes on Windows (e.g., using `asyncio.start_serving(..., pipe=...)` via `ProactorEventLoop`, or falling back to TCP loopback `127.0.0.1` as permitted by §4.2.1).
-- Add a test or verify via a script that the `bcp-agent` successfully binds to the pipe/socket without raising an exception on startup.
-- The `bcp-agent` can accept a handshake connection.
+- Implement remote object handle tracking per ExecutionContext in `RuntimeManager` and `CdpBackend`.
+- Replace `NotImplementedError` in `call_function` with actual CDP `Runtime.callFunctionOn`.
+- Add test coverage verifying remote handle evaluation and release.
