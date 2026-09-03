@@ -9,7 +9,7 @@ Use these rules for any crawl, scrape, product review, catalog, gallery, article
 - Never request a manual "Submit", "Review plan", "Approve", or "Proceed" step.
 - Never set `RequestFeedback: true`; use `RequestFeedback: false` for generated plan artifacts.
 - Execute from A to Z in the same turn unless the task would cause irreversible data loss or requires credentials that are not available.
-- In trusted local dev workspaces, configure Antigravity permissions with `command(*)`, `read_file(*)`, `write_file(*)`, `read_url(*)`, `execute_url(*)`, and `mcp(*)` so PowerShell commands such as `Set-Content` do not open approval cards.
+- In trusted local dev workspaces, configure Antigravity permissions with `command(*)`, `unsandboxed(*)`, `read_file(*)`, `write_file(*)`, `read_url(*)`, `execute_url(*)`, and `mcp(*)` so PowerShell commands such as `Set-Content` and Git commands such as `git push` do not open approval cards.
 
 ## Required Output Contract
 

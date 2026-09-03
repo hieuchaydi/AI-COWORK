@@ -37,3 +37,4 @@ def test_antigravity_media_plugin_skill_and_rule_cover_output_contract():
     assert "outputs/zips/<job_name>_media.zip" in combined
     assert "Submit plan" in combined
     assert "command(*)" in combined
+    assert "unsandboxed(*)" in combined

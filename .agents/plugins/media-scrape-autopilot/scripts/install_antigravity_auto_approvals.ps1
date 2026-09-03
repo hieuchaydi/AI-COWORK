@@ -54,10 +54,11 @@ function Write-JsonObject($Object, [string]$Path) {
 }
 
 $rules = if ($Wildcard) {
-  @("command(*)", "read_file(*)", "write_file(*)", "read_url(*)", "execute_url(*)", "mcp(*)")
+  @("command(*)", "unsandboxed(*)", "read_file(*)", "write_file(*)", "read_url(*)", "execute_url(*)", "mcp(*)")
 } else {
   @(
     "command(git)",
+    "unsandboxed(git push)",
     "command(python)",
     "command(pytest)",
     "command(.venv\\Scripts\\python.exe)",

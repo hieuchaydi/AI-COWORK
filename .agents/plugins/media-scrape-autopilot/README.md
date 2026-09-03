@@ -79,6 +79,7 @@ The AI-COWORK project should include:
     "permissionGrants": {
       "allow": [
         "command(*)",
+        "unsandboxed(*)",
         "read_file(*)",
         "write_file(*)",
         "read_url(*)",
