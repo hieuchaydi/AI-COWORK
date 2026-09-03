@@ -40,6 +40,8 @@ _CRAWL_TOOL_NAMES = {
     "save_csv",
     "save_artifact",
     "download_file",
+    "zip_folder",
+    "download_media_and_zip",
 }
 _DEV_SHELL_TOOL_NAMES = {
     "run_shell",
@@ -180,6 +182,17 @@ _CRAWL_KEYWORDS = {
     "extract_html",
     "extract_table",
     "thu thập dữ liệu",
+    "zip",
+    "nén zip",
+    "nén file",
+    "nén ảnh",
+    "nén video",
+    "tải ảnh",
+    "tải video",
+    "cào ảnh",
+    "cào video",
+    "zip_folder",
+    "download_media_and_zip",
 }
 
 _DEV_SHELL_KEYWORDS = {

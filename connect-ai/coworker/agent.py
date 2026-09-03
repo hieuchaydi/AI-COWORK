@@ -84,14 +84,6 @@ you're doing and why (e.g. "Checking what merged since yesterday's digest."). It
 to the user as live progress. Don't narrate trivial single-call follow-ups, don't repeat \
 the previous line, and never let narration replace your final answer."""
 
-_AUTONOMOUS_TOOL_GUIDANCE = """\
-Autonomous Tool Synthesis:
-- When faced with a specialized problem that no existing tool supports (e.g. unique calculation algorithms, \
-specialized format parsing, data conversions, or custom batch transformations), you can autonomously \
-reason about the required function, write the Python implementation, and call `create_custom_tool` to \
-register it into the runtime.
-- Once registered, the new tool is hot-reloaded and immediately callable in your subsequent turn."""
-
 
 def _enabled_connector_tools(secrets: SecretStore) -> tuple[set[str], set[str]]:
     connectors = {c["name"]: c for c in connector_list(secrets)}
@@ -281,9 +273,7 @@ def build_engine(
         registry.register_all(custom_tools)
     registry.register(make_create_custom_tool(registry, ws))
 
-    instructions = (
-        f"{agent.system_prompt}\n\n{_NARRATION_GUIDANCE}\n\n{_AUTONOMOUS_TOOL_GUIDANCE}"
-    )
+    instructions = f"{agent.system_prompt}\n\n{_NARRATION_GUIDANCE}"
     if ws is not None:
         instructions = f"{instructions}\n\n{environment_context(ws)}"
     conventions = load_agents_md(ws)

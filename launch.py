@@ -1041,6 +1041,60 @@ class _HelperHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
+
+        # /outputs/<kind>/<file> — serve files from outputs/ (zips, csv, media, etc.)
+        if self.path.startswith("/outputs/"):
+            rel = urllib.parse.unquote(self.path[len("/outputs/"):].split("?")[0])
+            if ".." in rel:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"invalid path")
+                return
+            out_file = (_outputs_root() / rel).resolve()
+            # Security: ensure file stays within outputs root
+            try:
+                out_file.relative_to(_outputs_root())
+            except ValueError:
+                self.send_response(403)
+                self.end_headers()
+                self.wfile.write(b"forbidden")
+                return
+
+            if not out_file.is_file():
+                self.send_response(404)
+                self._cors()
+                self.end_headers()
+                self.wfile.write(b"not found")
+                return
+
+            ext = out_file.suffix.lower()
+            ctype = {
+                ".zip": "application/zip",
+                ".mp4": "video/mp4",
+                ".webm": "video/webm",
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".webp": "image/webp",
+                ".gif": "image/gif",
+                ".pdf": "application/pdf",
+                ".csv": "text/csv; charset=utf-8",
+                ".json": "application/json; charset=utf-8",
+                ".html": "text/html; charset=utf-8",
+                ".md": "text/markdown; charset=utf-8",
+                ".txt": "text/plain; charset=utf-8",
+            }.get(ext, "application/octet-stream")
+
+            data = out_file.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            if ext == ".zip":
+                self.send_header("Content-Disposition", f'attachment; filename="{out_file.name}"')
+            self._cors()
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if self.path == "/artifacts":
             # Simple JSON index of all artifacts.
             art_dir = ROOT / "artifacts"

@@ -75,7 +75,7 @@ Vào trang đăng nhập của X, tôi tự nhập mật khẩu, xong bảo tôi
 Chụp màn hình trang hiện tại
 ```
 
-## Crawl / scrape — 8 tool
+## Crawl / scrape — 10 tool
 
 | Tool | Việc |
 |---|---|
@@ -87,10 +87,13 @@ Chụp màn hình trang hiện tại
 | `save_csv` | ghi rows ra CSV |
 | `save_artifact` | ghi file vào `artifacts/` (publish được qua helper 8766) |
 | `download_file` | tải file về `outputs/` |
+| `download_media_and_zip` | tải danh sách URL ảnh/video về 1 folder rồi tự động đóng gói `.zip` và trả link tải trực tiếp |
+| `zip_folder` | nén toàn bộ một thư mục thành file `.zip` tại `outputs/zips/` và trả URL public một phát |
 
 ```
 Crawl 30 bài mục Khoa học của vnexpress.net, tóm tắt từng bài rồi xuất CSV
 Lấy bảng tỷ giá trên trang X và lưu thành CSV
+Cào toàn bộ ảnh và video sản phẩm rồi nén thành file zip gửi tôi tải về
 ```
 
 ---

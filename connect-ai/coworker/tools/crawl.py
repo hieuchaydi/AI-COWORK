@@ -22,6 +22,7 @@ import re
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -612,6 +613,128 @@ def _download_file(url: str, save_to: str = "", max_mb: int = 50) -> dict[str, A
     return result
 
 
+def _zip_folder(
+    folder_path: str,
+    zip_filename: str = "",
+) -> dict[str, Any]:
+    """Compress an entire directory into a .zip archive under outputs/zips/
+    and return the local path and download URL."""
+    p = Path(folder_path).expanduser().resolve()
+    if not p.exists() or not p.is_dir():
+        return {"error": f"folder not found: {folder_path}"}
+
+    zips_dir = _output_subdir("zips")
+    base_name = zip_filename.strip() if zip_filename else f"{p.name}.zip"
+    if not base_name.lower().endswith(".zip"):
+        base_name += ".zip"
+    base_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", base_name)
+    target_zip = zips_dir / base_name
+
+    file_count = 0
+    total_uncompressed = 0
+    try:
+        with zipfile.ZipFile(target_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for root, _, files in os.walk(p):
+                for f in files:
+                    full_path = Path(root) / f
+                    arcname = full_path.relative_to(p)
+                    zf.write(full_path, arcname)
+                    file_count += 1
+                    total_uncompressed += full_path.stat().st_size
+    except Exception as exc:
+        return {"error": f"failed to create zip: {exc}"}
+
+    zip_size = target_zip.stat().st_size
+    return {
+        "ok": True,
+        "zip_path": str(target_zip),
+        "zip_url": f"{_OUTPUTS_BASE_URL}/zips/{target_zip.name}",
+        "filename": target_zip.name,
+        "file_count": file_count,
+        "uncompressed_mb": round(total_uncompressed / (1024 * 1024), 2),
+        "zip_size_mb": round(zip_size / (1024 * 1024), 2),
+        "note": f"Send THIS zip_url to the user for one-click download: {_OUTPUTS_BASE_URL}/zips/{target_zip.name}",
+    }
+
+
+def _download_media_and_zip(
+    urls: list[str],
+    zip_filename: str = "",
+    folder_name: str = "",
+    max_files: int = 100,
+    max_mb_per_file: int = 25,
+) -> dict[str, Any]:
+    """Download a batch of media URLs (images, videos, attachments) into a dedicated folder,
+    then automatically pack them into a .zip archive and return the download URL (like save_csv)."""
+    if not isinstance(urls, list) or not urls:
+        return {"error": "urls must be a non-empty list of URLs"}
+
+    job_name = folder_name.strip() or zip_filename.replace(".zip", "").strip() or f"media_{int(time.time())}"
+    job_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", job_name)[:80]
+    media_dir = _output_subdir("media") / job_name
+    media_dir.mkdir(parents=True, exist_ok=True)
+
+    downloaded = []
+    errors = []
+    cap_per_file = max(1, int(max_mb_per_file or 25)) * 1024 * 1024
+    valid_urls = [u for u in urls if isinstance(u, str) and u.startswith(("http://", "https://"))][:max_files]
+
+    with _client() as c:
+        for idx, u in enumerate(valid_urls, start=1):
+            parsed_path = urllib.parse.urlparse(u).path
+            ext = Path(parsed_path).suffix.lower()
+            if not ext or len(ext) > 5 or ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".mov", ".webm", ".pdf", ".svg"):
+                ext = ".bin"
+
+            orig_name = Path(parsed_path).stem
+            orig_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", orig_name)[:30]
+            fname = f"{idx:03d}_{orig_name}{ext}" if orig_name else f"media_{idx:03d}{ext}"
+            dest = media_dir / fname
+
+            try:
+                with c.stream("GET", u) as r:
+                    r.raise_for_status()
+                    ctype = r.headers.get("content-type", "").lower()
+                    if ext == ".bin":
+                        if "jpeg" in ctype or "jpg" in ctype:
+                            dest = dest.with_suffix(".jpg")
+                        elif "png" in ctype:
+                            dest = dest.with_suffix(".png")
+                        elif "webp" in ctype:
+                            dest = dest.with_suffix(".webp")
+                        elif "mp4" in ctype:
+                            dest = dest.with_suffix(".mp4")
+                        elif "webm" in ctype:
+                            dest = dest.with_suffix(".webm")
+
+                    total = 0
+                    with open(dest, "wb") as f:
+                        for chunk in r.iter_bytes(64 * 1024):
+                            total += len(chunk)
+                            if total > cap_per_file:
+                                raise ValueError(f"exceeds max_mb_per_file={max_mb_per_file}")
+                            f.write(chunk)
+                downloaded.append({"filename": dest.name, "url": u, "size": dest.stat().st_size})
+            except Exception as exc:
+                if dest.exists():
+                    dest.unlink(missing_ok=True)
+                errors.append({"url": u, "error": str(exc)})
+
+    if not downloaded:
+        return {"error": f"No files were successfully downloaded. Errors: {errors[:5]}"}
+
+    # Automatically zip the folder
+    zip_name = zip_filename.strip() if zip_filename else f"{job_name}.zip"
+    zip_result = _zip_folder(str(media_dir), zip_filename=zip_name)
+    if "error" in zip_result:
+        return zip_result
+
+    zip_result["downloaded_count"] = len(downloaded)
+    zip_result["failed_count"] = len(errors)
+    zip_result["media_folder"] = str(media_dir)
+    return zip_result
+
+
 # ─── Factory ─────────────────────────────────────────────────────────────────
 
 def make_crawl_tools() -> list[Callable[..., Any]]:
@@ -730,6 +853,37 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
             },
         },
         ["rows", "filename"],
+        risk="low",
+    )
+    _add(
+        _zip_folder, "zip_folder",
+        "Nén toàn bộ một thư mục thành file .zip đặt tại outputs/zips/ và trả về "
+        "đường dẫn file zip cùng link tải public (http://localhost:8766/outputs/zips/<name>.zip). "
+        "Dùng khi đã cào/thu thập xong một thư mục dữ liệu, ảnh hoặc video.",
+        {
+            "folder_path": {"type": "string", "description": "Đường dẫn thư mục cần nén"},
+            "zip_filename": {"type": "string", "description": "Tên file zip (mặc định: <tên_thư_mục>.zip)"},
+        },
+        ["folder_path"],
+        risk="low",
+    )
+    _add(
+        _download_media_and_zip, "download_media_and_zip",
+        "Tải một danh sách URL ảnh/video/tài liệu về một thư mục riêng trong outputs/media/, "
+        "sau đó tự động nén lại thành file .zip và trả về URL tải trực tiếp cho người dùng. "
+        "Tiện lợi và nhanh gọn y như save_csv!",
+        {
+            "urls": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Danh sách URL ảnh hoặc video cần tải",
+            },
+            "zip_filename": {"type": "string", "description": "Tên file zip xuất ra (ví dụ: product_images.zip)"},
+            "folder_name": {"type": "string", "description": "Tên thư mục lưu tạm các media (tùy chọn)"},
+            "max_files": {"type": "integer", "description": "Số lượng file tối đa (mặc định 100)"},
+            "max_mb_per_file": {"type": "integer", "description": "Dung lượng tối đa mỗi file MB (mặc định 25)"},
+        },
+        ["urls"],
         risk="low",
     )
 

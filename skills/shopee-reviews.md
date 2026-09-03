@@ -78,8 +78,14 @@ Phần dưới chỉ dùng cho site **không** chặn CDP: gọi API của chín
 5. `save_csv(filename="shopee_reviews_<itemid>.csv", rows=<rows>)` — BOM UTF-8 mặc định đã bật,
    Excel đọc tiếng Việt không lỗi font.
 
-6. Trả lời: tổng số đánh giá, phân bố sao, 2-3 ý lặp lại nhiều nhất, kèm link
-   `[Tải CSV](artifact:outputs/csv/<tên file>)`.
+6. **Nếu user yêu cầu lấy cả ảnh / video đánh giá**:
+   - Lọc toàn bộ URL ảnh (`images`) và video (`videos`) trong kết quả đánh giá.
+   - Gọi tool: `download_media_and_zip(urls=<list_media_url>, zip_filename="shopee_media_<itemid>.zip")`.
+   - Tool sẽ tự tải toàn bộ về thư mục `outputs/media/shopee_media_<itemid>/` và tự động nén thành file `.zip`.
+
+7. Trả lời: tổng số đánh giá, phân bố sao, 2-3 ý lặp lại nhiều nhất, kèm link tải:
+   - `[Tải file CSV](http://localhost:8766/outputs/csv/<tên file>)`
+   - `[Tải trọn bộ ảnh/video .ZIP](http://localhost:8766/outputs/zips/<tên file zip>)` (nếu có cào media).
 
 ## Nếu Shopee chặn cả browser tool
 
