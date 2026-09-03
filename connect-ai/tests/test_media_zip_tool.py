@@ -1,17 +1,21 @@
-﻿"""Unit tests for media crawling and zip archiving tools (zip_folder & download_media_and_zip)."""
+"""Unit tests for media crawling and zip archiving tools (zip_folder & download_media_and_zip)."""
 
 from __future__ import annotations
 
 import sys
+import hashlib
+import json
 import zipfile
 from pathlib import Path
+
+import httpx
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pytest
-from coworker.tools.crawl import _zip_folder, make_crawl_tools
+from coworker.tools.crawl import _download_media_and_zip, _zip_folder, make_crawl_tools
 
 
 def test_crawl_tools_factory_includes_zip_tools():
@@ -63,3 +67,104 @@ def test_zip_folder_nonexistent():
     """Verify error handling when directory does not exist."""
     res = _zip_folder("C:/path/to/nonexistent/folder/12345")
     assert "error" in res
+
+
+def test_download_media_and_zip_deduplicates_by_hash(tmp_path, monkeypatch):
+    """Verify that _download_media_and_zip calculates SHA-256 hashes, deduplicates
+    identical files across different URLs (keeping only 1 copy), records duplicate_of
+    in manifest.json, and produces a ZIP with only unique files + manifest."""
+    content_dup = b"\xff\xd8\xff\xe0\x00\x10JFIF_identical_binary_image_content_12345"
+    content_uniq = b"\x89PNG\r\n\x1a\n_different_binary_image_content_67890"
+
+    sha_dup = hashlib.sha256(content_dup).hexdigest()
+    sha_uniq = hashlib.sha256(content_uniq).hexdigest()
+
+    u1 = "https://cdn1.example.com/photos/item_alpha.jpg"
+    u2 = "https://mirror2.example.com/photos/item_alpha_duplicate.jpg"
+    u3 = "https://cdn1.example.com/photos/item_beta_unique.png"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+        if "item_alpha" in url_str:
+            return httpx.Response(200, content=content_dup, headers={"content-type": "image/jpeg"})
+        elif "item_beta" in url_str:
+            return httpx.Response(200, content=content_uniq, headers={"content-type": "image/png"})
+        return httpx.Response(404)
+
+    mock_client = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr("coworker.tools.crawl._client", lambda: mock_client)
+
+    res = _download_media_and_zip(
+        urls=[u1, u2, u3],
+        zip_filename="test_dedup_bundle.zip",
+        folder_name="test_dedup_job",
+        output_dir=str(tmp_path),
+    )
+
+    # 1. Check returned metadata
+    assert res.get("ok") is True
+    assert res["downloaded_count"] == 2
+    assert res["unique_count"] == 2
+    assert res["duplicate_count"] == 1
+    assert res["failed_count"] == 0
+    # ZIP contains 2 unique media files + 1 manifest.json = 3 files
+    assert res["file_count"] == 3
+
+    # 2. Check files on disk in media_folder
+    media_dir = Path(res["media_folder"])
+    assert media_dir.exists()
+    disk_files = {p.name for p in media_dir.iterdir() if p.is_file()}
+    assert "manifest.json" in disk_files
+    # Only 2 unique media files + 1 manifest on disk (duplicate file was unlinked)
+    assert len(disk_files) == 3
+
+    # 3. Check manifest.json contents
+    manifest_path = Path(res["manifest_path"])
+    assert manifest_path.exists()
+    manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert manifest_data["total_urls"] == 3
+    assert manifest_data["unique_count"] == 2
+    assert manifest_data["duplicate_count"] == 1
+    assert len(manifest_data["files"]) == 3
+
+    file_0 = manifest_data["files"][0]
+    file_1 = manifest_data["files"][1]
+    file_2 = manifest_data["files"][2]
+
+    # Primary file (kept)
+    assert file_0["url"] == u1
+    assert file_0["sha256"] == sha_dup
+    assert file_0["duplicate_of"] is None
+    primary_name = file_0["filename"]
+    assert (media_dir / primary_name).exists()
+
+    # Duplicate file (different URL, identical sha256 -> deleted, duplicate_of set)
+    assert file_1["url"] == u2
+    assert file_1["sha256"] == sha_dup
+    assert file_1["duplicate_of"] == primary_name
+    assert not (media_dir / file_1["filename"]).exists()
+
+    # Unique second file (kept)
+    assert file_2["url"] == u3
+    assert file_2["sha256"] == sha_uniq
+    assert file_2["duplicate_of"] is None
+    assert (media_dir / file_2["filename"]).exists()
+
+    # 4. Check ZIP archive contents: must only contain unique files + manifest.json
+    zip_path = Path(res["zip_path"])
+    assert zip_path.exists()
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        namelist = zf.namelist()
+        assert "manifest.json" in namelist
+        assert primary_name in namelist
+        assert file_2["filename"] in namelist
+        # Duplicate file must NOT be inside the ZIP
+        assert file_1["filename"] not in namelist
+        assert len(namelist) == 3
+
+        # Validate manifest inside ZIP matches disk manifest
+        zip_manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+        assert zip_manifest["duplicate_count"] == 1
+        assert zip_manifest["files"][1]["duplicate_of"] == primary_name
+

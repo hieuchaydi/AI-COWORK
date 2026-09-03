@@ -97,6 +97,10 @@ def crawl_and_export_bundle(
                 "file_count": zip_res.get("file_count", 0),
                 "zip_size_mb": zip_res.get("zip_size_mb", 0.0),
                 "media_folder": zip_res.get("media_folder"),
+                "unique_count": zip_res.get("unique_count", zip_res.get("file_count", 0)),
+                "duplicate_count": zip_res.get("duplicate_count", 0),
+                "manifest_path": zip_res.get("manifest_path"),
+                "manifest": zip_res.get("manifest"),
             }
     else:
         result["zip"] = None

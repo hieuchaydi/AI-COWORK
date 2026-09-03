@@ -132,3 +132,48 @@ def test_crawl_and_export_bundle_custom_output_dir(tmp_path, monkeypatch):
     assert Path(res["csv"]["path"]).exists()
     assert str(custom_dir) in res["zip"]["path"]
     assert Path(res["zip"]["path"]).exists()
+
+
+def test_crawl_and_export_bundle_forwards_manifest_and_dedup_metadata(monkeypatch):
+    """Verify that crawl_and_export_bundle exposes unique_count, duplicate_count, and manifest."""
+    rows = [
+        {"title": "Item 1", "img": "https://example.com/img1.jpg"},
+        {"title": "Item 2", "img": "https://example.com/img2_dup.jpg"},
+    ]
+
+    mock_manifest = {
+        "job_name": "test_job",
+        "unique_count": 1,
+        "duplicate_count": 1,
+        "files": [
+            {"url": "https://example.com/img1.jpg", "duplicate_of": None},
+            {"url": "https://example.com/img2_dup.jpg", "duplicate_of": "001_img1.jpg"},
+        ],
+    }
+
+    def mock_download_and_zip(urls, zip_filename, folder_name, **kwargs):
+        return {
+            "ok": True,
+            "zip_path": f"/tmp/{zip_filename}",
+            "zip_url": f"http://localhost:8766/outputs/zips/{zip_filename}",
+            "file_count": 2,
+            "zip_size_mb": 0.5,
+            "media_folder": f"/tmp/{folder_name}",
+            "unique_count": 1,
+            "duplicate_count": 1,
+            "manifest_path": f"/tmp/{folder_name}/manifest.json",
+            "manifest": mock_manifest,
+        }
+
+    monkeypatch.setattr("coworker.tools.media_pipeline._download_media_and_zip", mock_download_and_zip)
+
+    res = crawl_and_export_bundle(rows, job_name="dedup_bundle_job")
+    assert res.get("ok") is True
+    assert res["zip"] is not None
+    assert res["zip"]["unique_count"] == 1
+    assert res["zip"]["duplicate_count"] == 1
+    assert res["zip"]["manifest_path"] == "/tmp/dedup_bundle_job/manifest.json"
+    assert res["zip"]["manifest"] == mock_manifest
+
+    Path(res["csv"]["path"]).unlink(missing_ok=True)
+

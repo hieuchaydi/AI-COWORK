@@ -48,9 +48,12 @@ Use this skill whenever the user asks to crawl, scrape, collect, export, or anal
    zip_folder(folder_path="outputs/media/<job_name>", zip_filename="<job_name>_media.zip")
    ```
 
-## Media URL Handling
+## Media URL Handling & Hash Deduplication
 
 - Deduplicate URLs while preserving order.
+- Content hash deduplication: Files are automatically hashed with SHA-256 during download. If different URLs yield identical content, only 1 file is kept on disk.
+- Manifest: A `manifest.json` is generated with `duplicate_of` pointing to the primary unique file for any duplicates.
+- The exported ZIP archive contains only unique files plus `manifest.json`.
 - Include images and videos by default when the task asks for "media", "anh", "hinh anh", "video", "gallery", "review co anh", or similar wording.
 - Do not download buyer avatars or profile pictures unless the user specifically asks for them.
 - Respect max file limits if a tool enforces them; report partial failures clearly.

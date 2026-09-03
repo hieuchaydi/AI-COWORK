@@ -17,6 +17,8 @@ and truncate large responses so a single tool call can't flood the LLM context.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import time
@@ -670,7 +672,8 @@ def _download_media_and_zip(
     output_dir: str = "",
 ) -> dict[str, Any]:
     """Download a batch of media URLs (images, videos, attachments) into a dedicated folder,
-    then automatically pack them into a .zip archive and return the download URL (like save_csv)."""
+    deduplicating identical files by SHA-256 hash, generating a manifest.json with duplicate_of
+    mappings, and packing unique files + manifest into a .zip archive."""
     if not isinstance(urls, list) or not urls:
         return {"error": "urls must be a non-empty list of URLs"}
 
@@ -681,6 +684,11 @@ def _download_media_and_zip(
 
     downloaded = []
     errors = []
+    seen_hashes: dict[str, str] = {}
+    manifest_entries: list[dict[str, Any]] = []
+    unique_files: list[dict[str, Any]] = []
+    duplicate_files: list[dict[str, Any]] = []
+
     cap_per_file = max(1, int(max_mb_per_file or 25)) * 1024 * 1024
     valid_urls = [u for u in urls if isinstance(u, str) and u.startswith(("http://", "https://"))][:max_files]
 
@@ -712,14 +720,42 @@ def _download_media_and_zip(
                         elif "webm" in ctype:
                             dest = dest.with_suffix(".webm")
 
+                    hasher = hashlib.sha256()
                     total = 0
                     with open(dest, "wb") as f:
                         for chunk in r.iter_bytes(64 * 1024):
                             total += len(chunk)
                             if total > cap_per_file:
                                 raise ValueError(f"exceeds max_mb_per_file={max_mb_per_file}")
+                            hasher.update(chunk)
                             f.write(chunk)
-                downloaded.append({"filename": dest.name, "url": u, "size": dest.stat().st_size})
+
+                file_hash = hasher.hexdigest()
+
+                if file_hash in seen_hashes:
+                    primary_filename = seen_hashes[file_hash]
+                    dest.unlink(missing_ok=True)
+                    entry = {
+                        "url": u,
+                        "filename": dest.name,
+                        "sha256": file_hash,
+                        "size": total,
+                        "duplicate_of": primary_filename,
+                    }
+                    manifest_entries.append(entry)
+                    duplicate_files.append(entry)
+                else:
+                    seen_hashes[file_hash] = dest.name
+                    entry = {
+                        "url": u,
+                        "filename": dest.name,
+                        "sha256": file_hash,
+                        "size": total,
+                        "duplicate_of": None,
+                    }
+                    manifest_entries.append(entry)
+                    unique_files.append(entry)
+                    downloaded.append({"filename": dest.name, "url": u, "size": total, "sha256": file_hash})
             except Exception as exc:
                 if dest.exists():
                     dest.unlink(missing_ok=True)
@@ -728,15 +764,33 @@ def _download_media_and_zip(
     if not downloaded:
         return {"error": f"No files were successfully downloaded. Errors: {errors[:5]}"}
 
-    # Automatically zip the folder
+    # Generate manifest.json (contains all URLs/files with duplicate_of for duplicates)
+    manifest_data = {
+        "job_name": job_name,
+        "created_at": datetime.now().isoformat(),
+        "total_urls": len(valid_urls),
+        "downloaded_count": len(downloaded),
+        "unique_count": len(unique_files),
+        "duplicate_count": len(duplicate_files),
+        "failed_count": len(errors),
+        "files": manifest_entries,
+    }
+    manifest_path = media_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest_data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # Automatically zip the folder (only contains unique files + manifest.json)
     zip_name = zip_filename.strip() if zip_filename else f"{job_name}.zip"
     zip_result = _zip_folder(str(media_dir), zip_filename=zip_name, output_dir=output_dir)
     if "error" in zip_result:
         return zip_result
 
     zip_result["downloaded_count"] = len(downloaded)
+    zip_result["unique_count"] = len(unique_files)
+    zip_result["duplicate_count"] = len(duplicate_files)
     zip_result["failed_count"] = len(errors)
     zip_result["media_folder"] = str(media_dir)
+    zip_result["manifest_path"] = str(manifest_path)
+    zip_result["manifest"] = manifest_data
     return zip_result
 
 
@@ -898,9 +952,9 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
     )
     _add(
         _download_media_and_zip, "download_media_and_zip",
-        "Tải một danh sách URL ảnh/video/tài liệu về một thư mục riêng trong outputs/media/, "
-        "sau đó tự động nén lại thành file .zip và trả về URL tải trực tiếp cho người dùng. "
-        "Tiện lợi và nhanh gọn y như save_csv!",
+        "Tải một danh sách URL ảnh/video/tài liệu về thư mục outputs/media/, tự động "
+        "tính mã băm SHA-256 chống trùng file (chỉ lưu 1 bản duy nhất và ghi duplicate_of "
+        "vào manifest.json), nén các file unique + manifest thành .zip và trả về URL tải trực tiếp.",
         {
             "urls": {
                 "type": "array",
