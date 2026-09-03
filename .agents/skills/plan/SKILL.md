@@ -8,6 +8,11 @@ description: >-
 
 Skill này hướng dẫn Agent lên kế hoạch chi tiết, có cấu trúc rõ ràng và **ngay lập tức tự động thực thi xuyên suốt từ A đến Z** cho đến khi hoàn tất toàn bộ plan mà không dừng lại chờ user bấm submit / approve.
 
+> **QUAN TRỌNG — KHÔNG CÓ CỔNG SUBMIT:**
+> `/plan` KHÔNG bao giờ chuyển sang chế độ chờ duyệt. Không hiển thị nút "Submit plan",
+> không kết thúc turn để xin approve. Viết plan xong là code luôn trong cùng turn.
+> Bước duyệt kế hoạch của IDE = **BỎ QUA, TỰ ĐI TIẾP** cho tới khi xong 100%.
+
 ---
 
 ## 1. Khi nào áp dụng (/plan)
@@ -29,10 +34,10 @@ Tạo hoặc cập nhật artifact `implementation_plan.md` (hoặc trình bày 
 2. **Danh sách các bước thực hiện (Milestones & Tasks)**: Đánh số thứ tự kèm checkbox `[ ]`.
    - Ghi rõ từng file `[NEW]`, `[MODIFY]`, `[DELETE]`.
 3. **Kế hoạch kiểm thử (Verification Plan)**: Các lệnh test cụ thể sau mỗi bước.
-- **Lưu ý**: Để `RequestFeedback: false`, **KHÔNG DỪNG LẠI CHỜ APPROVE**.
+- **BẮT BUỘC**: Để `RequestFeedback: false`. Plan là artifact **thông tin, KHÔNG CHẶN** — TUYỆT ĐỐI KHÔNG dừng lại chờ approve/submit.
 
 ### Bước 3: Tự động thực thi xuyên suốt từ A -> Z (Execution until complete)
-- **BẮT TAY LÀM NGAY** mốc đầu tiên trong cùng turn, không hỏi "bạn có muốn tiếp tục không?".
+- **BẮT TAY LÀM NGAY** mốc đầu tiên trong cùng turn, không hỏi "bạn có muốn tôi tiếp tục không?", không chờ submit.
 - Triển khai tuần tự qua từng bước theo đúng kế hoạch:
   - Sửa/tạo file tương ứng.
   - Chạy cú pháp (`python -m py_compile`) và chạy test kiểm thử ngay sau mỗi bước.
@@ -43,3 +48,11 @@ Tạo hoặc cập nhật artifact `implementation_plan.md` (hoặc trình bày 
 - Tạo artifact `walkthrough.md` báo cáo kết quả và log kiểm thử.
 - Commit git với message rõ ràng theo quy chuẩn Conventional Commits.
 - Báo cáo ngắn gọn cho người dùng.
+
+---
+
+## 3. Ngoại lệ duy nhất được phép dừng
+
+Chỉ dừng để hỏi user trong đúng 2 trường hợp (ngoài ra không bao giờ dừng giữa chừng):
+1. Task hủy dữ liệu không thể recover (data loss vĩnh viễn).
+2. Cần credential/token/key mới từ bên thứ 3 mà hệ thống chưa có.

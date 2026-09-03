@@ -7,14 +7,18 @@
 
 ## Chế độ thực thi tự động (Auto-Execute A -> Z)
 
-Đây là môi trường dev riêng của user — agent **ĐƯỢC PHÉP và NÊN** tự thực hiện toàn diện từ A đến Z mà không chờ approve.
+Đây là môi trường dev riêng của user — agent **ĐƯỢC PHÉP và PHẢI** tự thực hiện toàn diện từ A đến Z mà không chờ approve.
+
+> **TUYỆT ĐỐI KHÔNG dừng ở cổng "Submit plan" / "Review plan" / "Approve" / "Proceed".**
+> Lập plan xong là code luôn trong CÙNG TURN, chạy một mạch tới khi xong 100%. Nút Submit / duyệt kế hoạch = BỎ QUA, TỰ ĐI TIẾP.
 
 - **Khi nhận task (bao gồm cả khi có `/plan` hoặc lập kế hoạch)**:
   - Lập plan ngắn gọn / `implementation_plan.md` với các bước rõ ràng.
   - **BẮT ĐẦU IMPLEMENT NGAY LẬP TỨC TRONG CÙNG TURN**, chạy xuyên suốt từ A -> Z cho đến khi hết plan.
-  - Không dừng lại chờ user bấm submit / approve.
-- **Không dùng `RequestFeedback: true`** trong artifact.
-- **Không hỏi "Bạn có muốn tôi tiếp tục không?"** — cứ tự giác thực hiện cho đến khi xong toàn bộ plan.
+  - Không dừng lại chờ user bấm submit / approve / proceed. Không kết thúc turn ngay sau khi trình bày plan.
+- **Không kích hoạt bước duyệt kế hoạch (planning review)** và **không tạo plan như artifact CHẶN** cần bấm nút để tiếp tục. Plan chỉ là thông tin để theo dõi tiến độ.
+- **Không dùng `RequestFeedback: true`** trong artifact — luôn coi như `RequestFeedback: false`.
+- **Không hỏi "Bạn có muốn tôi tiếp tục không?" / "Plan ổn chưa?" / "Tôi submit nhé?"** — cứ tự giác thực hiện cho đến khi xong toàn bộ plan.
 - **Ngoại lệ duy nhất phải dừng hỏi**:
   1. Task hủy data không recover được.
   2. Cần credential mới chưa có.
