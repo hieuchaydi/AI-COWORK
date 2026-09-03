@@ -36,3 +36,14 @@ Follow-up fix: the live Antigravity 2.0 project config for `Desktop/AI-COWORK` w
 - allow grants for `command(git)`, Python, pytest, npm, node, `read_url(*)`, and `execute_url(*)`
 
 The previous config files were backed up with suffix `.bak-20260903-161317`.
+
+Second follow-up fix: Antigravity still prompted for PowerShell `Set-Content` because that command did not match the narrower `command(git)` / Python / npm allow rules, and the active session may not have reloaded `toolPermission`. The live global config and both project config files were updated with wildcard grants:
+
+- `command(*)`
+- `read_file(*)`
+- `write_file(*)`
+- `read_url(*)`
+- `execute_url(*)`
+- `mcp(*)`
+
+The previous config files were backed up again with suffix `.bak-20260903-161810`. The plugin now includes `scripts/install_antigravity_auto_approvals.ps1` to reapply these settings later.

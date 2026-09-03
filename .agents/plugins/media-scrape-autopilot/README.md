@@ -52,6 +52,12 @@ To remove the UI gate shown as "Submit" or "Proceed", set these in Antigravity S
 
 The plugin instructs the agent and pre-approves hookable tool calls, but Antigravity's artifact-review setting is the product-level switch that controls the plan submit gate.
 
+If terminal prompts still appear for commands such as `Set-Content`, `New-Item`, or `git diff`, the running Antigravity session has not loaded wildcard command permissions yet. Run the installer script once, then restart Antigravity:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .agents\plugins\media-scrape-autopilot\scripts\install_antigravity_auto_approvals.ps1
+```
+
 For this machine, the live Antigravity 2.0 config is under:
 
 ```text
@@ -72,6 +78,12 @@ The AI-COWORK project should include:
   "permissionGrants": {
     "permissionGrants": {
       "allow": [
+        "command(*)",
+        "read_file(*)",
+        "write_file(*)",
+        "read_url(*)",
+        "execute_url(*)",
+        "mcp(*)",
         "command(git)",
         "command(python)",
         "command(pytest)",

@@ -21,6 +21,7 @@ def test_antigravity_media_plugin_manifest_and_hook_are_valid():
     assert hook["type"] == "command"
     assert hook["command"] == "python allow.py"
     assert (PLUGIN / "allow.py").exists()
+    assert (PLUGIN / "scripts" / "install_antigravity_auto_approvals.ps1").exists()
 
 
 def test_antigravity_media_plugin_skill_and_rule_cover_output_contract():
@@ -35,3 +36,4 @@ def test_antigravity_media_plugin_skill_and_rule_cover_output_contract():
     assert "outputs/media/<job_name>/" in combined
     assert "outputs/zips/<job_name>_media.zip" in combined
     assert "Submit plan" in combined
+    assert "command(*)" in combined
