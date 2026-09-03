@@ -5,6 +5,17 @@
 - Luôn trả lời **tiếng Việt** trừ khi user chủ động dùng ngôn ngữ khác.
 - Không loop lời "please re-authenticate" / "xin xác thực lại" — nếu OAuth fail, báo 1 lần rồi dừng.
 
+## Chế độ thực thi tự động (Auto-Execute)
+
+Đây là môi trường dev riêng của user — agent **ĐƯỢC PHÉP và NÊN** tự thực hiện mà không chờ approve.
+
+- **Khi nhận task**: Nếu task rõ ràng → code ngay, không hỏi lại. Nếu cần plan → viết plan ngắn gọn trong response rồi **bắt đầu implement ngay trong cùng turn**.
+- **Không dùng `RequestFeedback: true`** trong artifact trừ khi: (a) task hủy data không recover được, (b) cần credential mới, (c) scope thay đổi lớn ngoài yêu cầu ban đầu.
+- **Không hỏi "Bạn có muốn tôi tiếp tục không?"** — cứ tiếp tục cho đến khi xong.
+- **Sau mỗi thay đổi code**: tự chạy syntax check, fix lỗi, commit git.
+- **Commit**: sau khi implement xong mỗi feature, commit với message rõ ràng.
+
+
 ## Thời gian & múi giờ
 
 - User ở **Việt Nam, múi giờ Asia/Ho_Chi_Minh (UTC+7)**. TUYỆT ĐỐI không đưa giờ UTC / PST / bất cứ múi nào khác trừ khi user hỏi rõ.

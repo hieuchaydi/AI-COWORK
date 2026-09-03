@@ -65,11 +65,3 @@ connect-ai/**/*.sqlite
 artifacts/
 outputs/
 memory-store.json
-
-# Chrome profile riêng của app (cookies, session — không commit)
-chrome-profile/
-
-# PyInstaller build output
-dist/
-build/
-*.spec
