@@ -1,4 +1,4 @@
-﻿"""Unit tests for media_pipeline.crawl_and_export_bundle."""
+"""Unit tests for media_pipeline.crawl_and_export_bundle."""
 
 from __future__ import annotations
 
@@ -103,3 +103,32 @@ def test_crawl_and_export_bundle_registered_as_crawl_tool(monkeypatch):
     assert res["zip"]["url"].endswith("/registered_bundle_media.zip")
 
     Path(res["csv"]["path"]).unlink(missing_ok=True)
+
+
+def test_crawl_and_export_bundle_custom_output_dir(tmp_path, monkeypatch):
+    """Verify that specifying custom output_dir routes both CSV and ZIP to that folder."""
+    custom_dir = tmp_path / "custom_workspace_export"
+    rows = [{"title": "Item 1", "img": "https://example.com/test.jpg"}]
+
+    def mock_download_and_zip(urls, zip_filename, folder_name, output_dir="", **kwargs):
+        assert str(custom_dir) in output_dir
+        zip_path = Path(output_dir) / "zips" / zip_filename
+        zip_path.parent.mkdir(parents=True, exist_ok=True)
+        zip_path.write_bytes(b"mock_zip")
+        return {
+            "ok": True,
+            "zip_path": str(zip_path),
+            "zip_url": f"http://localhost:8766/outputs/zips/{zip_filename}",
+            "file_count": 1,
+            "zip_size_mb": 0.1,
+            "media_folder": str(Path(output_dir) / "media" / folder_name),
+        }
+
+    monkeypatch.setattr("coworker.tools.media_pipeline._download_media_and_zip", mock_download_and_zip)
+
+    res = crawl_and_export_bundle(rows, job_name="custom_job", output_dir=str(custom_dir))
+    assert res.get("ok") is True
+    assert str(custom_dir) in res["csv"]["path"]
+    assert Path(res["csv"]["path"]).exists()
+    assert str(custom_dir) in res["zip"]["path"]
+    assert Path(res["zip"]["path"]).exists()

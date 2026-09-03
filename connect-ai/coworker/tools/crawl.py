@@ -63,10 +63,11 @@ def _output_root() -> Path:
     return base
 
 
-def _output_subdir(kind: str) -> Path:
-    """Get (and auto-create) a subdirectory under the output root."""
+def _output_subdir(kind: str, base_dir: str | Path | None = None) -> Path:
+    """Get (and auto-create) a subdirectory under base_dir (or default output root)."""
     kind = re.sub(r"[^a-z0-9_-]+", "", (kind or "misc").lower()) or "misc"
-    d = _output_root() / kind
+    root = Path(base_dir).expanduser().resolve() if base_dir else _output_root()
+    d = root / kind
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -470,6 +471,7 @@ def _save_artifact(
     filename: str,
     encoding: str = "utf-8",
     add_utf8_bom: bool = True,
+    output_dir: str = "",
 ) -> dict[str, Any]:
     """Save a text file into the project's outputs folder (subdir chosen by
     extension: `.csv` → outputs/csv/, `.pdf/.zip` → outputs/downloads/, else
@@ -483,7 +485,7 @@ def _save_artifact(
     if not filename or ".." in filename or "/" in filename or "\\" in filename:
         return {"error": "filename must be a simple name (no path, no '..')"}
     kind = _kind_from_ext(filename)
-    target = _output_subdir(kind) / filename
+    target = _output_subdir(kind, base_dir=output_dir) / filename
     is_csv = filename.lower().endswith(".csv")
     payload = content or ""
     try:
@@ -552,6 +554,7 @@ def _save_csv(
     rows: list,
     filename: str,
     headers: list = None,
+    output_dir: str = "",
 ) -> dict[str, Any]:
     """One-shot: convert list of dicts / rows → CSV → save to artifacts folder
     with UTF-8 BOM + CRLF line endings. Returns the public URL. Use this
@@ -562,7 +565,7 @@ def _save_csv(
     csv_text = _rows_to_csv(rows, headers=headers)
     if not filename.lower().endswith(".csv"):
         filename += ".csv"
-    r = _save_artifact(csv_text, filename, encoding="utf-8", add_utf8_bom=True)
+    r = _save_artifact(csv_text, filename, encoding="utf-8", add_utf8_bom=True, output_dir=output_dir)
     if "url" in r:
         r["row_count"] = len(rows)
         r["headers"] = headers or (list(rows[0].keys()) if rows and isinstance(rows[0], dict) else [])
@@ -616,6 +619,7 @@ def _download_file(url: str, save_to: str = "", max_mb: int = 50) -> dict[str, A
 def _zip_folder(
     folder_path: str,
     zip_filename: str = "",
+    output_dir: str = "",
 ) -> dict[str, Any]:
     """Compress an entire directory into a .zip archive under outputs/zips/
     and return the local path and download URL."""
@@ -623,7 +627,7 @@ def _zip_folder(
     if not p.exists() or not p.is_dir():
         return {"error": f"folder not found: {folder_path}"}
 
-    zips_dir = _output_subdir("zips")
+    zips_dir = _output_subdir("zips", base_dir=output_dir)
     base_name = zip_filename.strip() if zip_filename else f"{p.name}.zip"
     if not base_name.lower().endswith(".zip"):
         base_name += ".zip"
@@ -663,6 +667,7 @@ def _download_media_and_zip(
     folder_name: str = "",
     max_files: int = 100,
     max_mb_per_file: int = 25,
+    output_dir: str = "",
 ) -> dict[str, Any]:
     """Download a batch of media URLs (images, videos, attachments) into a dedicated folder,
     then automatically pack them into a .zip archive and return the download URL (like save_csv)."""
@@ -671,7 +676,7 @@ def _download_media_and_zip(
 
     job_name = folder_name.strip() or zip_filename.replace(".zip", "").strip() or f"media_{int(time.time())}"
     job_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", job_name)[:80]
-    media_dir = _output_subdir("media") / job_name
+    media_dir = _output_subdir("media", base_dir=output_dir) / job_name
     media_dir.mkdir(parents=True, exist_ok=True)
 
     downloaded = []
@@ -725,7 +730,7 @@ def _download_media_and_zip(
 
     # Automatically zip the folder
     zip_name = zip_filename.strip() if zip_filename else f"{job_name}.zip"
-    zip_result = _zip_folder(str(media_dir), zip_filename=zip_name)
+    zip_result = _zip_folder(str(media_dir), zip_filename=zip_name, output_dir=output_dir)
     if "error" in zip_result:
         return zip_result
 
@@ -873,6 +878,7 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
                 "items": {"type": "string"},
                 "description": "optional, override / order columns",
             },
+            "output_dir": {"type": "string", "description": "Thư mục lưu tùy chỉnh (để trống nếu dùng mặc định outputs/)"},
         },
         ["rows", "filename"],
         risk="low",
@@ -885,6 +891,7 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
         {
             "folder_path": {"type": "string", "description": "Đường dẫn thư mục cần nén"},
             "zip_filename": {"type": "string", "description": "Tên file zip (mặc định: <tên_thư_mục>.zip)"},
+            "output_dir": {"type": "string", "description": "Thư mục lưu tùy chỉnh (để trống nếu dùng mặc định outputs/)"},
         },
         ["folder_path"],
         risk="low",
@@ -904,6 +911,7 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
             "folder_name": {"type": "string", "description": "Tên thư mục lưu tạm các media (tùy chọn)"},
             "max_files": {"type": "integer", "description": "Số lượng file tối đa (mặc định 100)"},
             "max_mb_per_file": {"type": "integer", "description": "Dung lượng tối đa mỗi file MB (mặc định 25)"},
+            "output_dir": {"type": "string", "description": "Thư mục lưu tùy chỉnh (để trống nếu dùng mặc định outputs/)"},
         },
         ["urls"],
         risk="low",
@@ -933,6 +941,7 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
                 "items": {"type": "string"},
                 "description": "Optional CSV column order",
             },
+            "output_dir": {"type": "string", "description": "Thư mục lưu tùy chỉnh (để trống nếu dùng mặc định outputs/)"},
         },
         ["rows"],
         risk="low",

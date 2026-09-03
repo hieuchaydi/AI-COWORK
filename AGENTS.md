@@ -55,6 +55,18 @@
      - `[Tải file CSV](http://localhost:8766/outputs/csv/<tên>.csv)`
      - `[Tải trọn bộ ảnh/video .ZIP](http://localhost:8766/outputs/zips/<tên>_media.zip)`
 
+## Tùy chọn thư mục lưu trữ khi cào dữ liệu (Custom Output Directory)
+
+- **Khi nhận yêu cầu cào dữ liệu** (trừ khi user đã ghi rõ đường dẫn thư mục trong prompt):
+  1. **Hiển thị form hỏi người dùng**: Dùng `ask_question` (hoặc `ask_user`):
+     - Câu hỏi: `"Bạn muốn lưu toàn bộ kết quả cào dữ liệu (CSV, ảnh/video, file ZIP) vào thư mục nào?"`
+     - Lựa chọn:
+       - `(Khuyên dùng) Lưu mặc định vào thư mục outputs/ của dự án`
+       - `Lưu ra Desktop (Desktop/crawled_data/)`
+  2. **Xử lý lựa chọn**:
+     - Nếu người dùng bấm **Bỏ qua (Skip)** hoặc chọn Mặc định: Hệ thống tự động dùng thư mục mặc định `outputs/` của dự án và chạy tiếp ngay một mạch từ A -> Z.
+     - Nếu người dùng nhập đường dẫn cụ thể (ví dụ `D:/Data/Crawl`): Hệ thống truyền `output_dir` vào các tool `save_csv`, `download_media_and_zip`, `crawl_and_export_bundle` để lưu toàn bộ dữ liệu vào đúng vị trí đó.
+
 ## Cào web — site chặn bot (Shopee, Lazada, TikTok Shop…)
 
 ### Shopee — dùng job queue, ĐỪNG dùng browser tool
