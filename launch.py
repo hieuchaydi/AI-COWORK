@@ -200,18 +200,21 @@ def _run_tool_in_sandbox(code: str, args: dict, timeout: int = 30) -> dict:
     """
     runner_script = (
         "import sys, json, traceback\n"
+        "real_stdout = sys.stdout\n"
+        "sys.stdout = sys.stderr\n"
         "args = json.loads(sys.argv[1])\n"
         "try:\n"
         + "\n".join("    " + line for line in code.splitlines())
         + "\n"
         "    result = run(args)\n"
-        "    print(json.dumps({'ok': True, 'result': result}))\n"
+        "    real_stdout.write(json.dumps({'ok': True, 'result': result}) + '\\n')\n"
         "except Exception as e:\n"
-        "    print(json.dumps({'ok': False, 'error': traceback.format_exc()}))\n"
+        "    real_stdout.write(json.dumps({'ok': False, 'error': traceback.format_exc()}) + '\\n')\n"
     )
     try:
         proc = subprocess.run(
-            [str(VENV_PY), "-c", runner_script, json.dumps(args)],
+            [str(VENV_PY), "-", json.dumps(args)],
+            input=runner_script,
             capture_output=True,
             text=True,
             timeout=timeout,

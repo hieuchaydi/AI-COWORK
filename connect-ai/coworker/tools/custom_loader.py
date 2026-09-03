@@ -1,4 +1,4 @@
-﻿"""Dynamic custom tools auto-discovery and loader.
+"""Dynamic custom tools auto-discovery and loader.
 
 Scans designated custom tool directories (e.g. `custom_tools/` in workspace root),
 loads Python modules, and extracts functions decorated with `@coworker_tool`.
@@ -80,3 +80,95 @@ def discover_custom_tools(workspace: Optional[Path] = None) -> list[Callable[...
                 logger.warning("Failed to load custom tool from %s: %s", py_file, exc)
 
     return tools
+
+
+def reload_custom_tools(registry: Any, workspace: Optional[Path] = None) -> list[str]:
+    """Scan custom tool directories and register any new/updated tools into the registry."""
+    discovered = discover_custom_tools(workspace)
+    added: list[str] = []
+    for tool_fn in discovered:
+        name = getattr(tool_fn, "__name__", None)
+        if name:
+            registry.register(tool_fn)
+            added.append(name)
+    return added
+
+
+def make_create_custom_tool(registry: Any, workspace: Optional[Path] = None) -> Callable[..., Any]:
+    """Return a tool function that allows the agent to create and hot-register custom tools."""
+    import ast
+    import re
+    from .base import coworker_tool, tool_success, tool_error
+
+    @coworker_tool(
+        name="create_custom_tool",
+        category="core",
+        requires_approval=True,
+        description=(
+            "Tạo và nạp một công cụ Python mới vào hệ thống ngay lập tức (hot-reload). "
+            "Code Python phải định nghĩa hàm cần tạo."
+        ),
+    )
+    def create_custom_tool(
+        name: str,
+        code: str,
+        description: str = "",
+        requires_approval: bool = False,
+    ) -> dict[str, Any]:
+        cleaned_name = name.strip().lower()
+        if not re.match(r"^[a-z][a-z0-9_]*$", cleaned_name):
+            return tool_error("Tool name must be valid snake_case (lowercase letters, numbers, underscores).")
+
+        # 1. AST syntax check
+        try:
+            ast.parse(code)
+        except SyntaxError as exc:
+            return tool_error(f"Python syntax error in tool code: {exc}")
+
+        # 2. Determine target custom_tools directory
+        target_dir = (workspace / "custom_tools") if workspace else (
+            Path(__file__).resolve().parent.parent.parent.parent / "custom_tools"
+        )
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_file = target_dir / f"{cleaned_name}.py"
+
+        # 3. Ensure necessary imports and decorator if not present
+        prepared_code = code
+        if "@coworker_tool" not in code and f"def {cleaned_name}(" in code:
+            prepared_code = (
+                "from coworker.tools.base import coworker_tool, tool_success, tool_error\n\n"
+                f'@coworker_tool(name="{cleaned_name}", description="{description}", requires_approval={requires_approval})\n'
+                + code
+            )
+
+        # 4. Write to disk
+        try:
+            target_file.write_text(prepared_code, encoding="utf-8")
+        except Exception as exc:
+            return tool_error(f"Cannot write file {target_file}: {exc}")
+
+        # 5. Hot-reload into registry
+        try:
+            module_name = f"coworker_custom_tool_{cleaned_name}"
+            spec = importlib.util.spec_from_file_location(module_name, target_file)
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+                tool_func = getattr(module, cleaned_name, None)
+                if tool_func and callable(tool_func):
+                    registry.register(tool_func)
+                    return tool_success(
+                        data={
+                            "tool": cleaned_name,
+                            "file": str(target_file),
+                            "hot_reloaded": True,
+                            "note": f"Custom tool '{cleaned_name}' successfully created and hot-reloaded.",
+                        }
+                    )
+        except Exception as exc:
+            return tool_error(f"File created at {target_file} but registry hot-reload failed: {exc}")
+
+        return tool_success(data={"tool": cleaned_name, "file": str(target_file), "hot_reloaded": False})
+
+    return create_custom_tool

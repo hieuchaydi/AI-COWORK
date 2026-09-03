@@ -87,18 +87,21 @@ def _run_sandbox(code: str, args: dict, timeout: int = 30) -> dict:
     """
     runner = (
         "import sys, json, traceback\n"
+        "real_stdout = sys.stdout\n"
+        "sys.stdout = sys.stderr\n"
         "args = json.loads(sys.argv[1])\n"
         "try:\n"
         + "\n".join("    " + ln for ln in code.splitlines())
         + "\n"
         "    result = run(args)\n"
-        "    print(json.dumps({'ok': True, 'result': result}))\n"
+        "    real_stdout.write(json.dumps({'ok': True, 'result': result}) + '\\n')\n"
         "except Exception:\n"
-        "    print(json.dumps({'ok': False, 'error': traceback.format_exc()}))\n"
+        "    real_stdout.write(json.dumps({'ok': False, 'error': traceback.format_exc()}) + '\\n')\n"
     )
     try:
         proc = subprocess.run(
-            [str(_VENV_PY), "-c", runner, json.dumps(args)],
+            [str(_VENV_PY), "-", json.dumps(args)],
+            input=runner,
             capture_output=True,
             text=True,
             timeout=timeout,

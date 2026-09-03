@@ -1,4 +1,4 @@
-﻿"""Base definitions, standard response helpers, and decorators for Coworker tools."""
+"""Base definitions, standard response helpers, and decorators for Coworker tools."""
 
 from __future__ import annotations
 
@@ -82,7 +82,12 @@ def coworker_tool(
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             try:
-                return func(*args, **kwargs)
+                res = func(*args, **kwargs)
+                if isinstance(res, dict):
+                    if "ok" not in res:
+                        return tool_success(data=res)
+                    return res
+                return tool_success(data=res)
             except Exception as exc:  # noqa: BLE001
                 return tool_error(f"Execution failed: {exc}")
 

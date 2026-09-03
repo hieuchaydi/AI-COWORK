@@ -215,7 +215,9 @@ def main() -> int:
     if not args.no_test:
         generate_test(tool_name, is_core=(args.type == "core"))
 
-    print("\n[success] Hoàn tất tạo tool! Bạn có thể chỉnh sửa logic và chạy test ngay.")
+    print("\n[success] Tool created successfully! You can customize logic and run tests now.")
+    if not args.no_test:
+        print(f"[test] Run: pytest connect-ai/tests/test_tool_{tool_name}.py")
     return 0
 
 

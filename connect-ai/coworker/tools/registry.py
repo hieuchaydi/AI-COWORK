@@ -8,6 +8,7 @@ docstring/type-hint → JSON-schema extraction.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -78,5 +79,59 @@ class ToolRegistry:
 
 
 def _schema_for(func: Callable[..., Any]) -> dict[str, Any]:
-    """Generate one OpenAI-format tool schema via aisuite's schema generator."""
-    return Tools([func]).tools(format="openai")[0]
+    """Generate one OpenAI-format tool schema via aisuite's schema generator with fallback."""
+    try:
+        return Tools([func]).tools(format="openai")[0]
+    except Exception:
+        return _fallback_schema(func)
+
+
+def _fallback_schema(func: Callable[..., Any]) -> dict[str, Any]:
+    """Fallback schema generator for tools with missing or unconventional type hints."""
+    name = getattr(func, "__name__", "unnamed_tool")
+    doc = (inspect.getdoc(func) or f"Tool {name}").strip()
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+
+    type_map = {
+        int: "integer",
+        float: "number",
+        str: "string",
+        bool: "boolean",
+        list: "array",
+        dict: "object",
+    }
+
+    try:
+        sig = inspect.signature(func)
+        for param_name, param in sig.parameters.items():
+            if param_name in ("self", "cls"):
+                continue
+            param_type = "string"
+            if param.annotation != inspect.Parameter.empty:
+                ann = param.annotation
+                for py_type, json_type in type_map.items():
+                    if ann is py_type or (isinstance(ann, type) and issubclass(ann, py_type)):
+                        param_type = json_type
+                        break
+            prop_def: dict[str, Any] = {"type": param_type, "description": f"Parameter {param_name}"}
+            if param.default != inspect.Parameter.empty:
+                prop_def["default"] = param.default
+            else:
+                required.append(param_name)
+            properties[param_name] = prop_def
+    except Exception:
+        pass
+
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": doc,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
+        },
+    }
