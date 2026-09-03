@@ -177,3 +177,45 @@ def test_crawl_and_export_bundle_forwards_manifest_and_dedup_metadata(monkeypatc
 
     Path(res["csv"]["path"]).unlink(missing_ok=True)
 
+
+def test_crawl_and_export_bundle_supports_split_zip_urls(monkeypatch):
+    """Verify that crawl_and_export_bundle forwards max_zip_mb and returns zip_urls list."""
+    rows = [
+        {"title": "Item 1", "img": "https://example.com/item1.jpg"},
+        {"title": "Item 2", "img": "https://example.com/item2.png"},
+    ]
+
+    captured_kwargs = {}
+
+    def mock_download_and_zip(urls, zip_filename, folder_name, **kwargs):
+        captured_kwargs.update(kwargs)
+        urls_list = [
+            f"http://localhost:8766/outputs/zips/{folder_name}_media_part01.zip",
+            f"http://localhost:8766/outputs/zips/{folder_name}_media_part02.zip",
+        ]
+        return {
+            "ok": True,
+            "zip_path": f"/tmp/{folder_name}_media_part01.zip",
+            "zip_url": urls_list[0],
+            "zip_urls": urls_list,
+            "part_count": 2,
+            "file_count": 3,
+            "zip_size_mb": 1.8,
+            "media_folder": f"/tmp/{folder_name}",
+        }
+
+    monkeypatch.setattr("coworker.tools.media_pipeline._download_media_and_zip", mock_download_and_zip)
+
+    res = crawl_and_export_bundle(rows, job_name="split_job", max_zip_mb=5)
+    assert res.get("ok") is True
+    assert captured_kwargs.get("max_zip_mb") == 5
+
+    assert res["zip"] is not None
+    assert res["zip"]["part_count"] == 2
+    assert isinstance(res["zip"]["zip_urls"], list)
+    assert len(res["zip"]["zip_urls"]) == 2
+    assert res["zip_urls"] == res["zip"]["zip_urls"]
+
+    Path(res["csv"]["path"]).unlink(missing_ok=True)
+
+

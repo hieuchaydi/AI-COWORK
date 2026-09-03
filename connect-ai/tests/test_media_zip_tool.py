@@ -168,3 +168,66 @@ def test_download_media_and_zip_deduplicates_by_hash(tmp_path, monkeypatch):
         assert zip_manifest["duplicate_count"] == 1
         assert zip_manifest["files"][1]["duplicate_of"] == primary_name
 
+
+def test_download_media_and_zip_split_when_exceeding_max_zip_mb(tmp_path, monkeypatch):
+    """Verify that _download_media_and_zip splits media into multiple ZIP parts
+    (<job_name>_media_part01.zip, part02.zip...) when total size exceeds max_zip_mb,
+    and returns zip_urls as a list of all download links."""
+    # Create mock media payloads of 600KB each (total ~1.2MB, exceeding 1MB limit)
+    data_1 = b"A" * (600 * 1024)
+    data_2 = b"B" * (600 * 1024)
+
+    u1 = "https://example.com/large_image_01.jpg"
+    u2 = "https://example.com/large_image_02.png"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+        if "large_image_01" in url_str:
+            return httpx.Response(200, content=data_1, headers={"content-type": "image/jpeg"})
+        elif "large_image_02" in url_str:
+            return httpx.Response(200, content=data_2, headers={"content-type": "image/png"})
+        return httpx.Response(404)
+
+    mock_client = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr("coworker.tools.crawl._client", lambda: mock_client)
+
+    res = _download_media_and_zip(
+        urls=[u1, u2],
+        folder_name="large_media_job",
+        output_dir=str(tmp_path),
+        max_zip_mb=1,  # 1 MB threshold -> should split into 2 parts
+    )
+
+    assert res.get("ok") is True
+    assert res["part_count"] == 2
+    assert isinstance(res["zip_urls"], list)
+    assert len(res["zip_urls"]) == 2
+    assert isinstance(res["zip_paths"], list)
+    assert len(res["zip_paths"]) == 2
+
+    # Check naming conventions: <job_name>_media_part01.zip, part02.zip...
+    assert res["zip_urls"][0].endswith("/large_media_job_media_part01.zip")
+    assert res["zip_urls"][1].endswith("/large_media_job_media_part02.zip")
+
+    # Verify each part on disk
+    part1_path = Path(res["zip_paths"][0])
+    part2_path = Path(res["zip_paths"][1])
+
+    assert part1_path.exists()
+    assert part2_path.exists()
+    assert zipfile.is_zipfile(part1_path)
+    assert zipfile.is_zipfile(part2_path)
+
+    with zipfile.ZipFile(part1_path, "r") as zf1:
+        names1 = zf1.namelist()
+        assert "manifest.json" in names1
+        assert any("large_image_01" in n for n in names1)
+        assert not any("large_image_02" in n for n in names1)
+
+    with zipfile.ZipFile(part2_path, "r") as zf2:
+        names2 = zf2.namelist()
+        assert "manifest.json" in names2
+        assert any("large_image_02" in n for n in names2)
+        assert not any("large_image_01" in n for n in names2)
+
+

@@ -21,12 +21,13 @@ def crawl_and_export_bundle(
     zip_filename: str = "",
     headers: list[str] | None = None,
     output_dir: str = "",
+    max_zip_mb: int | float = 0,
 ) -> dict[str, Any]:
     """Process structured crawl rows and optional media URLs into a complete bundle:
     1. Saves rows to Excel-safe CSV in outputs/csv/ (or custom output_dir/csv/)
     2. Downloads all images and videos to outputs/media/<job_name>/ (or custom output_dir/media/<job_name>/)
-    3. Compresses all media into outputs/zips/<zip_filename>.zip (or custom output_dir/zips/<zip_filename>.zip)
-    4. Returns direct download URLs for both CSV and ZIP.
+    3. Compresses all media into outputs/zips/<zip_filename>.zip (or multiple parts if exceeding max_zip_mb)
+    4. Returns direct download URLs for CSV and ZIP(s).
     """
     ts = int(time.time())
     clean_job = re.sub(r"[^a-zA-Z0-9_-]+", "_", (job_name or f"crawl_{ts}").strip())[:60]
@@ -86,14 +87,21 @@ def crawl_and_export_bundle(
             zip_filename=zip_name,
             folder_name=clean_job,
             output_dir=output_dir,
+            max_zip_mb=max_zip_mb,
         )
         if "error" in zip_res:
             result["zip_error"] = zip_res["error"]
+            result["zip_urls"] = []
         else:
+            zip_urls_list = zip_res.get("zip_urls", [zip_res.get("zip_url")] if zip_res.get("zip_url") else [])
             result["zip"] = {
                 "filename": zip_res.get("filename", zip_name),
+                "filenames": zip_res.get("filenames", [zip_res.get("filename", zip_name)]),
                 "path": zip_res.get("zip_path"),
+                "paths": zip_res.get("zip_paths", [zip_res.get("zip_path")]),
                 "url": zip_res.get("zip_url"),
+                "zip_urls": zip_urls_list,
+                "part_count": zip_res.get("part_count", len(zip_urls_list)),
                 "file_count": zip_res.get("file_count", 0),
                 "zip_size_mb": zip_res.get("zip_size_mb", 0.0),
                 "media_folder": zip_res.get("media_folder"),
@@ -102,7 +110,9 @@ def crawl_and_export_bundle(
                 "manifest_path": zip_res.get("manifest_path"),
                 "manifest": zip_res.get("manifest"),
             }
+            result["zip_urls"] = zip_urls_list
     else:
         result["zip"] = None
+        result["zip_urls"] = []
 
     return result

@@ -622,9 +622,10 @@ def _zip_folder(
     folder_path: str,
     zip_filename: str = "",
     output_dir: str = "",
+    max_zip_mb: int | float = 0,
 ) -> dict[str, Any]:
-    """Compress an entire directory into a .zip archive under outputs/zips/
-    and return the local path and download URL."""
+    """Compress an entire directory into a .zip archive (or multiple parts if exceeding max_zip_mb)
+    under outputs/zips/ and return the local path(s) and download URL(s)."""
     p = Path(folder_path).expanduser().resolve()
     if not p.exists() or not p.is_dir():
         return {"error": f"folder not found: {folder_path}"}
@@ -634,32 +635,114 @@ def _zip_folder(
     if not base_name.lower().endswith(".zip"):
         base_name += ".zip"
     base_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", base_name)
-    target_zip = zips_dir / base_name
 
-    file_count = 0
+    # Collect all files
+    all_files: list[tuple[Path, int]] = []
+    manifest_path: Path | None = None
     total_uncompressed = 0
+    for root, _, files in os.walk(p):
+        for f in files:
+            full_path = Path(root) / f
+            size = full_path.stat().st_size
+            total_uncompressed += size
+            if full_path.name == "manifest.json" and full_path.parent == p:
+                manifest_path = full_path
+            else:
+                all_files.append((full_path, size))
+
+    all_files.sort(key=lambda x: str(x[0]))
+    max_bytes = int(float(max_zip_mb or 0) * 1024 * 1024)
+    should_split = bool(max_bytes > 0 and total_uncompressed > max_bytes and len(all_files) > 1)
+
+    if should_split:
+        stem = re.sub(r"\.zip$", "", base_name, flags=re.I)
+        prefix = stem if stem.endswith("_media") else f"{stem}_media"
+
+        parts: list[list[Path]] = []
+        current_part: list[Path] = []
+        current_bytes = 0
+
+        for f_path, f_size in all_files:
+            if current_part and (current_bytes + f_size > max_bytes):
+                parts.append(current_part)
+                current_part = [f_path]
+                current_bytes = f_size
+            else:
+                current_part.append(f_path)
+                current_bytes += f_size
+
+        if current_part:
+            parts.append(current_part)
+
+        zip_paths: list[str] = []
+        zip_urls: list[str] = []
+        filenames: list[str] = []
+        total_files = 0
+        total_zip_size = 0
+
+        try:
+            for part_idx, part_files in enumerate(parts, start=1):
+                part_name = f"{prefix}_part{part_idx:02d}.zip"
+                part_zip = zips_dir / part_name
+                with zipfile.ZipFile(part_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    if manifest_path and manifest_path.exists():
+                        zf.write(manifest_path, manifest_path.relative_to(p))
+                        total_files += 1
+                    for f_path in part_files:
+                        zf.write(f_path, f_path.relative_to(p))
+                        total_files += 1
+
+                total_zip_size += part_zip.stat().st_size
+                zip_paths.append(str(part_zip))
+                zip_urls.append(f"{_OUTPUTS_BASE_URL}/zips/{part_name}")
+                filenames.append(part_name)
+        except Exception as exc:
+            return {"error": f"failed to create split zip: {exc}"}
+
+        return {
+            "ok": True,
+            "zip_path": zip_paths[0],
+            "zip_url": zip_urls[0],
+            "zip_paths": zip_paths,
+            "zip_urls": zip_urls,
+            "filename": filenames[0],
+            "filenames": filenames,
+            "part_count": len(zip_urls),
+            "file_count": total_files,
+            "uncompressed_mb": round(total_uncompressed / (1024 * 1024), 2),
+            "zip_size_mb": round(total_zip_size / (1024 * 1024), 2),
+            "note": f"Split into {len(zip_urls)} parts: {', '.join(zip_urls)}",
+        }
+
+    # Standard single zip
+    target_zip = zips_dir / base_name
+    file_count = 0
     try:
         with zipfile.ZipFile(target_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for root, _, files in os.walk(p):
-                for f in files:
-                    full_path = Path(root) / f
-                    arcname = full_path.relative_to(p)
-                    zf.write(full_path, arcname)
-                    file_count += 1
-                    total_uncompressed += full_path.stat().st_size
+            if manifest_path and manifest_path.exists():
+                zf.write(manifest_path, manifest_path.relative_to(p))
+                file_count += 1
+            for f_path, _ in all_files:
+                zf.write(f_path, f_path.relative_to(p))
+                file_count += 1
     except Exception as exc:
         return {"error": f"failed to create zip: {exc}"}
 
     zip_size = target_zip.stat().st_size
+    single_url = f"{_OUTPUTS_BASE_URL}/zips/{target_zip.name}"
     return {
         "ok": True,
         "zip_path": str(target_zip),
-        "zip_url": f"{_OUTPUTS_BASE_URL}/zips/{target_zip.name}",
+        "zip_url": single_url,
+        "zip_paths": [str(target_zip)],
+        "zip_urls": [single_url],
         "filename": target_zip.name,
+        "filenames": [target_zip.name],
+        "part_count": 1,
         "file_count": file_count,
         "uncompressed_mb": round(total_uncompressed / (1024 * 1024), 2),
         "zip_size_mb": round(zip_size / (1024 * 1024), 2),
-        "note": f"Send THIS zip_url to the user for one-click download: {_OUTPUTS_BASE_URL}/zips/{target_zip.name}",
+        "note": f"Send THIS zip_url to the user for one-click download: {single_url}",
     }
 
 
@@ -670,6 +753,7 @@ def _download_media_and_zip(
     max_files: int = 100,
     max_mb_per_file: int = 25,
     output_dir: str = "",
+    max_zip_mb: int | float = 0,
 ) -> dict[str, Any]:
     """Download a batch of media URLs (images, videos, attachments) into a dedicated folder,
     deduplicating identical files by SHA-256 hash, generating a manifest.json with duplicate_of
@@ -778,9 +862,14 @@ def _download_media_and_zip(
     manifest_path = media_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest_data, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    # Automatically zip the folder (only contains unique files + manifest.json)
+    # Automatically zip the folder (only contains unique files + manifest.json, splitting if exceeding max_zip_mb)
     zip_name = zip_filename.strip() if zip_filename else f"{job_name}.zip"
-    zip_result = _zip_folder(str(media_dir), zip_filename=zip_name, output_dir=output_dir)
+    zip_result = _zip_folder(
+        str(media_dir),
+        zip_filename=zip_name,
+        output_dir=output_dir,
+        max_zip_mb=max_zip_mb,
+    )
     if "error" in zip_result:
         return zip_result
 
@@ -801,9 +890,12 @@ def _crawl_and_export_bundle(
     csv_filename: str = "",
     zip_filename: str = "",
     headers: list[str] | None = None,
+    output_dir: str = "",
+    max_zip_mb: int | float = 0,
 ) -> dict[str, Any]:
     """Save crawl rows to CSV, download related media into outputs/media/,
-    zip the media folder into outputs/zips/, and return both download URLs."""
+    zip the media folder into outputs/zips/ (splitting if exceeding max_zip_mb),
+    and return both download URLs."""
     from .media_pipeline import crawl_and_export_bundle
 
     return crawl_and_export_bundle(
@@ -813,6 +905,8 @@ def _crawl_and_export_bundle(
         csv_filename=csv_filename,
         zip_filename=zip_filename,
         headers=headers,
+        output_dir=output_dir,
+        max_zip_mb=max_zip_mb,
     )
 
 
@@ -941,11 +1035,12 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
         _zip_folder, "zip_folder",
         "Nén toàn bộ một thư mục thành file .zip đặt tại outputs/zips/ và trả về "
         "đường dẫn file zip cùng link tải public (http://localhost:8766/outputs/zips/<name>.zip). "
-        "Dùng khi đã cào/thu thập xong một thư mục dữ liệu, ảnh hoặc video.",
+        "Hỗ trợ tự động chia nhiều file zip nếu vượt quá max_zip_mb.",
         {
             "folder_path": {"type": "string", "description": "Đường dẫn thư mục cần nén"},
             "zip_filename": {"type": "string", "description": "Tên file zip (mặc định: <tên_thư_mục>.zip)"},
             "output_dir": {"type": "string", "description": "Thư mục lưu tùy chỉnh (để trống nếu dùng mặc định outputs/)"},
+            "max_zip_mb": {"type": "integer", "description": "Dung lượng tối đa mỗi file zip MB, nếu vượt quá sẽ chia thành part01, part02... (mặc định 0: không chia)"},
         },
         ["folder_path"],
         risk="low",
@@ -954,7 +1049,8 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
         _download_media_and_zip, "download_media_and_zip",
         "Tải một danh sách URL ảnh/video/tài liệu về thư mục outputs/media/, tự động "
         "tính mã băm SHA-256 chống trùng file (chỉ lưu 1 bản duy nhất và ghi duplicate_of "
-        "vào manifest.json), nén các file unique + manifest thành .zip và trả về URL tải trực tiếp.",
+        "vào manifest.json), nén các file unique + manifest thành .zip (tự chia nhiều part nếu vượt max_zip_mb) "
+        "và trả về danh sách URL tải trực tiếp.",
         {
             "urls": {
                 "type": "array",
@@ -966,6 +1062,7 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
             "max_files": {"type": "integer", "description": "Số lượng file tối đa (mặc định 100)"},
             "max_mb_per_file": {"type": "integer", "description": "Dung lượng tối đa mỗi file MB (mặc định 25)"},
             "output_dir": {"type": "string", "description": "Thư mục lưu tùy chỉnh (để trống nếu dùng mặc định outputs/)"},
+            "max_zip_mb": {"type": "integer", "description": "Dung lượng tối đa mỗi file zip MB, tự chia thành part01, part02... nếu vượt quá"},
         },
         ["urls"],
         risk="low",
@@ -975,7 +1072,7 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
         _crawl_and_export_bundle, "crawl_and_export_bundle",
         "One-shot bundle export for scrape jobs with media: save rows as an Excel-safe CSV in "
         "outputs/csv/, find or accept image/video URLs, download them into outputs/media/<job_name>/, "
-        "zip them into outputs/zips/<job_name>_media.zip, then return CSV and ZIP links.",
+        "zip them into outputs/zips/<job_name>_media.zip (splitting into parts if exceeding max_zip_mb), then return CSV and ZIP links.",
         {
             "rows": {
                 "type": "array",
@@ -996,6 +1093,7 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
                 "description": "Optional CSV column order",
             },
             "output_dir": {"type": "string", "description": "Thư mục lưu tùy chỉnh (để trống nếu dùng mặc định outputs/)"},
+            "max_zip_mb": {"type": "integer", "description": "Dung lượng tối đa mỗi file zip MB, tự chia thành part01, part02... nếu vượt quá"},
         },
         ["rows"],
         risk="low",
