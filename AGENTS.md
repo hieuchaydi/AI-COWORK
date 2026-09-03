@@ -54,7 +54,6 @@
   3. **Báo người dùng**: Luôn gửi 2 link download trực tiếp:
      - `[Tải file CSV](http://localhost:8766/outputs/csv/<tên>.csv)`
      - `[Tải trọn bộ ảnh/video .ZIP](http://localhost:8766/outputs/zips/<tên>_media.zip)`
-     - Nếu media vượt quá `max_zip_mb` và bị chia thành nhiều file ZIP (`<tên>_media_part01.zip`, `part02.zip`...), gửi đầy đủ tất cả link tải cho từng part.
 
 ## Tùy chọn thư mục lưu trữ khi cào dữ liệu (Custom Output Directory)
 

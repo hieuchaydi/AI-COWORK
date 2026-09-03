@@ -26,7 +26,8 @@ def crawl_and_export_bundle(
     """Process structured crawl rows and optional media URLs into a complete bundle:
     1. Saves rows to Excel-safe CSV in outputs/csv/ (or custom output_dir/csv/)
     2. Downloads all images and videos to outputs/media/<job_name>/ (or custom output_dir/media/<job_name>/)
-    3. Compresses all media into outputs/zips/<zip_filename>.zip (or multiple parts if exceeding max_zip_mb)
+    3. Compresses all media into outputs/zips/<zip_filename>.zip (or custom output_dir/zips/<zip_filename>.zip,
+       split into parts if exceeding max_zip_mb)
     4. Returns direct download URLs for CSV and ZIP(s).
     """
     ts = int(time.time())

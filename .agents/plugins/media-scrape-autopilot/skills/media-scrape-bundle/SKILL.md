@@ -72,11 +72,4 @@ When media exists, always include both links:
 [Tai tron bo anh/video .ZIP](http://localhost:8766/outputs/zips/<job_name>_media.zip)
 ```
 
-When media is split into multiple parts (due to `max_zip_mb`), include links to all parts:
-
-```markdown
-- [Tai tron bo anh/video .ZIP (Part 1)](http://localhost:8766/outputs/zips/<job_name>_media_part01.zip)
-- [Tai tron bo anh/video .ZIP (Part 2)](http://localhost:8766/outputs/zips/<job_name>_media_part02.zip)
-```
-
 Also include row count, downloaded media count, failed media count if available, and the local media folder path.

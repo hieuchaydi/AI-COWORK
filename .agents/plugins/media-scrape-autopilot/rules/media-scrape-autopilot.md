@@ -29,11 +29,6 @@ Always report both links when media exists:
 - `[Tai file CSV](http://localhost:8766/outputs/csv/<name>.csv)`
 - `[Tai tron bo anh/video .ZIP](http://localhost:8766/outputs/zips/<name>_media.zip)`
 
-If media exceeds `max_zip_mb` and is split into multiple parts (`<name>_media_part01.zip`, `<name>_media_part02.zip`...), report all generated ZIP links:
-
-- `[Tai tron bo anh/video .ZIP (Part 1)](http://localhost:8766/outputs/zips/<name>_media_part01.zip)`
-- `[Tai tron bo anh/video .ZIP (Part 2)](http://localhost:8766/outputs/zips/<name>_media_part02.zip)`
-
 If no media exists, explicitly say that only CSV was produced.
 
 ## Blocked Sites
