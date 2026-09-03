@@ -65,10 +65,24 @@ def _output_root() -> Path:
     return base
 
 
+def _is_in_outputs(path: Path | str | None) -> bool:
+    """Check whether a given path is inside the project outputs/ directory."""
+    if not path:
+        return False
+    try:
+        p = Path(path).expanduser().resolve()
+        out_root = _output_root().resolve()
+        p.relative_to(out_root)
+        return True
+    except Exception:
+        return False
+
+
 def _output_subdir(kind: str, base_dir: str | Path | None = None) -> Path:
     """Get (and auto-create) a subdirectory under base_dir (or default output root)."""
     kind = re.sub(r"[^a-z0-9_-]+", "", (kind or "misc").lower()) or "misc"
-    root = Path(base_dir).expanduser().resolve() if base_dir else _output_root()
+    clean_base = str(base_dir).strip() if base_dir else ""
+    root = Path(clean_base).expanduser().resolve() if clean_base else _output_root()
     d = root / kind
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -504,6 +518,7 @@ def _save_artifact(
         "url": f"{_OUTPUTS_BASE_URL}/{kind}/{filename}",
         "filename": filename,
         "kind": kind,
+        "is_in_outputs": _is_in_outputs(target),
         "note": (
             "Send THIS url to the user (localhost:8766, not localhost:1420 — "
             "1420 is Vite GUI, returns index.html for unknown paths)."
@@ -711,6 +726,7 @@ def _zip_folder(
             "file_count": total_files,
             "uncompressed_mb": round(total_uncompressed / (1024 * 1024), 2),
             "zip_size_mb": round(total_zip_size / (1024 * 1024), 2),
+            "is_in_outputs": _is_in_outputs(zip_paths[0]),
             "note": f"Split into {len(zip_urls)} parts: {', '.join(zip_urls)}",
         }
 
@@ -742,6 +758,7 @@ def _zip_folder(
         "file_count": file_count,
         "uncompressed_mb": round(total_uncompressed / (1024 * 1024), 2),
         "zip_size_mb": round(zip_size / (1024 * 1024), 2),
+        "is_in_outputs": _is_in_outputs(target_zip),
         "note": f"Send THIS zip_url to the user for one-click download: {single_url}",
     }
 
@@ -982,6 +999,7 @@ def _download_media_and_zip(
     zip_result["media_folder"] = str(media_dir)
     zip_result["manifest_path"] = str(manifest_path)
     zip_result["manifest"] = manifest_data
+    zip_result["is_in_outputs"] = _is_in_outputs(media_dir)
     return zip_result
 
 

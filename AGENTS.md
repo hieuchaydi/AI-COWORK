@@ -51,10 +51,12 @@
 - Khi cào bất kỳ dữ liệu nào có chứa hình ảnh, video (đánh giá sản phẩm, catalog, thư viện ảnh bài viết...):
   1. **Lưu dữ liệu bảng**: Dùng `save_csv` lưu vào `outputs/csv/<tên>.csv` (BOM UTF-8 chuẩn).
   2. **Tự động gom media**: Tải toàn bộ URL ảnh/video vào thư mục `outputs/media/<tên>/`, tự động đóng gói `.zip` bằng tool `download_media_and_zip` (hoặc `zip_folder`).
-  3. **Báo người dùng**: Luôn gửi các link download trực tiếp:
-     - `[Tải file CSV](http://localhost:8766/outputs/csv/<tên>.csv)`
-     - `[Tải trọn bộ ảnh/video .ZIP](http://localhost:8766/outputs/zips/<tên>_media.zip)` (hoặc các link `_part01.zip`, `_part02.zip` nếu vượt quá `max_zip_mb`)
-     - `[Xem báo cáo Markdown](http://localhost:8766/outputs/text/<tên>_report.md)`
+  3. **Báo người dùng**: Luôn báo đúng đường dẫn local trên máy và kèm link localhost nếu nằm trong thư mục outputs/:
+     - Đường dẫn local: file CSV, thư mục media, file ZIP, file Markdown report.
+     - Link download trực tiếp (khi lưu trong outputs/):
+       - `[Tải file CSV](http://localhost:8766/outputs/csv/<tên>.csv)`
+       - `[Tải trọn bộ ảnh/video .ZIP](http://localhost:8766/outputs/zips/<tên>_media.zip)` (hoặc các link `_part01.zip`, `_part02.zip` nếu vượt quá `max_zip_mb`)
+       - `[Xem báo cáo Markdown](http://localhost:8766/outputs/text/<tên>_report.md)`
 
 ## Tùy chọn thư mục lưu trữ khi cào dữ liệu (Custom Output Directory)
 
@@ -66,7 +68,7 @@
        - `Lưu ra Desktop (Desktop/crawled_data/)`
   2. **Xử lý lựa chọn**:
      - Nếu người dùng bấm **Bỏ qua (Skip)** hoặc chọn Mặc định: Hệ thống tự động dùng thư mục mặc định `outputs/` của dự án và chạy tiếp ngay một mạch từ A -> Z.
-     - Nếu người dùng nhập đường dẫn cụ thể (ví dụ `D:/Data/Crawl`): Hệ thống truyền `output_dir` vào các tool `save_csv`, `download_media_and_zip`, `crawl_and_export_bundle` để lưu toàn bộ dữ liệu vào đúng vị trí đó.
+     - Nếu người dùng nhập đường dẫn cụ thể (ví dụ `D:/Data/Crawl`): Hệ thống truyền `output_dir` vào các tool `save_csv`, `download_media_and_zip`, `crawl_and_export_bundle` để lưu toàn bộ dữ liệu vào đúng vị trí đó. Phản hồi báo rõ đường dẫn local đã lưu; nếu nằm ngoài thư mục outputs/ thì báo đường dẫn local trên máy.
 
 ## Cào web — site chặn bot (Shopee, Lazada, TikTok Shop…)
 

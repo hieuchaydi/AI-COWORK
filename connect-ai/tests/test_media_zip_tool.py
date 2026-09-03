@@ -348,9 +348,74 @@ def test_download_media_and_zip_resume_from_disk_without_manifest(tmp_path, monk
     assert res["downloaded_count"] == 1   # Only u2 downloaded
     assert res["failed_count"] == 0
     assert res["unique_count"] == 2
-
     assert u1 not in requested
     assert u2 in requested
+
+
+def test_download_media_and_zip_custom_output_dir(tmp_path, monkeypatch):
+    """Verify that download_media_and_zip writes media and zips to custom output_dir
+    with is_in_outputs=False."""
+    u1 = "https://example.com/custom_photo.jpg"
+    data_1 = b"Custom photo payload"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=data_1, headers={"content-type": "image/jpeg"})
+
+    monkeypatch.setattr("coworker.tools.crawl._client", lambda: httpx.Client(transport=httpx.MockTransport(handler)))
+
+    custom_dir = tmp_path / "custom_download_store"
+    res = _download_media_and_zip(
+        urls=[u1],
+        folder_name="custom_photo_job",
+        output_dir=str(custom_dir),
+    )
+    assert res.get("ok") is True
+    assert res["is_in_outputs"] is False
+
+    media_dir = Path(res["media_folder"])
+    assert media_dir.exists()
+    assert media_dir.parent.resolve() == (custom_dir / "media").resolve()
+
+    zip_file = Path(res["zip_path"])
+    assert zip_file.exists()
+    assert zip_file.parent.resolve() == (custom_dir / "zips").resolve()
+
+
+def test_download_media_and_zip_fallback_default_output_dir(monkeypatch):
+    """Verify that omitting output_dir falls back to project outputs/ with is_in_outputs=True."""
+    from coworker.tools.crawl import _output_root
+    u1 = "https://example.com/default_photo.jpg"
+    data_1 = b"Default photo payload"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=data_1, headers={"content-type": "image/jpeg"})
+
+    monkeypatch.setattr("coworker.tools.crawl._client", lambda: httpx.Client(transport=httpx.MockTransport(handler)))
+
+    job_name = "default_dl_job_test"
+    res = _download_media_and_zip(
+        urls=[u1],
+        folder_name=job_name,
+        output_dir="",
+    )
+    try:
+        assert res.get("ok") is True
+        assert res["is_in_outputs"] is True
+
+        out_root = _output_root()
+        media_dir = Path(res["media_folder"])
+        assert media_dir.exists()
+        assert media_dir.parent.resolve() == (out_root / "media").resolve()
+
+        zip_file = Path(res["zip_path"])
+        assert zip_file.exists()
+        assert zip_file.parent.resolve() == (out_root / "zips").resolve()
+    finally:
+        # Cleanup created files in project outputs/
+        import shutil
+        shutil.rmtree(res["media_folder"], ignore_errors=True)
+        Path(res["zip_path"]).unlink(missing_ok=True)
+
 
 
 

@@ -10,7 +10,15 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .crawl import _save_csv, _zip_folder, _download_media_and_zip, _output_subdir, _OUTPUTS_BASE_URL
+from .crawl import (
+    _save_csv,
+    _zip_folder,
+    _download_media_and_zip,
+    _output_subdir,
+    _output_root,
+    _is_in_outputs,
+    _OUTPUTS_BASE_URL,
+)
 
 
 def crawl_and_export_bundle(
@@ -28,28 +36,36 @@ def crawl_and_export_bundle(
     2. Downloads all images and videos to outputs/media/<job_name>/ (or custom output_dir/media/<job_name>/)
     3. Compresses all media into outputs/zips/<zip_filename>.zip (or custom output_dir/zips/<zip_filename>.zip,
        split into parts if exceeding max_zip_mb)
-    4. Returns direct download URLs for CSV and ZIP(s).
+    4. Generates a summary Markdown report in outputs/text/<job_name>_report.md
+    5. Returns direct download URLs and local paths for CSV, ZIP(s), and Markdown report.
     """
     ts = int(time.time())
     clean_job = re.sub(r"[^a-zA-Z0-9_-]+", "_", (job_name or f"crawl_{ts}").strip())[:60]
+
+    clean_output_dir = str(output_dir).strip() if output_dir else ""
+    resolved_output_dir = str(Path(clean_output_dir).expanduser().resolve()) if clean_output_dir else str(_output_root().resolve())
+    is_in_outputs = _is_in_outputs(resolved_output_dir)
 
     # 1. Export CSV
     csv_name = csv_filename.strip() or f"{clean_job}.csv"
     if not csv_name.lower().endswith(".csv"):
         csv_name += ".csv"
 
-    csv_res = _save_csv(rows=rows, filename=csv_name, headers=headers, output_dir=output_dir)
+    csv_res = _save_csv(rows=rows, filename=csv_name, headers=headers, output_dir=clean_output_dir)
     if "error" in csv_res:
         return {"error": f"Failed to save CSV: {csv_res['error']}"}
 
     result: dict[str, Any] = {
         "ok": True,
         "job_name": clean_job,
+        "output_dir": resolved_output_dir,
+        "is_in_outputs": is_in_outputs,
         "csv": {
             "filename": csv_res.get("filename", csv_name),
             "path": csv_res.get("path"),
             "url": csv_res.get("url"),
             "row_count": csv_res.get("row_count", len(rows)),
+            "is_in_outputs": _is_in_outputs(csv_res.get("path")),
         },
     }
 
@@ -112,6 +128,7 @@ def crawl_and_export_bundle(
                 "duplicate_count": zip_res.get("duplicate_count", 0),
                 "manifest_path": zip_res.get("manifest_path"),
                 "manifest": zip_res.get("manifest"),
+                "is_in_outputs": _is_in_outputs(zip_res.get("zip_path")),
             }
             result["zip_urls"] = zip_urls_list
     else:
@@ -119,13 +136,15 @@ def crawl_and_export_bundle(
         result["zip_urls"] = []
 
     # 4. Generate Markdown report in outputs/text/<clean_job>_report.md
-    text_dir = _output_subdir("text", base_dir=output_dir)
+    text_dir = _output_subdir("text", base_dir=clean_output_dir)
     report_filename = f"{clean_job}_report.md"
     report_path = text_dir / report_filename
 
     row_count = len(rows)
     media_found = len(unique_media)
     csv_url = result["csv"].get("url", "")
+    csv_path = result["csv"].get("path", "")
+    zip_path = result.get("zip", {}).get("path", "") if result.get("zip") else ""
 
     zip_info = result.get("zip")
     if zip_info:
@@ -149,6 +168,7 @@ def crawl_and_export_bundle(
         "## Thống kê tổng quan",
         f"- **Job Name**: `{clean_job}`",
         f"- **Thời gian tạo**: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))}",
+        f"- **Thư mục lưu (local)**: `{resolved_output_dir}`",
         f"- **Tổng số dòng (rows)**: {row_count}",
         f"- **Số media tìm thấy**: {media_found}",
         f"- **Số tải thành công**: {downloaded_count}",
@@ -158,15 +178,21 @@ def crawl_and_export_bundle(
         "",
         "## Liên kết dữ liệu",
         f"- 📄 [Tải file CSV]({csv_url})",
+        f"  - Đường dẫn local: `{csv_path}`",
     ]
 
     if zip_urls:
         if len(zip_urls) == 1:
             report_lines.append(f"- 📦 [Tải trọn bộ ảnh/video .ZIP]({zip_urls[0]})")
+            if zip_path:
+                report_lines.append(f"  - Đường dẫn local: `{zip_path}`")
         else:
             report_lines.append("- 📦 **Tải trọn bộ ảnh/video .ZIP (nhiều phần)**:")
             for part_i, u in enumerate(zip_urls, start=1):
+                part_p = result["zip"]["paths"][part_i - 1] if part_i - 1 < len(result["zip"].get("paths", [])) else ""
                 report_lines.append(f"  - [Tải trọn bộ ảnh/video .ZIP (Part {part_i})]({u})")
+                if part_p:
+                    report_lines.append(f"    - Đường dẫn local: `{part_p}`")
     else:
         report_lines.append("- 📦 [Tải trọn bộ ảnh/video .ZIP]: *Không có media hoặc chưa nén*")
 
@@ -197,6 +223,7 @@ def crawl_and_export_bundle(
         "filename": report_filename,
         "path": str(report_path),
         "url": report_url,
+        "is_in_outputs": _is_in_outputs(report_path),
     })
     result["report_url"] = report_url
 

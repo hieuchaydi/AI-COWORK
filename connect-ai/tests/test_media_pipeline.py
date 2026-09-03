@@ -272,3 +272,111 @@ def test_crawl_and_export_bundle_generates_markdown_report(tmp_path, monkeypatch
     assert "404 Not Found" in content
 
 
+def test_crawl_and_export_bundle_custom_output_dir(tmp_path, monkeypatch):
+    """Verify that specifying a custom output_dir stores CSV, media, ZIP and report
+    in the designated custom folder, with is_in_outputs=False and accurate paths."""
+    rows = [{"title": "Item Custom", "img": "https://example.com/custom.png"}]
+    custom_target = tmp_path / "my_custom_crawl"
+
+    def mock_download_and_zip(urls, zip_filename, folder_name, output_dir="", **kwargs):
+        zpath = Path(output_dir) / "zips" / zip_filename
+        zpath.parent.mkdir(parents=True, exist_ok=True)
+        zpath.write_bytes(b"PK0304mockzip")
+        return {
+            "ok": True,
+            "zip_path": str(zpath),
+            "zip_url": f"http://localhost:8766/outputs/zips/{zip_filename}",
+            "zip_urls": [f"http://localhost:8766/outputs/zips/{zip_filename}"],
+            "part_count": 1,
+            "file_count": 1,
+            "unique_count": 1,
+            "duplicate_count": 0,
+            "failed_count": 0,
+            "media_folder": str(Path(output_dir) / "media" / folder_name),
+            "is_in_outputs": False,
+        }
+
+    monkeypatch.setattr("coworker.tools.media_pipeline._download_media_and_zip", mock_download_and_zip)
+
+    res = crawl_and_export_bundle(rows, job_name="custom_bundle_job", output_dir=str(custom_target))
+    assert res.get("ok") is True
+    assert res["is_in_outputs"] is False
+    assert res["output_dir"] == str(custom_target.resolve())
+
+    # CSV path inside custom folder
+    csv_path = Path(res["csv"]["path"])
+    assert csv_path.exists()
+    assert csv_path.parent.resolve() == (custom_target / "csv").resolve()
+    assert res["csv"]["is_in_outputs"] is False
+
+    # ZIP path inside custom folder
+    zip_path = Path(res["zip"]["path"])
+    assert zip_path.exists()
+    assert zip_path.parent.resolve() == (custom_target / "zips").resolve()
+    assert res["zip"]["is_in_outputs"] is False
+
+    # Report path inside custom folder
+    report_path = Path(res["report"]["path"])
+    assert report_path.exists()
+    assert report_path.parent.resolve() == (custom_target / "text").resolve()
+    assert res["report"]["is_in_outputs"] is False
+
+    report_text = report_path.read_text(encoding="utf-8")
+    assert str(custom_target.resolve()) in report_text
+    assert str(csv_path) in report_text
+
+
+def test_crawl_and_export_bundle_fallback_default_output_dir(monkeypatch):
+    """Verify that omitting output_dir (or passing empty string) falls back to outputs/
+    in project root with is_in_outputs=True."""
+    from coworker.tools.crawl import _output_root
+
+    rows = [{"title": "Item Default", "img": "https://example.com/default.png"}]
+    job_name = "fallback_default_job"
+
+    def mock_download_and_zip(urls, zip_filename, folder_name, output_dir="", **kwargs):
+        out_root = _output_root()
+        zpath = out_root / "zips" / zip_filename
+        zpath.parent.mkdir(parents=True, exist_ok=True)
+        zpath.write_bytes(b"PK0304mockzip")
+        return {
+            "ok": True,
+            "zip_path": str(zpath),
+            "zip_url": f"http://localhost:8766/outputs/zips/{zip_filename}",
+            "zip_urls": [f"http://localhost:8766/outputs/zips/{zip_filename}"],
+            "part_count": 1,
+            "file_count": 1,
+            "unique_count": 1,
+            "duplicate_count": 0,
+            "failed_count": 0,
+            "media_folder": str(out_root / "media" / folder_name),
+            "is_in_outputs": True,
+        }
+
+    monkeypatch.setattr("coworker.tools.media_pipeline._download_media_and_zip", mock_download_and_zip)
+
+    res = crawl_and_export_bundle(rows, job_name=job_name, output_dir="")
+    try:
+        assert res.get("ok") is True
+        assert res["is_in_outputs"] is True
+        assert res["csv"]["is_in_outputs"] is True
+        assert res["zip"]["is_in_outputs"] is True
+        assert res["report"]["is_in_outputs"] is True
+
+        out_root = _output_root()
+        assert Path(res["csv"]["path"]).exists()
+        assert Path(res["csv"]["path"]).parent.resolve() == (out_root / "csv").resolve()
+
+        assert Path(res["zip"]["path"]).exists()
+        assert Path(res["zip"]["path"]).parent.resolve() == (out_root / "zips").resolve()
+
+        assert Path(res["report"]["path"]).exists()
+        assert Path(res["report"]["path"]).parent.resolve() == (out_root / "text").resolve()
+    finally:
+        # Cleanup project outputs/ created by this test
+        Path(res["csv"]["path"]).unlink(missing_ok=True)
+        Path(res["zip"]["path"]).unlink(missing_ok=True)
+        Path(res["report"]["path"]).unlink(missing_ok=True)
+
+
+
