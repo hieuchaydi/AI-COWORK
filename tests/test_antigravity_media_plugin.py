@@ -9,6 +9,9 @@ PLUGIN = ROOT / ".agents" / "plugins" / "media-scrape-autopilot"
 
 
 def test_antigravity_media_plugin_manifest_and_hook_are_valid():
+    plugins_config = json.loads((ROOT / ".agents" / "plugins.json").read_text(encoding="utf-8"))
+    assert plugins_config["entries"] == [{"path": ".agents/plugins"}]
+
     manifest = json.loads((PLUGIN / "plugin.json").read_text(encoding="utf-8"))
     assert manifest["name"] == "media-scrape-autopilot"
     assert manifest["$schema"] == "https://antigravity.google/schemas/v1/plugin.json"

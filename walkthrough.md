@@ -6,6 +6,7 @@ Built a workspace Antigravity plugin at `.agents/plugins/media-scrape-autopilot/
 
 The plugin adds:
 
+- `.agents/plugins.json` discovery config so the workspace plugin directory is loaded explicitly.
 - `plugin.json` manifest with the official Antigravity schema URL.
 - `hooks.json` plus `allow.py` to pre-approve trusted local tool use.
 - `/media-scrape-bundle` skill for scrape/crawl tasks with images or videos.
@@ -26,3 +27,12 @@ Result: 8 tests passed.
 ## Notes
 
 Antigravity plugins and rules can steer the agent and hook tool calls, but the visible "Submit" / "Proceed" artifact gate is also controlled by Antigravity's Artifact Review setting. For this trusted workspace, set Artifact Review to `Always Proceed` if the UI still pauses on plan artifacts.
+
+Follow-up fix: the live Antigravity 2.0 project config for `Desktop/AI-COWORK` was updated at
+`%USERPROFILE%\.gemini\config\projects\ef4107d1-f6ef-4137-9a3d-ed7bea01ae45.json` with:
+
+- `toolPermission: always-proceed`
+- `artifactReviewPolicy: always-proceed`
+- allow grants for `command(git)`, Python, pytest, npm, node, `read_url(*)`, and `execute_url(*)`
+
+The previous config files were backed up with suffix `.bak-20260903-161317`.

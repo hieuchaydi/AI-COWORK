@@ -51,3 +51,39 @@ To remove the UI gate shown as "Submit" or "Proceed", set these in Antigravity S
 - Browser Javascript Execution: `Always Proceed`, if your scrape needs same-origin API calls from an opened browser
 
 The plugin instructs the agent and pre-approves hookable tool calls, but Antigravity's artifact-review setting is the product-level switch that controls the plan submit gate.
+
+For this machine, the live Antigravity 2.0 config is under:
+
+```text
+%USERPROFILE%\.gemini\config\config.json
+%USERPROFILE%\.gemini\config\projects\<project-id>.json
+```
+
+The AI-COWORK project should include:
+
+```json
+{
+  "settings": {
+    "toolPermission": "always-proceed",
+    "artifactReviewPolicy": "always-proceed",
+    "allowNonWorkspaceAccess": "allow",
+    "internetAccess": "allow"
+  },
+  "permissionGrants": {
+    "permissionGrants": {
+      "allow": [
+        "command(git)",
+        "command(python)",
+        "command(pytest)",
+        "command(.venv\\Scripts\\python.exe)",
+        "command(npm)",
+        "command(node)",
+        "read_url(*)",
+        "execute_url(*)"
+      ]
+    }
+  }
+}
+```
+
+If prompts still appear after editing this config, restart Antigravity so the project settings are reloaded.
