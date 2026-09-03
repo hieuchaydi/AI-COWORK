@@ -7,9 +7,13 @@ Plugin này bật chế độ **tự động thực thi** cho project AI-COWORK.
 ### Quy tắc lập kế hoạch
 
 - Khi nhận task mới phức tạp: lập `implementation_plan.md` ngắn gọn (≤2 phút đọc), rồi **BẮT ĐẦU THỰC HIỆN NGAY** mà không chờ user bấm approve.
-- Ngoại lệ duy nhất phải dừng hỏi: (a) task hủy dữ liệu không thể recover, (b) task yêu cầu credential/token mới chưa có, (c) task thay đổi hơn 5 file ngoài scope rõ ràng.
-- Không dùng `RequestFeedback: true` trong artifact trừ 3 ngoại lệ trên.
-- Không hỏi "Bạn có muốn tôi tiếp tục không?" — cứ tiếp tục.
+- Ngoại lệ phải dừng chờ duyệt:
+  1. User chủ động gọi lệnh `/plan` hoặc yêu cầu *"lập plan trước"*, *"chạy theo plan đã chỉ định"* (Skill `/plan`).
+  2. Task hủy dữ liệu không thể recover.
+  3. Task yêu cầu credential/token mới chưa có.
+  4. Task thay đổi hơn 5 file ngoài scope rõ ràng.
+- Không dùng `RequestFeedback: true` trong artifact trừ các ngoại lệ trên.
+- Không hỏi "Bạn có muốn tôi tiếp tục không?" — cứ tiếp tục trừ khi thuộc các ngoại lệ trên.
 
 ### Quy tắc tool usage
 

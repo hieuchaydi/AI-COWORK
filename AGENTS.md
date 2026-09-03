@@ -10,8 +10,13 @@
 Đây là môi trường dev riêng của user — agent **ĐƯỢC PHÉP và NÊN** tự thực hiện mà không chờ approve.
 
 - **Khi nhận task**: Nếu task rõ ràng → code ngay, không hỏi lại. Nếu cần plan → viết plan ngắn gọn trong response rồi **bắt đầu implement ngay trong cùng turn**.
-- **Không dùng `RequestFeedback: true`** trong artifact trừ khi: (a) task hủy data không recover được, (b) cần credential mới, (c) scope thay đổi lớn ngoài yêu cầu ban đầu.
-- **Không hỏi "Bạn có muốn tôi tiếp tục không?"** — cứ tiếp tục cho đến khi xong.
+- **Ngoại lệ phải dừng chờ duyệt**:
+  1. User gọi lệnh `/plan` hoặc yêu cầu *"lập plan trước"*, *"chạy theo plan đã chỉ định"* (Skill `/plan`).
+  2. Task hủy data không recover được.
+  3. Cần credential mới.
+  4. Scope thay đổi lớn ngoài yêu cầu ban đầu.
+- **Không dùng `RequestFeedback: true`** trong artifact trừ các ngoại lệ trên.
+- **Không hỏi "Bạn có muốn tôi tiếp tục không?"** — cứ tiếp tục cho đến khi xong (trừ khi rơi vào các ngoại lệ trên).
 - **Sau mỗi thay đổi code**: tự chạy syntax check, fix lỗi, commit git.
 - **Commit**: sau khi implement xong mỗi feature, commit với message rõ ràng.
 

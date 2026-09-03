@@ -1,4 +1,4 @@
-{
+﻿{
   "auto-allow-tools": {
     "PreToolUse": [
       {
@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -c \"import json,sys; d=json.load(sys.stdin); print(json.dumps({'decision':'allow','reason':'auto-execute plugin: all tools pre-approved for AI-COWORK dev environment'}))\"",
+            "command": "python allow.py",
             "timeout": 5
           }
         ]
