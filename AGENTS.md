@@ -21,6 +21,13 @@
 - **Sau mỗi thay đổi code**: tự chạy syntax check, fix lỗi, commit git.
 - **Commit**: sau khi implement xong mỗi feature, commit với message rõ ràng.
 
+## Tự suy luận và tạo tool mới khi thiếu (Autonomous Tool Synthesis)
+
+- Khi gặp bài toán, thuật toán phức tạp, hoặc định dạng dữ liệu mà bộ tool hiện tại chưa hỗ trợ:
+  1. **Tự suy luận**: Thiết kế hàm Python xử lý đáp ứng đúng nhu cầu bài toán (có type hints, docstring, xử lý lỗi an toàn).
+  2. **Đăng ký tool**: Gọi tool `create_custom_tool(name, code, description)` (hoặc ghi file vào `custom_tools/<name>.py`).
+  3. **Sử dụng ngay**: Tool mới được nạp nóng (hot-reload) vào Registry tức thì để agent gọi thực thi hoàn thành task cho user ngay trong cùng phiên làm việc.
+
 
 ## Thời gian & múi giờ
 
