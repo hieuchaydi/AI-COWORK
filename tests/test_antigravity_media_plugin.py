@@ -12,6 +12,9 @@ def test_antigravity_media_plugin_manifest_and_hook_are_valid():
     plugins_config = json.loads((ROOT / ".agents" / "plugins.json").read_text(encoding="utf-8"))
     assert plugins_config["entries"] == [{"path": ".agents/plugins"}]
 
+    skills_config = json.loads((ROOT / ".agents" / "skills.json").read_text(encoding="utf-8"))
+    assert skills_config["entries"] == [{"path": ".agents/skills"}]
+
     manifest = json.loads((PLUGIN / "plugin.json").read_text(encoding="utf-8"))
     assert manifest["name"] == "media-scrape-autopilot"
     assert manifest["$schema"] == "https://antigravity.google/schemas/v1/plugin.json"
@@ -27,7 +30,10 @@ def test_antigravity_media_plugin_manifest_and_hook_are_valid():
 def test_antigravity_media_plugin_skill_and_rule_cover_output_contract():
     skill = (PLUGIN / "skills" / "media-scrape-bundle" / "SKILL.md").read_text(encoding="utf-8")
     rules = (PLUGIN / "rules" / "media-scrape-autopilot.md").read_text(encoding="utf-8")
-    combined = f"{skill}\n{rules}"
+    agents_rules = (PLUGIN / "rules" / "AGENTS.md").read_text(encoding="utf-8")
+    workspace_rules = (ROOT / ".agents" / "rules" / "AGENTS.md").read_text(encoding="utf-8")
+    code_builder = (ROOT / ".agents" / "agents" / "code_builder" / "agent.md").read_text(encoding="utf-8")
+    combined = f"{skill}\n{rules}\n{agents_rules}\n{workspace_rules}\n{code_builder}"
 
     assert "RequestFeedback: false" in combined
     assert "crawl_and_export_bundle" in combined
@@ -38,3 +44,5 @@ def test_antigravity_media_plugin_skill_and_rule_cover_output_contract():
     assert "Submit plan" in combined
     assert "command(*)" in combined
     assert "unsandboxed(*)" in combined
+    assert "Never stop at" in combined
+    assert "AGENTS.md" in combined
