@@ -800,17 +800,38 @@ def make_integration_tools(
             }
         return path, None
 
-    def github_clone(owner: str, repo: str, directory: str = "") -> dict[str, Any]:
-        target, err = _writable_target(directory, default_name=repo)
+    def github_clone(
+        owner: str = "",
+        repo: str = "",
+        directory: str = "",
+        repository: str = "",
+    ) -> dict[str, Any]:
+        raw_repository = (repository or "").strip()
+        raw_owner = (owner or "").strip()
+        raw_repo = (repo or "").strip()
+        candidate = raw_repository or (raw_owner if "/" in raw_owner and not raw_repo else "")
+        if candidate:
+            match = re.match(
+                r"^(?:https?://github\.com/|git@github\.com:)?([^/\s]+)/([^/\s]+?)(?:\.git)?/?$",
+                candidate,
+                re.IGNORECASE,
+            )
+            if not match:
+                return {"error": "repository must be a GitHub URL or owner/repo"}
+            raw_owner, raw_repo = match.group(1), match.group(2)
+        if not raw_owner or not raw_repo:
+            return {"error": "provide repository as a GitHub URL or owner/repo"}
+
+        target, err = _writable_target(directory, default_name=raw_repo)
         if err:
             return err
         if target.exists() and any(target.iterdir()):
             return {
                 "error": f"{target} already exists and is not empty (use github_pull?)"
             }
-        url = f"{_github_git_base()}/{owner}/{repo}.git"
+        url = f"{_github_git_base()}/{raw_owner}/{raw_repo}.git"
         _out, git_err = _run_git(
-            [*_github_git_auth_args(secrets, owner), "clone", url, str(target)]
+            [*_github_git_auth_args(secrets, raw_owner), "clone", url, str(target)]
         )
         if git_err:
             return {"error": f"clone failed: {git_err}"}
@@ -835,14 +856,18 @@ def make_integration_tools(
                 "explore the code locally. Private repos use a short-lived token "
                 "that is never written to disk. Requires user approval.",
                 {
-                    "owner": {"type": "string"},
-                    "repo": {"type": "string"},
+                    "repository": {
+                        "type": "string",
+                        "description": "GitHub URL or owner/repo (recommended input)",
+                    },
+                    "owner": {"type": "string", "description": "repository owner; optional when repository is provided"},
+                    "repo": {"type": "string", "description": "repository name; optional when repository is provided"},
                     "directory": {
                         "type": "string",
                         "description": "target path inside a granted folder (default: <primary>/<repo>)",
                     },
                 },
-                ["owner", "repo"],
+                [],
             ),
             approval=True,
             caps=["github", "read"],

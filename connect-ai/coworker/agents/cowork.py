@@ -58,6 +58,7 @@ COWORK_INSTRUCTIONS = (
     "- 'chay lenh X' → run_shell(command=X)\n"
     "- 'doc file X' / 'tom tat X' → read_file then summarize\n"
     "- 'git log / status / commit' → mcp__git__*\n"
+    "- 'clone/tải project GitHub' + URL hoặc owner/repo → github_clone\n"
     "\n"
     "For Telegram bot: if send_message returns 400 or 'chat not found', tell user to DM the bot "
     "once first, don't retry. Never claim 'Telegram not connected' if sidebar shows it enabled."

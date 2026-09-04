@@ -585,6 +585,30 @@ def test_clone_pull_roundtrip_and_no_token_at_rest(tmp_path, monkeypatch, _origi
     assert (clone / "next.txt").read_text() == "more"
 
 
+@pytest.mark.parametrize(
+    "repository",
+    ["acme/site", "https://github.com/acme/site", "https://github.com/acme/site.git"],
+)
+def test_clone_accepts_repository_slug_or_url(
+    repository, tmp_path, monkeypatch, _origin
+):
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("GITHUB_GIT_URL", f"file://{_origin['base']}")
+    granted, tools = _clone_tools(SecretStore(), tmp_path)
+
+    out = tools["github_clone"](repository=repository)
+
+    assert out.get("ok") is True, out
+    assert (granted / "site" / "README.md").read_text() == "hello"
+
+
+def test_clone_rejects_missing_or_non_github_repository(tmp_path):
+    _granted, tools = _clone_tools(SecretStore(), tmp_path)
+
+    assert "provide repository" in tools["github_clone"]()["error"]
+    assert "GitHub URL" in tools["github_clone"](repository="https://example.com/a/b")["error"]
+
+
 def test_clone_refuses_paths_outside_granted_roots(tmp_path, monkeypatch, _origin):
     monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("GITHUB_GIT_URL", f"file://{_origin['base']}")
