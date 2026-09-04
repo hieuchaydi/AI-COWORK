@@ -16,7 +16,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 KIND_TIMER = "timer"
 KIND_COMPLETION = "completion"
@@ -29,6 +29,30 @@ STATE_FIRED = "fired"
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _to_utc(dt: datetime) -> datetime:
+    """Normalize a datetime to UTC-aware datetime.
+    All naive datetimes in selfwake are interpreted as UTC (preserving original semantics).
+    Aware datetimes are converted to UTC."""
+    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_iso_utc(val: Any) -> Optional[datetime]:
+    """Parse an ISO datetime string and normalize to UTC-aware datetime, or None if invalid.
+    Safe against non-string types (int, list, dict, None, etc.) without raising AttributeError."""
+    if not isinstance(val, str):
+        return None
+    val = val.strip()
+    if not val:
+        return None
+    try:
+        raw = val.replace("Z", "+00:00") if val.endswith("Z") else val
+        return _to_utc(datetime.fromisoformat(raw))
+    except (ValueError, TypeError):
+        return None
 
 
 @dataclass
@@ -70,11 +94,12 @@ class WakeStore:
         )
 
     def add_timer(self, session_id: str, fire_at: datetime, *, note: str = "") -> Wake:
+        fire_dt = _to_utc(fire_at)
         w = Wake(
             uuid.uuid4().hex,
             session_id,
             KIND_TIMER,
-            fire_at=fire_at.isoformat(),
+            fire_at=fire_dt.isoformat(),
             note=note,
         )
         with self._lock:
@@ -102,19 +127,17 @@ class WakeStore:
 
     def due(self, now: Optional[datetime] = None) -> list[Wake]:
         """Timer wakes whose fire time has passed, plus completion/event wakes marked due."""
-        now = now or _now()
+        curr_now = _to_utc(now) if now is not None else _now()
         out = []
         for w in self._wakes.values():
             if not self.auto_enabled(w.session_id):
                 continue
             if w.state != STATE_PENDING and w.state != STATE_DUE:
                 continue
-            if (
-                w.kind == KIND_TIMER
-                and w.fire_at
-                and datetime.fromisoformat(w.fire_at) <= now
-            ):
-                out.append(w)
+            if w.kind == KIND_TIMER and w.fire_at:
+                fire_dt = _parse_iso_utc(w.fire_at)
+                if fire_dt is not None and fire_dt <= curr_now:
+                    out.append(w)
             elif w.kind in (KIND_COMPLETION, KIND_EVENT) and w.state == STATE_DUE:
                 out.append(w)
         return out
@@ -188,9 +211,9 @@ def selfwake_tools(store: WakeStore, session_id: str) -> list:
 
     def sleep_until(when_iso: str, note: str = "") -> dict:
         """Suspend and wake this session at an ISO-8601 timestamp."""
-        when = datetime.fromisoformat(when_iso)
-        if when.tzinfo is None:
-            when = when.replace(tzinfo=timezone.utc)
+        when = _parse_iso_utc(when_iso)
+        if when is None:
+            raise ValueError(f"Invalid isoformat string: {when_iso!r}")
         w = store.add_timer(session_id, when, note=note)
         return {"ok": True, "wake_id": w.id, "fire_at": w.fire_at}
 
