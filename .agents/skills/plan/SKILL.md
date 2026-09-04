@@ -28,7 +28,7 @@ Skill này hướng dẫn Agent lên kế hoạch chi tiết, có cấu trúc r�
 
 ### Bước 1: Khảo sát & Phân tích (Research)
 - Đọc kỹ codebase, tìm các file liên quan trước khi lên danh sách thay đổi.
-- Nếu người dùng chỉ định một file plan có sẵn (ví dụ `CRAWLER_LAYER_PLAN.md`, `BROWSER_CONTROL_PLANE_PLAN.md`), đọc kỹ file đó để lấy ngữ cảnh.
+- Nếu người dùng chỉ định một tài liệu hoặc yêu cầu cụ thể, đọc kỹ để lấy ngữ cảnh.
 
 ### Bước 2: Lập Implementation Plan (Kế hoạch hành động)
 Tạo hoặc cập nhật artifact `implementation_plan.md` (hoặc trình bày rõ trong response) với cấu trúc:
