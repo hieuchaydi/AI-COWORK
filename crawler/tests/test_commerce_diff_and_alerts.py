@@ -66,6 +66,10 @@ def test_lowest_price_30d_rule():
     curr_high = make_snapshot(price=11500000.0)
     assert rule.evaluate(curr_high, prev, history) is None
 
+    # A lower price outside the configured window must not suppress a new low.
+    stale_low = make_snapshot(price=5000000.0, days_ago=31)
+    assert rule.evaluate(current, prev, history + [stale_low]) is not None
+
 
 def test_stock_transition_rules():
     restock_rule = RestockRule()

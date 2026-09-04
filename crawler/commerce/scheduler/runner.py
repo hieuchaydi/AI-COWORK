@@ -7,18 +7,18 @@ runs diff analysis, and dispatches verified alerts.
 import asyncio
 import logging
 import random
-import time
-from typing import Any, Dict, List, Optional
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Dict, List, Optional
 
 from ..connectors.registry import get_connector_for_url
 from ..delivery.dispatcher import AlertDispatcher
 from ..interfaces import (
     AccessDeniedException,
     CaptchaChallengeException,
-    CommerceException,
+    CommerceConnector,
     ProductIdentity,
     ProductNotFoundException,
-    ProductSnapshot,
     RateLimitException,
     SessionExpiredException,
 )
@@ -41,26 +41,38 @@ class CommerceMonitorScheduler:
         diff_engine: Optional[DiffEngine] = None,
         dispatcher: Optional[AlertDispatcher] = None,
         min_interval_seconds: float = 2.0,
+        connector_resolver: Callable[[str], CommerceConnector] = get_connector_for_url,
     ):
         self.store = store or CommerceSqliteStore()
         self.diff_engine = diff_engine or DiffEngine()
         self.dispatcher = dispatcher or AlertDispatcher()
         self.min_interval_seconds = min_interval_seconds
-        self._platform_backoff_until: Dict[str, float] = {}
+        self.connector_resolver = connector_resolver
 
     def is_platform_backed_off(self, platform: str) -> bool:
         """Checks if a platform is currently in a polite backoff state."""
-        until = self._platform_backoff_until.get(platform, 0.0)
-        return time.time() < until
+        return self.store.get_platform_backoff_until(platform) is not None
 
-    def set_platform_backoff(self, platform: str, duration_seconds: float):
+    def set_platform_backoff(
+        self,
+        platform: str,
+        duration_seconds: float,
+        reason: str,
+    ) -> None:
         """Sets a mandatory backoff duration for a target platform."""
-        self._platform_backoff_until[platform] = time.time() + duration_seconds
-        logger.warning(f"[{platform}] Backing off requests for {duration_seconds:.1f}s.")
+        duration_seconds = max(float(duration_seconds), self.min_interval_seconds)
+        until = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
+        self.store.set_platform_backoff(platform, until, reason)
+        logger.warning(
+            "[%s] Backing off requests for %.1fs: %s",
+            platform,
+            duration_seconds,
+            reason,
+        )
 
     async def add_product(self, url: str, target_price: Optional[float] = None) -> ProductIdentity:
         """Resolves product and registers it for monitoring."""
-        connector = get_connector_for_url(url)
+        connector = self.connector_resolver(url)
         identity = await connector.resolve_product(url)
         self.store.upsert_monitored_product(identity, target_price=target_price)
         logger.info(f"Registered monitored product: {identity.canonical_url} (Platform: {identity.platform})")
@@ -76,12 +88,21 @@ class CommerceMonitorScheduler:
         - Evaluates diff engine rules
         - Dispatches alerts if triggered
         """
-        connector = get_connector_for_url(url)
-        identity = await connector.resolve_product(url)
+        try:
+            connector = self.connector_resolver(url)
+            identity = await connector.resolve_product(url)
+        except AccessDeniedException as exc:
+            return {"ok": False, "status": "unsupported", "error": str(exc), "url": url}
+        except ValueError as exc:
+            return {"ok": False, "status": "invalid_url", "error": str(exc), "url": url}
         platform = identity.platform
 
-        if self.is_platform_backed_off(platform):
-            remaining = self._platform_backoff_until[platform] - time.time()
+        backoff_until = self.store.get_platform_backoff_until(platform)
+        if backoff_until is not None:
+            remaining = max(
+                0.0,
+                (backoff_until - datetime.now(timezone.utc)).total_seconds(),
+            )
             return {
                 "ok": False,
                 "status": "backed_off",
@@ -106,7 +127,11 @@ class CommerceMonitorScheduler:
             snapshot = await connector.fetch_product(identity)
         except CaptchaChallengeException as exc:
             # Human-in-the-loop: Back off and request human assistance
-            self.set_platform_backoff(platform, duration_seconds=600.0)  # 10 min pause
+            self.set_platform_backoff(
+                platform,
+                duration_seconds=600.0,
+                reason="provider verification required",
+            )
             human_alert = AlertTrigger(
                 rule_name="human_verification_required",
                 product_id=identity.product_id,
@@ -116,8 +141,9 @@ class CommerceMonitorScheduler:
                 previous_value=None,
                 current_value=0.0,
                 message=(
-                    f"⚠️ Sàn {platform.upper()} yêu cầu giải Captcha / Cloudflare Challenge.\n"
-                    f"Vui lòng mở link {url} trong trình duyệt để hoàn thành xác thực. Không dùng bot bypass."
+                    f"⚠️ Nhà cung cấp {platform.upper()} yêu cầu xác thực.\n"
+                    "Tác vụ đã dừng. Hãy hoàn tất xác thực qua luồng tài khoản/API chính thức; "
+                    "không tự động vượt CAPTCHA hoặc đổi danh tính truy cập."
                 ),
                 severity="urgent",
             )
@@ -129,7 +155,11 @@ class CommerceMonitorScheduler:
                 "url": url,
             }
         except RateLimitException as exc:
-            self.set_platform_backoff(platform, duration_seconds=exc.retry_after)
+            self.set_platform_backoff(
+                platform,
+                duration_seconds=exc.retry_after,
+                reason="provider rate limit",
+            )
             return {
                 "ok": False,
                 "status": "rate_limited",
@@ -170,9 +200,9 @@ class CommerceMonitorScheduler:
         triggers = self.diff_engine.evaluate(snapshot, prev_snapshot, history, target_price=target_price)
 
         # Dispatch and record any triggered alerts
-        dispatched_count = 0
+        delivered_count = 0
         for trigger in triggers:
-            self.store.record_alert(
+            alert_id = self.store.record_alert(
                 product_id=trigger.product_id,
                 platform=trigger.platform,
                 rule=trigger.rule_name,
@@ -180,8 +210,10 @@ class CommerceMonitorScheduler:
                 current_value=trigger.current_value,
                 message=trigger.message,
             )
-            await self.dispatcher.dispatch(trigger)
-            dispatched_count += 1
+            delivery = await self.dispatcher.dispatch(trigger)
+            if delivery["delivered"]:
+                self.store.mark_alert_delivered(alert_id)
+                delivered_count += 1
 
         summary = self.diff_engine.calculate_summary(snapshot, prev_snapshot, history)
         return {
@@ -190,24 +222,26 @@ class CommerceMonitorScheduler:
             "snapshot": snapshot.model_dump(mode="json"),
             "summary": summary,
             "alerts_triggered": [t.rule_name for t in triggers],
-            "alerts_dispatched": dispatched_count,
+            "alerts": [asdict(trigger) for trigger in triggers],
+            "alerts_dispatched": delivered_count,
+            "alerts_pending_delivery": len(triggers) - delivered_count,
         }
 
     async def check_all(self) -> List[Dict[str, Any]]:
         """
-        Monitors all active registered products in sequence with randomized delays
-        to prevent request bursts or bot-like behavior.
+        Monitor active products sequentially with a polite delay between providers.
         """
         products = self.store.list_monitored_products(active_only=True)
         results = []
 
-        for prod in products:
+        for index, prod in enumerate(products):
             url = prod["canonical_url"]
             res = await self.check_product(url)
             results.append(res)
 
-            # Introduce polite randomized delay between checks
-            jitter = random.uniform(self.min_interval_seconds, self.min_interval_seconds + 1.5)
-            await asyncio.sleep(jitter)
+            # Spread checks to avoid request bursts against an authorized provider.
+            if index < len(products) - 1:
+                jitter = random.uniform(self.min_interval_seconds, self.min_interval_seconds + 1.5)
+                await asyncio.sleep(jitter)
 
         return results

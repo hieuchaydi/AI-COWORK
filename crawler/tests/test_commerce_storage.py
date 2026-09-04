@@ -2,7 +2,6 @@
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import tempfile
 import pytest
 
 from crawler.commerce.interfaces import ProductIdentity, ProductSnapshot
@@ -85,3 +84,15 @@ def test_record_and_deliver_alerts(temp_store: CommerceSqliteStore):
 
     temp_store.mark_alert_delivered(alert_id)
     assert len(temp_store.get_undelivered_alerts()) == 0
+
+
+def test_platform_backoff_is_durable_and_expires(temp_store: CommerceSqliteStore):
+    future = datetime.now(timezone.utc) + timedelta(minutes=5)
+    temp_store.set_platform_backoff("authorized_shop", future, "rate limit")
+
+    reopened = CommerceSqliteStore(temp_store.db_path)
+    assert reopened.get_platform_backoff_until("authorized_shop") == future
+
+    past = datetime.now(timezone.utc) - timedelta(seconds=1)
+    reopened.set_platform_backoff("authorized_shop", past, "expired")
+    assert reopened.get_platform_backoff_until("authorized_shop") is None

@@ -28,13 +28,16 @@ class CommerceSqliteStore:
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=5.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
     def _init_db(self):
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode = WAL")
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS monitored_products (
@@ -90,6 +93,16 @@ class CommerceSqliteStore:
                     message TEXT NOT NULL,
                     delivered INTEGER DEFAULT 0,
                     created_at TEXT NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS platform_backoffs (
+                    platform TEXT PRIMARY KEY,
+                    backoff_until TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 )
                 """
             )
@@ -267,6 +280,48 @@ class CommerceSqliteStore:
     def mark_alert_delivered(self, alert_id: int):
         with self._get_connection() as conn:
             conn.execute("UPDATE price_alerts SET delivered = 1 WHERE id = ?", (alert_id,))
+            conn.commit()
+
+    def set_platform_backoff(
+        self,
+        platform: str,
+        backoff_until: datetime,
+        reason: str,
+    ) -> None:
+        if backoff_until.tzinfo is None or backoff_until.utcoffset() is None:
+            raise ValueError("backoff_until must be timezone-aware")
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO platform_backoffs (platform, backoff_until, reason, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(platform) DO UPDATE SET
+                    backoff_until = excluded.backoff_until,
+                    reason = excluded.reason,
+                    updated_at = excluded.updated_at
+                """,
+                (platform, backoff_until.isoformat(), reason, now_iso),
+            )
+            conn.commit()
+
+    def get_platform_backoff_until(self, platform: str) -> Optional[datetime]:
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT backoff_until FROM platform_backoffs WHERE platform = ?",
+                (platform,),
+            ).fetchone()
+        if not row:
+            return None
+        backoff_until = datetime.fromisoformat(row["backoff_until"])
+        if backoff_until <= datetime.now(timezone.utc):
+            self.clear_platform_backoff(platform)
+            return None
+        return backoff_until
+
+    def clear_platform_backoff(self, platform: str) -> None:
+        with self._get_connection() as conn:
+            conn.execute("DELETE FROM platform_backoffs WHERE platform = ?", (platform,))
             conn.commit()
 
     @staticmethod

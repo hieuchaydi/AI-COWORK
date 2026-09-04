@@ -38,6 +38,7 @@ def test_categorize_tool_mappings():
     assert categorize_tool("extract_html") == ToolCategory.CRAWL
     assert categorize_tool("extract_table") == ToolCategory.CRAWL
     assert categorize_tool("save_csv") == ToolCategory.CRAWL
+    assert categorize_tool("commerce_monitor_check") == ToolCategory.CRAWL
 
     # DEV_SHELL tools
     assert categorize_tool("run_shell") == ToolCategory.DEV_SHELL
@@ -67,6 +68,10 @@ def test_intent_detection_vietnamese():
 
     # Crawl
     msgs = [{"role": "user", "content": "Cào 30 bài viết từ vnexpress và trích xuất bảng"}]
+    cats = get_active_categories(msgs, total_registered_tools=50)
+    assert ToolCategory.CRAWL in cats
+
+    msgs = [{"role": "user", "content": "Theo dõi giá sản phẩm này giúp tôi"}]
     cats = get_active_categories(msgs, total_registered_tools=50)
     assert ToolCategory.CRAWL in cats
 

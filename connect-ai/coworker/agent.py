@@ -231,6 +231,16 @@ def build_engine(
     #   crawl_urls, extract_html, extract_table, parse_sitemap,
     #   save_page_snapshot, download_file.
     registry.register_all(make_crawl_tools())
+    # Commerce monitoring lives in the repository-level crawler package. Source
+    # checkouts and desktop bundles include it; a standalone coworker wheel may not.
+    # Keep the base runtime usable when that optional package is absent.
+    try:
+        from .tools.commerce_monitor import make_commerce_monitor_tools
+    except ModuleNotFoundError as exc:
+        if exc.name != "crawler":
+            raise
+    else:
+        registry.register_all(make_commerce_monitor_tools())
     # ask_user: the universal human-in-the-loop Q&A primitive (every agent; engine-intercepted).
     if question_asker is not None:
         registry.register(ask_user_tool())

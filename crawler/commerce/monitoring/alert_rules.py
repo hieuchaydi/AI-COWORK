@@ -5,6 +5,7 @@ Evaluates price drops, 30-day lows, stock status flips, and rating shifts.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import List, Optional
 
 from ..interfaces import ProductSnapshot
@@ -109,8 +110,12 @@ class LowestPrice30DayRule(AlertRule):
         if not history:
             return None
 
-        # Exclude snapshots identical in timestamp/price to current
-        past_prices = [s.current_price for s in history if s.current_price > 0 and s.timestamp < current.timestamp]
+        cutoff = current.timestamp - timedelta(days=self.days)
+        past_prices = [
+            snapshot.current_price
+            for snapshot in history
+            if cutoff <= snapshot.timestamp < current.timestamp
+        ]
         if not past_prices:
             return None
 

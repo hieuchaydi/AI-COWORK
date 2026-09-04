@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python-core-and-commerce:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "connect-ai[dev,messaging,bedrock]" beautifulsoup4
+      - name: Run crawler and root integration tests
+        run: python -m pytest crawler/tests tests -q
+      - name: Run commerce runtime tests
+        working-directory: connect-ai
+        run: python -m pytest tests/test_commerce_monitor_tool.py tests/test_tool_router.py -q
+
+  gui-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: connect-ai/surfaces/gui/package-lock.json
+      - name: Install GUI dependencies
+        working-directory: connect-ai/surfaces/gui
+        run: npm ci
+      - name: Run GUI unit tests
+        working-directory: connect-ai/surfaces/gui
+        run: npm test
+      - name: Type-check and build GUI
+        working-directory: connect-ai/surfaces/gui
+        run: npm run build

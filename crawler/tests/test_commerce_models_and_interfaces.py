@@ -67,3 +67,25 @@ def test_custom_exceptions():
 
     sess_exc = SessionExpiredException(platform="lazada", message="Please login")
     assert sess_exc.platform == "lazada"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("current_price", 0),
+        ("rating_score", 5.1),
+        ("stock_quantity", -1),
+    ],
+)
+def test_product_snapshot_rejects_invalid_provider_data(field: str, value: float):
+    payload = {
+        "product_id": "123",
+        "platform": "authorized_shop",
+        "title": "Product",
+        "current_price": 100.0,
+        "url": "https://api.vendor.example/products/123",
+        field: value,
+    }
+
+    with pytest.raises(ValueError):
+        ProductSnapshot(**payload)

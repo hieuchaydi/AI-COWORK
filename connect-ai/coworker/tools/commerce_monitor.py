@@ -9,25 +9,38 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
+
+from .base import coworker_tool
 
 # Ensure project root is in sys.path
-root_dir = str(Path(__file__).resolve().parents[3])
+project_root = Path(__file__).resolve().parents[3]
+root_dir = str(project_root)
 if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
 
 from crawler.commerce.connectors.registry import get_connector_for_url
+from crawler.commerce.interfaces import AccessDeniedException
 from crawler.commerce.scheduler.runner import CommerceMonitorScheduler
 from crawler.commerce.storage.sqlite_store import CommerceSqliteStore
 
+_DB_PATH = project_root / "outputs" / "commerce" / "commerce_monitor.db"
+
+
+def _get_store() -> CommerceSqliteStore:
+    return CommerceSqliteStore(str(_DB_PATH))
+
 
 def _get_scheduler() -> CommerceMonitorScheduler:
-    store = CommerceSqliteStore("outputs/commerce/commerce_monitor.db")
-    return CommerceMonitorScheduler(store=store)
+    return CommerceMonitorScheduler(
+        store=_get_store(),
+        connector_resolver=get_connector_for_url,
+    )
 
 
+@coworker_tool(category="crawl")
 def commerce_monitor_track(url: str, target_price: Optional[float] = None) -> Dict[str, Any]:
-    """Register a product URL (e.g. Tiki, Shopee) for price and stock monitoring.
+    """Register a product from a configured official API/feed for monitoring.
 
     Args:
         url: Direct URL to the product.
@@ -47,10 +60,15 @@ def commerce_monitor_track(url: str, target_price: Optional[float] = None) -> Di
             "target_price": target_price,
             "message": f"Successfully registered {identity.canonical_url} for monitoring.",
         }
+    except AccessDeniedException as exc:
+        return {"ok": False, "status": "unsupported", "error": str(exc), "url": url}
+    except ValueError as exc:
+        return {"ok": False, "status": "invalid_url", "error": str(exc), "url": url}
     except Exception as exc:
         return {"ok": False, "error": str(exc), "url": url}
 
 
+@coworker_tool(category="crawl")
 def commerce_monitor_check(url: str) -> Dict[str, Any]:
     """Fetch current price, stock, and rating for a product URL and compute diffs/alerts.
 
@@ -67,17 +85,21 @@ def commerce_monitor_check(url: str) -> Dict[str, Any]:
         return {"ok": False, "error": str(exc), "url": url}
 
 
+@coworker_tool(category="crawl")
 def commerce_monitor_list() -> Dict[str, Any]:
     """List all currently active monitored products and their last check timestamps."""
-    store = CommerceSqliteStore("outputs/commerce/commerce_monitor.db")
-    products = store.list_monitored_products(active_only=True)
-    return {
-        "ok": True,
-        "count": len(products),
-        "products": products,
-    }
+    try:
+        products = _get_store().list_monitored_products(active_only=True)
+        return {
+            "ok": True,
+            "count": len(products),
+            "products": products,
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
+@coworker_tool(category="crawl")
 def commerce_monitor_history(url: str, days: int = 30) -> Dict[str, Any]:
     """Retrieve historical price snapshots and 30-day minimum price for a product.
 
@@ -85,24 +107,41 @@ def commerce_monitor_history(url: str, days: int = 30) -> Dict[str, Any]:
         url: Direct URL to the product.
         days: Historical lookback window in days (default: 30).
     """
-    connector = get_connector_for_url(url)
-    identity = asyncio.run(connector.resolve_product(url))
-    store = CommerceSqliteStore("outputs/commerce/commerce_monitor.db")
+    if not 1 <= days <= 3650:
+        return {"ok": False, "error": "days must be between 1 and 3650", "url": url}
+    try:
+        connector = get_connector_for_url(url)
+        identity = asyncio.run(connector.resolve_product(url))
+        store = _get_store()
+        snapshots = store.get_snapshots_history(
+            identity.product_id,
+            identity.platform,
+            limit=50,
+            days=days,
+        )
+        lowest_price = store.get_lowest_price(
+            identity.product_id,
+            identity.platform,
+            days=days,
+        )
+        return {
+            "ok": True,
+            "product_id": identity.product_id,
+            "platform": identity.platform,
+            "canonical_url": identity.canonical_url,
+            "lowest_price": lowest_price,
+            "snapshot_count": len(snapshots),
+            "history": [snapshot.model_dump(mode="json") for snapshot in snapshots],
+        }
+    except AccessDeniedException as exc:
+        return {"ok": False, "status": "unsupported", "error": str(exc), "url": url}
+    except ValueError as exc:
+        return {"ok": False, "status": "invalid_url", "error": str(exc), "url": url}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "url": url}
 
-    snapshots = store.get_snapshots_history(identity.product_id, identity.platform, limit=50, days=days)
-    lowest_price = store.get_lowest_price(identity.product_id, identity.platform, days=days)
 
-    return {
-        "ok": True,
-        "product_id": identity.product_id,
-        "platform": identity.platform,
-        "canonical_url": identity.canonical_url,
-        "lowest_price": lowest_price,
-        "snapshot_count": len(snapshots),
-        "history": [s.model_dump(mode="json") for s in snapshots],
-    }
-
-
+@coworker_tool(category="crawl")
 def commerce_monitor_check_all() -> Dict[str, Any]:
     """Execute scheduled check across all active registered products."""
     scheduler = _get_scheduler()
@@ -115,3 +154,15 @@ def commerce_monitor_check_all() -> Dict[str, Any]:
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+
+
+def make_commerce_monitor_tools() -> list[Any]:
+    """Return the commerce tools registered by the Coworker runtime."""
+
+    return [
+        commerce_monitor_track,
+        commerce_monitor_check,
+        commerce_monitor_list,
+        commerce_monitor_history,
+        commerce_monitor_check_all,
+    ]

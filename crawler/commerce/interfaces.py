@@ -6,7 +6,7 @@ Follows clean, sustainable architecture without bot-bypass or evasive hacks.
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class CommerceException(Exception):
@@ -50,7 +50,13 @@ class AccessDeniedException(CommerceException):
     """Raised when permission is denied or credentials are invalid."""
 
 
-class ProductIdentity(BaseModel):
+class CommerceModel(BaseModel):
+    """Strict base model for persisted commerce data."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ProductIdentity(CommerceModel):
     """Normalized identifier for a commerce product across platforms."""
 
     platform: str
@@ -61,26 +67,47 @@ class ProductIdentity(BaseModel):
     title: Optional[str] = None
     extra: Dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("canonical_url")
+    @classmethod
+    def validate_canonical_url(cls, value: str) -> str:
+        if not value.startswith("https://"):
+            raise ValueError("canonical_url must use HTTPS")
+        return value
 
-class ProductSnapshot(BaseModel):
+
+class ProductSnapshot(CommerceModel):
     """A point-in-time snapshot of product details, pricing, inventory, and ratings."""
 
     product_id: str
     platform: str
     title: str
-    current_price: float
-    original_price: Optional[float] = None
-    discount_rate: Optional[float] = None
+    current_price: float = Field(gt=0)
+    original_price: Optional[float] = Field(default=None, gt=0)
+    discount_rate: Optional[float] = Field(default=None, ge=0, le=100)
     currency: str = "VND"
     in_stock: bool = True
-    stock_quantity: Optional[int] = None
-    rating_score: Optional[float] = None
-    review_count: Optional[int] = None
+    stock_quantity: Optional[int] = Field(default=None, ge=0)
+    rating_score: Optional[float] = Field(default=None, ge=0, le=5)
+    review_count: Optional[int] = Field(default=None, ge=0)
     seller_name: Optional[str] = None
     image_url: Optional[str] = None
     url: str
     raw_attributes: Dict[str, Any] = Field(default_factory=dict)
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value: str) -> str:
+        if not value.startswith("https://"):
+            raise ValueError("snapshot URL must use HTTPS")
+        return value
+
+    @field_validator("timestamp")
+    @classmethod
+    def validate_timestamp(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("snapshot timestamp must be timezone-aware")
+        return value
 
     @property
     def computed_discount_pct(self) -> float:
@@ -92,18 +119,18 @@ class ProductSnapshot(BaseModel):
         return 0.0
 
 
-class ReviewItem(BaseModel):
+class ReviewItem(CommerceModel):
     """A single product review."""
 
     review_id: str
     author: Optional[str] = None
-    rating: int = 5
+    rating: int = Field(default=5, ge=1, le=5)
     content: Optional[str] = None
     created_at: Optional[datetime] = None
     media_urls: List[str] = Field(default_factory=list)
 
 
-class ReviewPage(BaseModel):
+class ReviewPage(CommerceModel):
     """Paginated collection of reviews."""
 
     product_id: str

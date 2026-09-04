@@ -1,10 +1,14 @@
 """Commerce connectors package."""
-from .registry import get_connector_for_url
-from .tiki import TikiCommerceConnector
-from .session_base import BrowserSessionCommerceConnector
+from .registry import (
+    CommerceConnectorRegistry,
+    ConnectorRegistration,
+    get_connector_for_url,
+    register_connector,
+)
 
 __all__ = [
+    "CommerceConnectorRegistry",
+    "ConnectorRegistration",
     "get_connector_for_url",
-    "TikiCommerceConnector",
-    "BrowserSessionCommerceConnector",
+    "register_connector",
 ]

@@ -29,6 +29,7 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 # (<repo>/packaging). Derive everything else from it — no hardcoded paths.
 PACKAGING = SPECPATH
 ROOT = os.path.dirname(PACKAGING)
+REPO_ROOT = os.path.dirname(ROOT)
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -43,6 +44,12 @@ binaries = []
 
 for pkg in ("coworker", "aisuite", "mcp", "ddgs", "croniter", "docstring_parser"):
     hiddenimports += collect_submodules(pkg)
+
+# Commerce monitoring is shared with the repository-level crawler package.
+# Add it to desktop bundles while keeping the standalone coworker wheel optional.
+if os.path.isfile(os.path.join(REPO_ROOT, "crawler", "__init__.py")):
+    sys.path.insert(0, REPO_ROOT)
+    hiddenimports += collect_submodules("crawler")
 
 if not INCLUDE_EXPERIMENTAL:
     hiddenimports = [
@@ -89,7 +96,7 @@ for pkg in ("slack_bolt", "telegram"):  # [messaging] extra — optional
 
 a = Analysis(
     [os.path.join(PACKAGING, "server_entry.py")],
-    pathex=[ROOT],
+    pathex=[ROOT, REPO_ROOT],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
