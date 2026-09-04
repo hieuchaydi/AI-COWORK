@@ -874,6 +874,35 @@ def make_integration_tools(
         )
     )
 
+    def github_remove_clone(directory: str) -> dict[str, Any]:
+        target, err = _writable_target(directory)
+        if err:
+            return err
+        if not target.exists():
+            return {"error": f"{target} does not exist"}
+        if not (target / ".git").is_dir():
+            return {"error": f"refusing to remove {target}: not a Git clone"}
+        import shutil
+
+        shutil.rmtree(target)
+        return {"ok": True, "removed": str(target)}
+
+    github_remove_clone.__name__ = "github_remove_clone"
+    tools.append(
+        _attach(
+            github_remove_clone,
+            _schema(
+                "github_remove_clone",
+                "Delete a previously cloned Git repository from a writable session folder. "
+                "Refuses ordinary folders and paths outside granted directories.",
+                {"directory": {"type": "string"}},
+                ["directory"],
+            ),
+            approval=True,
+            caps=["github", "write"],
+        )
+    )
+
     def github_pull(directory: str) -> dict[str, Any]:
         target, err = _writable_target(directory)
         if err:

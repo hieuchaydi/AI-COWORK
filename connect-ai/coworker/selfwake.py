@@ -49,10 +49,11 @@ class WakeStore:
         self.path = Path(path) if path else None
         self._lock = threading.Lock()
         self._wakes: dict[str, Wake] = {}
+        self._auto: dict[str, bool] = {}
         if self.path and self.path.is_file():
-            for raw in json.loads(self.path.read_text(encoding="utf-8")).get(
-                "wakes", []
-            ):
+            saved = json.loads(self.path.read_text(encoding="utf-8"))
+            self._auto = {str(k): bool(v) for k, v in saved.get("auto", {}).items()}
+            for raw in saved.get("wakes", []):
                 w = Wake(**raw)
                 self._wakes[w.id] = w
 
@@ -61,7 +62,10 @@ class WakeStore:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(
-            json.dumps({"wakes": [asdict(w) for w in self._wakes.values()]}, indent=2),
+            json.dumps(
+                {"wakes": [asdict(w) for w in self._wakes.values()], "auto": self._auto},
+                indent=2,
+            ),
             encoding="utf-8",
         )
 
@@ -101,6 +105,8 @@ class WakeStore:
         now = now or _now()
         out = []
         for w in self._wakes.values():
+            if not self.auto_enabled(w.session_id):
+                continue
             if w.state != STATE_PENDING and w.state != STATE_DUE:
                 continue
             if (
@@ -150,6 +156,23 @@ class WakeStore:
             if w.state != STATE_FIRED
             and (session_id is None or w.session_id == session_id)
         ]
+
+    def auto_enabled(self, session_id: str) -> bool:
+        return self._auto.get(session_id, True)
+
+    def set_auto(self, session_id: str, enabled: bool) -> None:
+        with self._lock:
+            self._auto[session_id] = bool(enabled)
+            self._save()
+
+    def cancel(self, wake_id: str, session_id: str = "") -> bool:
+        with self._lock:
+            wake = self._wakes.get(wake_id)
+            if wake is None or (session_id and wake.session_id != session_id):
+                return False
+            del self._wakes[wake_id]
+            self._save()
+            return True
 
 
 def selfwake_tools(store: WakeStore, session_id: str) -> list:

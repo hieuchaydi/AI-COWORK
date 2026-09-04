@@ -1736,6 +1736,38 @@ export async function disconnectGithubInstallation(installationId: string): Prom
   return res.json();
 }
 
+export interface SessionWake {
+  id: string;
+  kind: "timer" | "completion" | "event" | string;
+  state: string;
+  fire_at?: string | null;
+  job_id?: string | null;
+  event_key?: string | null;
+  note: string;
+  created_at: string;
+}
+
+export async function getSessionWakes(sessionId: string): Promise<{ auto: boolean; wakes: SessionWake[] }> {
+  const res = await fetch(`${httpBase()}/v1/sessions/${encodeURIComponent(sessionId)}/wakes`);
+  return res.json();
+}
+
+export async function setSessionWakeAuto(sessionId: string, auto: boolean): Promise<{ ok: boolean; auto: boolean }> {
+  const res = await fetch(`${httpBase()}/v1/sessions/${encodeURIComponent(sessionId)}/wakes`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ auto }),
+  });
+  return res.json();
+}
+
+export async function cancelSessionWake(sessionId: string, wakeId: string): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/sessions/${encodeURIComponent(sessionId)}/wakes/${encodeURIComponent(wakeId)}`, {
+    method: "DELETE",
+  });
+  return res.json();
+}
+
 export interface CloudStatus {
   signed_in: boolean;
   account?: string | null;
@@ -1753,10 +1785,17 @@ export async function startCloudLogin(): Promise<{ ok: boolean; error?: string }
 }
 
 export async function startGithubAppInstall(): Promise<{ ok: boolean; error?: string }> {
-  const res = await fetch(`${httpBase()}/v1/connectors/github/connect-managed`, {
+  return startManagedConnector("github", { flow: "install" });
+}
+
+export async function startManagedConnector(
+  name: string,
+  options: { flow?: string; access?: string } = {},
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/connectors/${encodeURIComponent(name)}/connect-managed`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ flow: "install" }),
+    body: JSON.stringify(options),
   });
   return res.json();
 }

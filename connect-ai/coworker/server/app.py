@@ -414,6 +414,26 @@ def create_app(manager: SessionManager) -> FastAPI:
         manager.unattended.set(session_id, on)
         return {"ok": True, "session_id": session_id, "unattended": on}
 
+    @app.get("/v1/sessions/{session_id}/wakes")
+    def session_wakes(session_id: str) -> dict[str, Any]:
+        from dataclasses import asdict
+
+        return {
+            "auto": manager.wakes.auto_enabled(session_id),
+            "wakes": [asdict(w) for w in manager.wakes.pending(session_id)],
+        }
+
+    @app.patch("/v1/sessions/{session_id}/wakes")
+    def set_session_wake_auto(session_id: str, body: dict) -> dict[str, Any]:
+        enabled = bool((body or {}).get("auto"))
+        manager.wakes.set_auto(session_id, enabled)
+        return {"ok": True, "auto": enabled}
+
+    @app.delete("/v1/sessions/{session_id}/wakes/{wake_id}")
+    def cancel_session_wake(session_id: str, wake_id: str) -> dict[str, Any]:
+        ok = manager.wakes.cancel(wake_id, session_id)
+        return {"ok": ok, **({} if ok else {"error": "wake not found"})}
+
     @app.get("/v1/sessions/{session_id}/connections")
     def session_connections(session_id: str, persona: str = "") -> dict[str, Any]:
         # `persona` is the GUI's hint for brand-new sessions (no record yet) — without it the

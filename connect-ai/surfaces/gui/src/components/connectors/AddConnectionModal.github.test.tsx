@@ -83,6 +83,32 @@ describe("GitHub connection flow", () => {
     }));
   });
 
+  it("uses the same managed one-click flow for other connectors", async () => {
+    const slack = {
+      ...github,
+      name: "slack",
+      title: "Slack",
+      logo: "slack",
+      connected: false,
+      installations: undefined,
+    } satisfies Connector;
+    const calls: Array<{ url: string; method: string }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+      const method = (init?.method || "GET").toUpperCase();
+      calls.push({ url, method });
+      if (url.includes("/v1/cloud/status")) return { json: async () => ({ signed_in: true }) } as Response;
+      if (url.includes("/connect-managed")) return { json: async () => ({ ok: true }) } as Response;
+      return { json: async () => ({ connectors: [{ ...slack, connected: true }] }) } as Response;
+    }));
+    const onChanged = vi.fn();
+    render(<AddConnectionModal c={slack} onChanged={onChanged} onClose={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Connect Slack" }));
+
+    await waitFor(() => expect(onChanged).toHaveBeenCalledOnce());
+    expect(calls.some((x) => x.method === "POST" && x.url.includes("/v1/connectors/slack/connect-managed"))).toBe(true);
+  });
+
   it("keeps manual PAT as an explicit secondary path", () => {
     vi.stubGlobal("fetch", vi.fn());
     render(<AddConnectionModal c={github} onChanged={vi.fn()} onClose={vi.fn()} />);

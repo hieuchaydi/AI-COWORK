@@ -178,6 +178,13 @@ TOOL_DEFS: tuple[ConnectorToolDef, ...] = (
     ),
     ConnectorToolDef(
         "github",
+        "github_remove_clone",
+        "Remove a clone",
+        "write",
+        "Delete a GitHub repository clone from a writable session folder.",
+    ),
+    ConnectorToolDef(
+        "github",
         "github_pull",
         "Update a clone",
         "read",

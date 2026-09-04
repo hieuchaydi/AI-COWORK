@@ -64,3 +64,18 @@ def test_selfwake_tools(tmp_path):
     pend = store.pending("s1")
     assert len(pend) == 4
     assert {w.kind for w in pend} == {"timer", "completion", "event"}
+
+
+def test_wake_auto_pause_and_cancel_persist(tmp_path):
+    path = tmp_path / "wakes.json"
+    store = WakeStore(path)
+    wake = store.add_timer("s1", _now() - timedelta(seconds=1), note="poll")
+    assert [w.id for w in store.due()] == [wake.id]
+
+    store.set_auto("s1", False)
+    assert store.due() == []
+    reloaded = WakeStore(path)
+    assert reloaded.auto_enabled("s1") is False
+    assert reloaded.cancel(wake.id, "wrong-session") is False
+    assert reloaded.cancel(wake.id, "s1") is True
+    assert reloaded.pending("s1") == []

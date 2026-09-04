@@ -48,6 +48,7 @@ import { Icon } from "./components/Icon";
 import { Sidebar } from "./components/Sidebar";
 import { ThinkingBlock, Transcript } from "./components/Transcript";
 import { Composer } from "./components/Composer";
+import { WakeControls } from "./components/WakeControls";
 import { Markdown } from "./components/Markdown";
 import { SearchModal } from "./components/SearchModal";
 import { SessionIntro } from "./components/SessionIntro";
@@ -1584,6 +1585,7 @@ export function App() {
               </div>
             )}
 
+            {agent !== "chat" && <WakeControls sessionId={sessionId} />}
             <Composer
               mode={mode}
               model={model}

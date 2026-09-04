@@ -8,6 +8,7 @@ import {
   startGoogleLogin,
   startCloudLogin,
   startGithubAppInstall,
+  startManagedConnector,
   type Connector,
 } from "../../api";
 import { ConnectorBadge } from "../../connectors/ConnectorIcon";
@@ -70,6 +71,8 @@ export function AddConnectionModal({
           <GoogleConnect c={c} onConnected={() => { onChanged(); onClose(); }} />
         ) : isGithub ? (
           <GithubConnect c={c} onConnected={() => { onChanged(); onClose(); }} />
+        ) : c.managed && !c.managed_paused ? (
+          <ManagedConnect c={c} onConnected={() => { onChanged(); onClose(); }} />
         ) : twoModes ? (
           <>
             <div className="px-5 pt-4">
@@ -109,6 +112,106 @@ export function AddConnectionModal({
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+function connectionKeys(c: Connector): Set<string> {
+  const rows = [
+    ...(c.workspaces ?? []).map((x) => x.team_id),
+    ...(c.accounts ?? []).map((x) => "email" in x ? x.email : x.account_id),
+    ...(c.portals ?? []).map((x) => x.hub_id),
+  ];
+  return new Set(rows.filter(Boolean));
+}
+
+function ManagedConnect({ c, onConnected }: { c: Connector; onConnected: () => void }) {
+  const [pane, setPane] = useState<"one" | "manual">("one");
+  const [step, setStep] = useState<GithubConnectStep>("idle");
+  const [error, setError] = useState<string | null>(null);
+  const initialKeys = useRef(connectionKeys(c));
+  const startedAt = useRef(0);
+  const polling = useRef(false);
+
+  useEffect(() => {
+    if (step === "idle") return;
+    let cancelled = false;
+    const poll = async () => {
+      if (polling.current) return;
+      if (Date.now() - startedAt.current > 180_000) {
+        setError("Connection timed out. Check the browser tab, then try again.");
+        setStep("idle");
+        return;
+      }
+      polling.current = true;
+      try {
+        if (step === "signing-in") {
+          const cloud = await getCloudStatus();
+          if (!cloud.signed_in || cancelled) return;
+          const started = await startManagedConnector(c.name);
+          if (!started.ok) throw new Error(started.error || `could not open ${c.title}`);
+          if (!cancelled) setStep("installing");
+          return;
+        }
+        const current = (await getConnectors()).find((x) => x.name === c.name);
+        if (!current) return;
+        const keys = connectionKeys(current);
+        const added = [...keys].some((key) => !initialKeys.current.has(key));
+        if (added || (!c.connected && current.connected)) onConnected();
+      } catch (e) {
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : `${c.title} connection failed`);
+          setStep("idle");
+        }
+      } finally {
+        polling.current = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 1500);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [step, c.name, c.title, c.connected, onConnected]);
+
+  const start = async () => {
+    setError(null);
+    startedAt.current = Date.now();
+    try {
+      const cloud = await getCloudStatus();
+      if (!cloud.signed_in) {
+        const login = await startCloudLogin();
+        if (!login.ok) throw new Error(login.error || "could not start sign-in");
+        setStep("signing-in");
+        return;
+      }
+      const result = await startManagedConnector(c.name);
+      if (!result.ok) throw new Error(result.error || `could not open ${c.title}`);
+      setStep("installing");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : `${c.title} connection failed`);
+      setStep("idle");
+    }
+  };
+
+  return (
+    <div className="px-5 pb-5 pt-4 space-y-4" data-testid="managed-connect">
+      {c.fields.length > 0 && (
+        <div className="inline-flex p-0.5 bg-paper text-[12.5px] font-medium" role="tablist">
+          <button className={pane === "one" ? "px-3.5 py-1 bg-panel border border-line" : "px-3.5 py-1 text-muted"} role="tab" aria-selected={pane === "one"} onClick={() => setPane("one")}>One click</button>
+          <button className={pane === "manual" ? "px-3.5 py-1 bg-panel border border-line" : "px-3.5 py-1 text-muted"} role="tab" aria-selected={pane === "manual"} onClick={() => setPane("manual")}>Manual</button>
+        </div>
+      )}
+      {pane === "one" ? (
+        <div className="space-y-3">
+          <p className="text-[13px] text-muted">Connect in your browser. The account is added automatically when authorization finishes.</p>
+          <button className={PILL_ACCENT + " w-full !py-2"} onClick={start} disabled={step !== "idle"}>
+            {step === "signing-in" ? "Finish signing in in your browser..." : step === "installing" ? `Finish connecting ${c.title}...` : `Connect ${c.title}`}
+          </button>
+          {error && <div className="text-[12.5px] text-danger" role="alert">{error}</div>}
+          <p className="text-[12px] text-faint text-center"><span className={TAG_ACCENT}>Recommended</span> no token to copy manually</p>
+        </div>
+      ) : (
+        <div className="-mx-3.5 -mb-2"><ConnectSetup c={c} onConnected={onConnected} manualOnly /></div>
+      )}
     </div>
   );
 }

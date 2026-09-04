@@ -609,6 +609,22 @@ def test_clone_rejects_missing_or_non_github_repository(tmp_path):
     assert "GitHub URL" in tools["github_clone"](repository="https://example.com/a/b")["error"]
 
 
+def test_remove_clone_only_deletes_git_repo_inside_granted_root(tmp_path):
+    granted, tools = _clone_tools(SecretStore(), tmp_path)
+    clone = granted / "repo"
+    (clone / ".git").mkdir(parents=True)
+    (clone / "work.txt").write_text("generated")
+    ordinary = granted / "ordinary"
+    ordinary.mkdir()
+
+    refused = tools["github_remove_clone"](str(ordinary))
+    assert "not a Git clone" in refused["error"]
+    assert ordinary.exists()
+    removed = tools["github_remove_clone"](str(clone))
+    assert removed["ok"] is True
+    assert not clone.exists()
+
+
 def test_clone_refuses_paths_outside_granted_roots(tmp_path, monkeypatch, _origin):
     monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("GITHUB_GIT_URL", f"file://{_origin['base']}")
