@@ -43,6 +43,11 @@ _CRAWL_TOOL_NAMES = {
     "zip_folder",
     "download_media_and_zip",
     "crawl_and_export_bundle",
+    "commerce_monitor_track",
+    "commerce_monitor_check",
+    "commerce_monitor_list",
+    "commerce_monitor_history",
+    "commerce_monitor_check_all",
 }
 _DEV_SHELL_TOOL_NAMES = {
     "run_shell",
