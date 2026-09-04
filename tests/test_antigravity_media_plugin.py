@@ -46,3 +46,43 @@ def test_antigravity_media_plugin_skill_and_rule_cover_output_contract():
     assert "unsandboxed(*)" in combined
     assert "Never stop at" in combined
     assert "AGENTS.md" in combined
+
+
+def test_antigravity_customizations_check_script_exists_and_covers_checks():
+    import os
+    import shutil
+    import subprocess
+
+    script_path = ROOT / ".agents" / "scripts" / "check_antigravity_customizations.ps1"
+    assert script_path.exists(), "check_antigravity_customizations.ps1 must exist"
+
+    script_text = script_path.read_text(encoding="utf-8")
+
+    # Key checks verified by the script
+    assert "AGENTS.md" in script_text
+    assert "plugins.json" in script_text
+    assert "skills.json" in script_text
+    assert "auto-execute" in script_text
+    assert "media-scrape-autopilot" in script_text
+    assert ".gemini\\bin\\agy.exe" in script_text
+    assert "plugin validate" in script_text
+    assert "plugin list" in script_text
+    assert "--add-dir" in script_text
+    assert "code_builder" in script_text
+    assert "PASS" in script_text
+    assert "FAIL" in script_text
+    assert "exit 1" in script_text
+    assert "exit 0" in script_text
+
+    # Execute verification script if environment supports it
+    powershell_cmd = shutil.which("powershell") or shutil.which("pwsh")
+    agy_path = Path(os.environ.get("USERPROFILE", "")) / ".gemini" / "bin" / "agy.exe"
+    if powershell_cmd and agy_path.exists():
+        proc = subprocess.run(
+            [powershell_cmd, "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, f"Script failed with output:\n{proc.stdout}\n{proc.stderr}"
+        assert "Result: PASS" in proc.stdout
