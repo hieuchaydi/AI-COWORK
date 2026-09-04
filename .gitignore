@@ -13,6 +13,7 @@ logs/
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
 
 # node
 node_modules/
@@ -76,3 +77,12 @@ build/
 connect-ai/packaging/dist/
 connect-ai/packaging/build/
 connect-ai/surfaces/gui/src-tauri/binaries/sidecar/
+
+# Temporary plan artifacts and scratch test scripts (never commit)
+implementation_plan*.md
+walkthrough*.md
+scratch/
+test_tmp*
+tmp_test*
+tmp_*.py
+

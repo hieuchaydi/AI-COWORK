@@ -39,6 +39,8 @@ Execution rules:
 - Continue from A to Z until the task is complete.
 - Run syntax checks and relevant tests after code changes.
 - Fix failures before finishing.
+- **Never commit plan or temporary test files to Git**: Never commit `implementation_plan.md`, `walkthrough.md`, temporary plan files, or scratch/temporary test scripts (`scratch/*`, `test_tmp*`, `tmp_*`).
+- **Clean up before commit**: Clear/delete all temporary plan and test files from the workspace before committing.
 - Commit completed implementation work with a clear Conventional Commit message.
 - Only stop for irreversible data loss or missing credentials.
 

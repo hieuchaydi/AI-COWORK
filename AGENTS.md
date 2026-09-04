@@ -23,7 +23,11 @@
   1. Task hủy data không recover được.
   2. Cần credential mới chưa có.
 - **Sau mỗi thay đổi code**: tự chạy syntax check, fix lỗi, commit git.
-- **Commit**: sau khi implement xong mỗi feature, commit với message rõ ràng.
+- **Quy tắc dọn dẹp & Git commit (TUYỆT ĐỐI KHÔNG COMMIT FILE TEST / PLAN)**:
+  - **Tuyệt đối KHÔNG commit các file test tạm / nháp, file plan, artifact lên Git**: Không bao giờ commit `implementation_plan.md`, `walkthrough.md`, các file plan nháp, hay các file/script test tạm thời (`scratch/*`, `test_tmp*`, `tmp_*`...) vào git repository.
+  - **Dọn dẹp sạch sẽ (Clear all)**: Trước khi commit hoặc ngay sau khi hoàn thành task, BẮT BUỘC phải dọn dẹp, xóa sạch toàn bộ các file test tạm, file plan, walkthrough khỏi workspace.
+  - Khi thực hiện `git add` / `git commit`: Chỉ commit mã nguồn chính thức, tài liệu dự án chính thức và các unit test chính thức (trong thư mục test chuẩn). Luôn kiểm tra `git status` để đảm bảo không có file rác, file plan hoặc file test nháp nào lọt vào commit.
+- **Commit**: sau khi implement xong mỗi feature và đã dọn dẹp sạch file test/plan tạm, commit với message rõ ràng theo quy chuẩn Conventional Commits.
 
 ## Tự suy luận và tạo tool mới khi thiếu (Autonomous Tool Synthesis)
 

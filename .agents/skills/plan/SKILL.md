@@ -47,8 +47,10 @@ Tạo hoặc cập nhật artifact `implementation_plan.md` (hoặc trình bày 
   - Cập nhật checkbox `[x]` trong `implementation_plan.md`.
 - Tiếp tục làm cho đến khi **HOÀN THÀNH 100% CÁC BƯỚC TRONG PLAN**, rồi mới báo cáo kết quả một lần.
 
-### Bước 4: Tổng kết & Commit Git
-- Tạo artifact `walkthrough.md` báo cáo kết quả và log kiểm thử.
+### Bước 4: Dọn dẹp, Tổng kết & Commit Git
+- **Dọn dẹp sạch sẽ (Clean up)**: Xóa toàn bộ các file plan tạm thời (`implementation_plan.md`, `walkthrough.md`) hoặc các file/script test nháp (`scratch/*`, `test_tmp*`, `tmp_*`...) khỏi workspace.
+- **TUYỆT ĐỐI KHÔNG commit file test/plan tạm lên Git**: Chỉ `git add` và commit các file code nguồn, tài liệu dự án chính thức và bộ unit test chính thức của dự án. Không bao giờ commit file plan hay file test nháp.
+- Nếu cần tạo báo cáo tổng kết, chỉ tạo dưới dạng artifact nội bộ của hệ thống hoặc trả lời trực tiếp trong response cho user, không để lại file rác trong workspace.
 - Commit git với message rõ ràng theo quy chuẩn Conventional Commits.
 - Báo cáo ngắn gọn cho người dùng.
 

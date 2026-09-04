@@ -11,6 +11,8 @@ Antigravity must load this workspace rule before acting in `AI-COWORK`.
 - Plans are tracking documents only. Create or update `implementation_plan.md`, then continue immediately.
 - Use `RequestFeedback: false` for generated plan artifacts.
 - Run syntax checks and relevant tests after code changes.
+- Never commit plan files (`implementation_plan.md`, `walkthrough.md`) or temporary test files/scripts to Git.
+- Clean up and clear all temporary test and plan files from the workspace before committing.
 - Commit completed implementation work with a clear Conventional Commit message.
 - Use Vietnamese in user-facing replies unless the user explicitly switches language.
 
