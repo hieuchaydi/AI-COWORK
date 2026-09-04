@@ -1,10 +1,13 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   connectConnector,
   connectMcpBacked,
+  getCloudStatus,
   getConnectors,
   GOOGLE_CONNECTORS,
   startGoogleLogin,
+  startCloudLogin,
+  startGithubAppInstall,
   type Connector,
 } from "../../api";
 import { ConnectorBadge } from "../../connectors/ConnectorIcon";
@@ -35,6 +38,7 @@ export function AddConnectionModal({
   // it IS the connect flow.
   const mcpBacked = !!c.mcp;
   const isGoogle = GOOGLE_CONNECTORS.includes(c.name);
+  const isGithub = c.name === "github";
   const twoModes = mcpBacked && c.fields.length > 0;
   const [pane, setPane] = useState<"one" | "manual">("one");
 
@@ -64,6 +68,8 @@ export function AddConnectionModal({
 
         {isGoogle ? (
           <GoogleConnect c={c} onConnected={() => { onChanged(); onClose(); }} />
+        ) : isGithub ? (
+          <GithubConnect c={c} onConnected={() => { onChanged(); onClose(); }} />
         ) : twoModes ? (
           <>
             <div className="px-5 pt-4">
@@ -103,6 +109,101 @@ export function AddConnectionModal({
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+type GithubConnectStep = "idle" | "signing-in" | "installing";
+
+function GithubConnect({ c, onConnected }: { c: Connector; onConnected: () => void }) {
+  const [pane, setPane] = useState<"app" | "manual">("app");
+  const [step, setStep] = useState<GithubConnectStep>("idle");
+  const [error, setError] = useState<string | null>(null);
+  const initialInstallIds = useRef(new Set((c.installations ?? []).map((x) => x.installation_id)));
+  const startedAt = useRef(0);
+  const polling = useRef(false);
+
+  useEffect(() => {
+    if (step === "idle") return;
+    let cancelled = false;
+    const poll = async () => {
+      if (polling.current) return;
+      if (Date.now() - startedAt.current > 180_000) {
+        setError("Connection timed out. Check the browser tab, then try again.");
+        setStep("idle");
+        return;
+      }
+      polling.current = true;
+      try {
+        if (step === "signing-in") {
+          const cloud = await getCloudStatus();
+          if (!cloud.signed_in || cancelled) return;
+          const started = await startGithubAppInstall();
+          if (!started.ok) throw new Error(started.error || "could not open GitHub");
+          if (!cancelled) setStep("installing");
+          return;
+        }
+        const list = await getConnectors();
+        const github = list.find((x) => x.name === "github");
+        const installs = github?.installations ?? [];
+        if (installs.some((x) => !initialInstallIds.current.has(x.installation_id))) onConnected();
+      } catch (e) {
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : "GitHub connection failed");
+          setStep("idle");
+        }
+      } finally {
+        polling.current = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [step, onConnected]);
+
+  const start = async () => {
+    setError(null);
+    startedAt.current = Date.now();
+    try {
+      const cloud = await getCloudStatus();
+      if (cloud.signed_in) {
+        const started = await startGithubAppInstall();
+        if (!started.ok) throw new Error(started.error || "could not open GitHub");
+        setStep("installing");
+      } else {
+        const started = await startCloudLogin();
+        if (!started.ok) throw new Error(started.error || "could not start sign-in");
+        setStep("signing-in");
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "GitHub connection failed");
+      setStep("idle");
+    }
+  };
+
+  return (
+    <div className="px-5 pb-5 pt-4 space-y-4" data-testid="github-connect">
+      <div className="inline-flex p-0.5 bg-paper text-[12.5px] font-medium" role="tablist">
+        <button className={pane === "app" ? "px-3.5 py-1 bg-panel border border-line" : "px-3.5 py-1 text-muted"} onClick={() => setPane("app")} role="tab" aria-selected={pane === "app"}>GitHub App</button>
+        <button className={pane === "manual" ? "px-3.5 py-1 bg-panel border border-line" : "px-3.5 py-1 text-muted"} onClick={() => setPane("manual")} role="tab" aria-selected={pane === "manual"}>Manual PAT</button>
+      </div>
+      {pane === "app" ? (
+        <div className="space-y-3">
+          <p className="text-[13px] text-muted">
+            Install the app on one account or organization, then choose exactly which repositories it can access. Mentions and agent labels can reach this computer through the relay.
+          </p>
+          <button className={PILL_ACCENT + " w-full !py-2"} onClick={start} disabled={step !== "idle"} data-testid="github-app-connect">
+            {step === "signing-in" ? "Finish signing in in your browser..." : step === "installing" ? "Finish installing on GitHub..." : "Install GitHub App"}
+          </button>
+          {error && <div className="text-[12.5px] text-danger" role="alert">{error}</div>}
+          <p className="text-[12px] text-faint text-center"><span className={TAG_ACCENT}>Recommended</span> no personal token to copy or store</p>
+        </div>
+      ) : (
+        <div className="-mx-3.5 -mb-2"><ConnectSetup c={c} onConnected={onConnected} manualOnly /></div>
+      )}
     </div>
   );
 }

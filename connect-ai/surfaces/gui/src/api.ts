@@ -1736,6 +1736,31 @@ export async function disconnectGithubInstallation(installationId: string): Prom
   return res.json();
 }
 
+export interface CloudStatus {
+  signed_in: boolean;
+  account?: string | null;
+  error?: string;
+}
+
+export async function getCloudStatus(): Promise<CloudStatus> {
+  const res = await fetch(`${httpBase()}/v1/cloud/status`);
+  return res.json();
+}
+
+export async function startCloudLogin(): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/cloud/login`, { method: "POST" });
+  return res.json();
+}
+
+export async function startGithubAppInstall(): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/connectors/github/connect-managed`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ flow: "install" }),
+  });
+  return res.json();
+}
+
 /** Drop ONE HubSpot portal; the default pointer moves to the next portal. */
 export async function disconnectHubSpotPortal(hubId: string): Promise<{ ok: boolean; error?: string; remaining_portals?: number }> {
   const res = await fetch(

@@ -331,12 +331,16 @@ class SlackRelayAdapter(BasePlatformAdapter):
         # Resolve friendly names with THIS workspace's bot token (cached per team),
         # mirroring the Socket-Mode adapter — so cards read "@OpenWorker"/"Rohit"/"#ocw-test"
         # not raw U…/C… ids. Best-effort: ids fall through on failure.
-        if not mapped.source.user_name:
-            mapped.source.user_name = await self._display_name(
-                team_id, mapped.source.user_id
-            )
-        if not mapped.source.chat_name:
-            mapped.source.chat_name = await self._channel_name(team_id, channel)
+        user_name, chat_name = await asyncio.gather(
+            self._display_name(team_id, mapped.source.user_id)
+            if not mapped.source.user_name
+            else asyncio.sleep(0, result=mapped.source.user_name),
+            self._channel_name(team_id, channel)
+            if not mapped.source.chat_name
+            else asyncio.sleep(0, result=mapped.source.chat_name),
+        )
+        mapped.source.user_name = user_name
+        mapped.source.chat_name = chat_name
         mapped.text = await self._resolve_mentions(team_id, mapped.text)
         # Team-qualify the reply handle so multi-workspace replies pick the right
         # per-team token.
@@ -407,7 +411,10 @@ class SlackRelayAdapter(BasePlatformAdapter):
             return None
         base = os.environ.get("SLACK_API_URL", "https://slack.com/api/")
         try:
-            async with httpx.AsyncClient(timeout=15) as http:
+            # Display-name enrichment must never stall every provider sharing the
+            # relay socket. IDs are a valid fallback, so keep this best-effort call short.
+            timeout = httpx.Timeout(1.0, connect=0.5)
+            async with httpx.AsyncClient(timeout=timeout) as http:
                 resp = await http.get(
                     base + method,
                     params=params,

@@ -98,9 +98,9 @@ export function GithubDetail({ c, onChanged }: DetailProps) {
       {!c.connected && (
         <div className={GRP}>
           <div className={ROW + " text-[12.5px] text-muted"}>
-            One @ocw-agent App, installed per account or org — you pick the repos on
-            GitHub; each installation keeps its own allow-list. Connect with a personal
-            access token — fully local.
+            Install the GitHub App per account or organization and choose the repositories
+            it can access. Each installation keeps its own allow-list. A manual PAT remains
+            available for tools-only access.
           </div>
         </div>
       )}
