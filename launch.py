@@ -156,10 +156,23 @@ _INGEST_RESULTS: dict[str, dict] = {}
 _INGEST_PROGRESS: dict[str, dict] = {}
 _INGEST_PROGRESS_LOCK = threading.Lock()
 
-# Chrome extension control channel. The token is process-local and is disclosed only
-# to a chrome-extension:// origin by /browser/pair. This prevents an arbitrary website
-# from opening a loopback control socket while keeping installation zero-config.
-_BROWSER_WS = BrowserWebSocketBridge(secrets.token_urlsafe(32))
+# Chrome extension control channel. The token is persisted to outputs/.bridge_token
+# and is disclosed only to a chrome-extension:// origin by /browser/pair.
+def _get_persistent_bridge_token() -> str:
+    token_file = _outputs_root() / ".bridge_token"
+    try:
+        if token_file.exists():
+            t = token_file.read_text(encoding="utf-8").strip()
+            if len(t) >= 20:
+                return t
+        token = secrets.token_urlsafe(32)
+        token_file.parent.mkdir(parents=True, exist_ok=True)
+        token_file.write_text(token, encoding="utf-8")
+        return token
+    except Exception:
+        return secrets.token_urlsafe(32)
+
+_BROWSER_WS = BrowserWebSocketBridge(_get_persistent_bridge_token())
 
 # ── Dynamic Tool Registry ─────────────────────────────────────────────────────
 # Agent tự viết tool mới qua GET /tools/register?name=…&desc=…&code=…
@@ -1271,6 +1284,15 @@ class _HelperHandler(BaseHTTPRequestHandler):
             sent = _BROWSER_WS.send(msg)
             _BROWSER_WS.transport.resume_verification()
             self._json(200, {"ok": True, "resumed": True, "sent": sent, "jobId": job_id})
+            return
+
+        if self.path.split("?", 1)[0] == "/browser/reload":
+            sent = False
+            if _BROWSER_WS.connected:
+                sent = _BROWSER_WS.send({"v": 1, "type": "extension.reload", "id": f"reload-{int(time.time()*1000)}"})
+            else:
+                _ensure_chrome_with_extension()
+            self._json(200, {"ok": True, "reloaded": True, "sent": sent})
             return
 
         # ── Dynamic Tools ─────────────────────────────────────────────────────

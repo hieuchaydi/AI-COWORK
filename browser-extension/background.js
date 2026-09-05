@@ -185,6 +185,221 @@ async function inTabExtractShopeeRatings(itemid, shopid, offset, limit) {
   }
 }
 
+// Function injected into the Shopee tab page context to scrape reviews from DOM
+function inTabScrapeShopeePage() {
+  const cardElements = Array.from(document.querySelectorAll(
+    '.shopee-product-rating, [class*="shopee-product-rating__main"], .product-rating-overview ~ div .shopee-product-rating'
+  ));
+  
+  const rawReviews = [];
+  for (const item of cardElements) {
+    if (item.closest('.product-rating-overview')) continue;
+
+    // Tác giả
+    const authorEl = item.querySelector('.shopee-product-rating__author-name') 
+      || item.querySelector('[class*="author-name"]')
+      || item.querySelector('a[href*="/shop/"]')
+      || item.querySelector('a');
+    const author = authorEl ? authorEl.textContent.trim() : "Khách hàng";
+
+    // Số sao
+    let stars = item.querySelectorAll('svg.icon-rating-solid, .icon-rating-solid, svg[class*="icon-rating-solid"]').length;
+    if (!stars) {
+      stars = item.querySelectorAll('svg[style*="fill: rgb(238, 77, 45)"], svg[fill="#ee4d2d"], svg[style*="fill:#ee4d2d"]').length;
+    }
+    if (!stars) {
+      const ratingBox = item.querySelector('.shopee-product-rating__rating') || item.querySelector('[class*="rating__rating"]');
+      if (ratingBox) stars = ratingBox.querySelectorAll('svg').length;
+    }
+    if (!stars || stars > 5) stars = 5;
+
+    // Thời gian & phân loại
+    const timeEl = item.querySelector('.shopee-product-rating__time') 
+      || item.querySelector('[class*="rating__time"]')
+      || item.querySelector('div[style*="color: rgba(0, 0, 0, 0.54)"]');
+    const timeText = timeEl ? timeEl.textContent.trim() : "";
+    
+    let ctime = "";
+    let variation = "";
+    if (timeText) {
+      const parts = timeText.split("|");
+      ctime = parts[0].trim();
+      if (parts.length > 1) {
+        variation = parts.slice(1).join("|").replace(/Phân loại hàng:\s*/i, "").trim();
+      }
+    }
+
+    // Nội dung bình luận
+    const contentEl = item.querySelector('.shopee-product-rating__content') 
+      || item.querySelector('div[style*="word-break"]')
+      || item.querySelector('div[style*="pre-wrap"]');
+    const comment = contentEl ? contentEl.textContent.replace(/\s+/g, ' ').trim() : "";
+
+    // Ảnh đính kèm
+    const imgEls = Array.from(item.querySelectorAll('.shopee-rating-image-list img, img[src*="susercontent"], img[class*="rating-image"]'));
+    const imageUrls = [];
+    for (const img of imgEls) {
+      let src = img.getAttribute('src') || img.src || "";
+      if (src && !src.startsWith("data:") && (src.includes("susercontent") || src.includes("shopee"))) {
+        src = src.replace(/_tn$/, '').replace(/_tn\./, '.');
+        if (!imageUrls.includes(src)) imageUrls.push(src);
+      }
+    }
+
+    // Video đính kèm
+    const videoEls = Array.from(item.querySelectorAll('video source[src], video[src]'));
+    const videoUrls = [];
+    for (const vid of videoEls) {
+      const vsrc = vid.getAttribute('src') || vid.src || "";
+      if (vsrc && !videoUrls.includes(vsrc)) videoUrls.push(vsrc);
+    }
+
+    if (author || comment || imageUrls.length) {
+      rawReviews.push({
+        author,
+        stars,
+        comment,
+        ctime,
+        variation,
+        imageUrls,
+        videoUrls,
+      });
+    }
+  }
+
+  // Tìm nút Next page
+  const nextBtn = document.querySelector('button.shopee-icon-button--right')
+    || document.querySelector('.shopee-page-controller button:last-child')
+    || document.querySelector('button[aria-label="Next page"]')
+    || document.querySelector('button[aria-label="Trang tiếp"]');
+
+  let hasNext = false;
+  if (nextBtn) {
+    const isDisabled = nextBtn.disabled 
+      || nextBtn.getAttribute('disabled') !== null 
+      || nextBtn.classList.contains('shopee-button-solid--disabled')
+      || nextBtn.getAttribute('aria-disabled') === 'true';
+    if (!isDisabled) {
+      hasNext = true;
+      nextBtn.click();
+    }
+  }
+
+  return { reviews: rawReviews, hasNext };
+}
+
+async function inTabExtractShopeeDOM(tabId, maxReviews, progress) {
+  try {
+    await chrome.tabs.update(tabId, { active: true });
+  } catch {}
+
+  if (progress) {
+    await progress({
+      stage: "dom-scroll",
+      message: "Đang cuộn trang đến phần đánh giá sản phẩm...",
+      percent: 25,
+    });
+  }
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const el = document.querySelector('.product-ratings-comments-view')
+        || document.querySelector('.product-ratings')
+        || document.querySelector('.shopee-product-rating')
+        || document.querySelector('[class*="product-rating"]');
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      } else {
+        window.scrollTo({ top: document.body.scrollHeight * 0.45, behavior: 'smooth' });
+      }
+    },
+  });
+
+  await new Promise((r) => setTimeout(r, 2500));
+
+  const all = [];
+  const seenKeys = new Set();
+  let page = 1;
+  const maxPages = 40;
+
+  while (all.length < maxReviews && page <= maxPages) {
+    let res = null;
+    try {
+      const [scriptRes] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: inTabScrapeShopeePage,
+      });
+      res = scriptRes && scriptRes.result;
+    } catch (err) {
+      console.warn("[bridge] inTabScrapeShopeePage execution error:", err.message);
+      break;
+    }
+
+    if (!res || !res.reviews || res.reviews.length === 0) {
+      if (page === 1) {
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          func: () => window.scrollBy({ top: 350, behavior: 'smooth' }),
+        });
+        await new Promise((r) => setTimeout(r, 2000));
+        try {
+          const [retryRes] = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: inTabScrapeShopeePage,
+          });
+          res = retryRes && retryRes.result;
+        } catch {}
+      }
+      if (!res || !res.reviews || res.reviews.length === 0) {
+        break;
+      }
+    }
+
+    let addedCount = 0;
+    for (const r of res.reviews) {
+      const key = `${r.author}_${r.ctime}_${r.comment.slice(0, 30)}`;
+      if (seenKeys.has(key)) continue;
+      seenKeys.add(key);
+
+      all.push({
+        user: r.author || "Khách hàng",
+        sao: r.stars || 5,
+        noi_dung: (r.comment || "").replace(/\s+/g, " ").trim(),
+        thoi_gian: r.ctime || new Date().toISOString().slice(0, 19).replace("T", " "),
+        phan_loai: r.variation || "",
+        anh: r.imageUrls.length ? 1 : 0,
+        so_anh: r.imageUrls.length,
+        anh_urls: r.imageUrls.join("|"),
+        video: r.videoUrls.length ? 1 : 0,
+        so_video: r.videoUrls.length,
+        video_urls: r.videoUrls.join("|"),
+        media_urls: [...r.imageUrls, ...r.videoUrls].join("|"),
+        huu_ich: 0,
+      });
+      addedCount++;
+    }
+
+    if (progress) {
+      await progress({
+        stage: "dom-crawl",
+        message: `Đang cào trang ${page} (đã thu thập ${all.length} đánh giá)`,
+        rows: all.length,
+        percent: Math.min(85, 30 + page * 2),
+      });
+    }
+
+    if (!res.hasNext || addedCount === 0) {
+      break;
+    }
+
+    page++;
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+
+  return all;
+}
+
 async function extractShopeeReviews(job, progress) {
   const parsed = idsFrom(job.url);
   let itemid = parsed.itemid;
@@ -288,6 +503,25 @@ async function extractShopeeReviews(job, progress) {
     }
 
     if (!result.ok) {
+      // If API is blocked (e.g. is_login=false, error 90309999, 403), seamlessly fallback to in-tab DOM extraction
+      if (targetTab && targetTab.id) {
+        if (progress) {
+          await progress({
+            stage: "dom-crawl",
+            message: "Shopee API yêu cầu đăng nhập. Tự động chuyển sang cào trực tiếp từ DOM của tab...",
+            percent: 30,
+          });
+        }
+        try {
+          const domResults = await inTabExtractShopeeDOM(targetTab.id, MAX_REVIEWS, progress);
+          if (domResults && domResults.length > 0) {
+            return domResults;
+          }
+        } catch (domErr) {
+          console.warn("[bridge] In-tab DOM extraction failed:", domErr.message);
+        }
+      }
+
       if (result.verificationRequired) {
         // Bring tab to front so user can easily solve challenge or log in
         if (targetTab && targetTab.id) {
@@ -987,6 +1221,21 @@ async function dispatchEnvelope(envelope) {
     enqueueLegacyJob(envelope.job, "websocket");
     return;
   }
+
+  // Extension reload message
+  if (envelope.type === "extension.reload" || envelope.type === "system.reload") {
+    console.log("[bridge] Reload requested via WebSocket. Reloading extension...");
+    bridgeSend({
+      v: 1,
+      type: "accepted",
+      id: envelope.id || ("reload-" + Date.now()),
+      params: { reloading: true },
+    });
+    setTimeout(() => {
+      try { chrome.runtime.reload(); } catch (e) { console.error("Reload failed:", e); }
+    }, 150);
+    return;
+  }
 }
 
 // ── WebSocket Bridge Connection ─────────────────────────────────────────────
@@ -1067,10 +1316,10 @@ async function connectBridge(overrideUrl, overrideToken) {
       let token = overrideToken || stored.pairingToken;
       let wsUrl = overrideUrl || stored.gatewayUrl;
 
-      // Auto-pair if missing token
-      if (!token) {
+      // Auto-pair or refresh token if missing or after reconnection attempts
+      if (!token || reconnectAttempts > 0) {
         const pair = await fetchPairingToken();
-        if (pair) {
+        if (pair && pair.token) {
           token = pair.token;
           wsUrl = pair.wsUrl || wsUrl;
         }
@@ -1142,9 +1391,9 @@ async function connectBridge(overrideUrl, overrideToken) {
           bridgeSocket = null;
           updateState("disconnected");
         }
-        // ONLY clear pairingToken when explicitly rejected by server (code 4001, 4003)
-        if (ev.code === 4001 || ev.code === 4003) {
-          console.warn("[bridge] Authentication rejected by server, clearing pairing token");
+        // If connection was never opened or rejected with auth codes, clear pairing token
+        if (!opened || ev.code === 4001 || ev.code === 4003) {
+          console.warn("[bridge] Connection not opened or authentication rejected, clearing pairing token");
           chrome.storage.local.remove("pairingToken");
         }
         if (!opened && stored.fallbackWsUrl && wsUrl !== stored.fallbackWsUrl) {
