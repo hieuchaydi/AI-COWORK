@@ -350,6 +350,10 @@ class BrowserGatewayServer:
         sock.settimeout(60.0)
         supplied_token = urllib.parse.parse_qs(query).get("token", [""])[0]
         origin = headers.get("origin", "")
+        if not origin and headers.get("referer", "").startswith("chrome-extension://"):
+            parts = headers.get("referer", "").split("/", 3)
+            if len(parts) >= 3:
+                origin = f"chrome-extension://{parts[2]}"
 
         valid_origin, ext_id = validate_extension_origin(origin, self.allowlisted_extension_ids)
         if not valid_origin:
@@ -457,6 +461,10 @@ class BrowserGatewayServer:
             parsed = urllib.parse.urlsplit(target)
             supplied_token = urllib.parse.parse_qs(parsed.query).get("token", [""])[0]
             origin = headers.get("origin", "")
+            if not origin and headers.get("referer", "").startswith("chrome-extension://"):
+                parts = headers.get("referer", "").split("/", 3)
+                if len(parts) >= 3:
+                    origin = f"chrome-extension://{parts[2]}"
 
             # Path check
             if method != "GET" or parsed.path not in ("/browser/v1/ws", "/browser-extension"):

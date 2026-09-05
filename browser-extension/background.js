@@ -899,7 +899,30 @@ function scheduleBridgeReconnect() {
   }, delay);
 }
 
-async function connectBridge() {
+async function fetchPairingToken() {
+  try {
+    const extId = chrome.runtime.id || "";
+    const pairResponse = await fetch(`${HELPER}/browser/pair?ext_id=${encodeURIComponent(extId)}`, {
+      headers: { "X-Extension-Id": extId },
+      cache: "no-store",
+    });
+    if (!pairResponse.ok) throw new Error(`pair HTTP ${pairResponse.status}`);
+    const pair = await pairResponse.json();
+    if (pair && pair.ok && pair.token) {
+      await chrome.storage.local.set({
+        gatewayUrl: pair.wsUrl || `${HELPER.replace("http", "ws")}/browser/v1/ws`,
+        fallbackWsUrl: pair.fallbackWsUrl || "ws://127.0.0.1:8767/browser-extension",
+        pairingToken: pair.token,
+      });
+      return pair;
+    }
+  } catch (err) {
+    console.warn("[bridge] Auto-pairing request failed:", err.message);
+  }
+  return null;
+}
+
+async function connectBridge(overrideUrl, overrideToken) {
   if (bridgeSocket && (bridgeSocket.readyState === WebSocket.OPEN || bridgeSocket.readyState === WebSocket.CONNECTING)) {
     return;
   }
@@ -907,27 +930,28 @@ async function connectBridge() {
 
   bridgeConnecting = (async () => {
     try {
-      let stored = await chrome.storage.local.get(["gatewayUrl", "pairingToken"]);
-      let token = stored.pairingToken;
-      let wsUrl = stored.gatewayUrl;
+      let stored = await chrome.storage.local.get(["gatewayUrl", "fallbackWsUrl", "pairingToken"]);
+      let token = overrideToken || stored.pairingToken;
+      let wsUrl = overrideUrl || stored.gatewayUrl;
 
       // Auto-pair if missing token
       if (!token) {
-        const pairResponse = await fetch(`${HELPER}/browser/pair`, { cache: "no-store" });
-        if (!pairResponse.ok) throw new Error(`pair HTTP ${pairResponse.status}`);
-        const pair = await pairResponse.json();
-        token = pair.token;
-        wsUrl = pair.wsUrl || `${HELPER.replace("http", "ws")}/browser/v1/ws`;
-        await chrome.storage.local.set({ gatewayUrl: wsUrl, pairingToken: token });
+        const pair = await fetchPairingToken();
+        if (pair) {
+          token = pair.token;
+          wsUrl = pair.wsUrl || wsUrl;
+        }
       }
 
       if (!wsUrl) wsUrl = "ws://127.0.0.1:8766/browser/v1/ws";
-      const fullUrl = `${wsUrl}${wsUrl.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`;
+      const fullUrl = `${wsUrl}${wsUrl.includes("?") ? "&" : "?"}token=${encodeURIComponent(token || "")}`;
 
       const socket = new WebSocket(fullUrl);
       bridgeSocket = socket;
+      let opened = false;
 
       socket.onopen = () => {
+        opened = true;
         console.log("[bridge] WebSocket connected to", wsUrl);
         reconnectAttempts = 0;
         updateState("connected");
@@ -959,6 +983,13 @@ async function connectBridge() {
         } catch {
           return;
         }
+        if (envelope && envelope.type === "error" && envelope.error && envelope.error.code === "AUTHENTICATION_FAILED") {
+          console.warn("[bridge] Authentication failed, clearing stale token");
+          chrome.storage.local.remove("pairingToken");
+          closeBridgeSocket();
+          scheduleBridgeReconnect();
+          return;
+        }
         dispatchEnvelope(envelope);
       };
 
@@ -966,9 +997,16 @@ async function connectBridge() {
         console.warn("[bridge] WebSocket error:", err);
       };
 
-      socket.onclose = () => {
-        console.log("[bridge] WebSocket disconnected");
+      socket.onclose = (ev) => {
+        console.log("[bridge] WebSocket disconnected", ev.code, ev.reason);
         if (bridgeSocket === socket) closeBridgeSocket();
+        if (!opened) {
+          console.warn("[bridge] Handshake failed or rejected by server, clearing pairing token for refresh");
+          chrome.storage.local.remove("pairingToken");
+          if (stored.fallbackWsUrl && wsUrl !== stored.fallbackWsUrl) {
+            chrome.storage.local.set({ gatewayUrl: stored.fallbackWsUrl });
+          }
+        }
         fallbackHttpLoop();
         scheduleBridgeReconnect();
       };
@@ -1033,8 +1071,19 @@ chrome.alarms.onAlarm.addListener(connectBridge);
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === "connect") {
     closeBridgeSocket();
-    connectBridge();
+    connectBridge(msg.url, msg.token);
     sendResponse({ ok: true });
+  } else if (msg.action === "autoPair") {
+    closeBridgeSocket();
+    fetchPairingToken().then((pair) => {
+      if (pair) {
+        connectBridge(pair.wsUrl, pair.token);
+        sendResponse({ ok: true, token: pair.token, wsUrl: pair.wsUrl });
+      } else {
+        sendResponse({ ok: false, error: "Auto-pair failed" });
+      }
+    });
+    return true;
   } else if (msg.action === "disconnect") {
     closeBridgeSocket();
     sendResponse({ ok: true });

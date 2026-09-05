@@ -1032,11 +1032,58 @@ class _HelperHandler(BaseHTTPRequestHandler):
     def _cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Extension-Id, Authorization, X-Bridge-Token")
         # Private Network Access: a page on a public origin (shopee.vn) POSTing to
         # http://127.0.0.1 gets a preflight that Chrome fails WITHOUT this header —
         # the /ingest bookmarklet dies silently otherwise.
         self.send_header("Access-Control-Allow-Private-Network", "true")
+
+    def _handle_browser_pair(self) -> None:
+        qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+        ext_query = qs.get("ext_id", [""])[0].strip()
+        origin = self.headers.get("Origin", "")
+        referer = self.headers.get("Referer", "")
+        ext_header = self.headers.get("X-Extension-Id", "").strip()
+
+        # Reject requests explicitly originating from normal web pages (e.g. evil.com)
+        if origin and not origin.startswith("chrome-extension://"):
+            self._json(403, {"ok": False, "error": "Unauthorized web origin"})
+            return
+
+        ext_origin = origin
+        if not ext_origin and referer.startswith("chrome-extension://"):
+            parts = referer.split("/", 3)
+            if len(parts) >= 3:
+                ext_origin = f"chrome-extension://{parts[2]}"
+        if not ext_origin and (ext_header or ext_query):
+            cand_id = ext_header or ext_query
+            ext_origin = f"chrome-extension://{cand_id}"
+
+        valid, ext_id = validate_extension_origin(ext_origin, _BROWSER_WS.allowlisted_extension_ids)
+        if not valid:
+            self._json(403, {"ok": False, "error": "Unauthorized extension origin"})
+            return
+
+        cors_origin = origin if origin else (f"chrome-extension://{ext_id}" if ext_id else "*")
+        body = json.dumps(
+            {
+                "ok": True,
+                "protocolVersion": "1.0",
+                "token": _BROWSER_WS.token,
+                "wsUrl": f"ws://127.0.0.1:{HELPER_PORT}/browser/v1/ws",
+                "fallbackWsUrl": f"ws://127.0.0.1:{HELPER_WS_PORT}/browser-extension",
+                "capabilities": ["actions", "verification", "same_origin_fetch"],
+            }
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", cors_origin)
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Extension-Id, Authorization, X-Bridge-Token")
+        self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(204)
@@ -1177,28 +1224,7 @@ class _HelperHandler(BaseHTTPRequestHandler):
         # WebSocket. Never expose the token to a normal web origin: otherwise any
         # visited page could turn localhost into a confused-deputy browser controller.
         if self.path.split("?", 1)[0] == "/browser/pair":
-            origin = self.headers.get("Origin", "")
-            valid, ext_id = validate_extension_origin(origin, _BROWSER_WS.allowlisted_extension_ids)
-            if not valid:
-                self._json(403, {"ok": False, "error": "Unauthorized extension origin"})
-                return
-            body = json.dumps(
-                {
-                    "ok": True,
-                    "protocolVersion": "1.0",
-                    "token": _BROWSER_WS.token,
-                    "wsUrl": f"ws://127.0.0.1:{HELPER_PORT}/browser/v1/ws",
-                    "fallbackWsUrl": f"ws://127.0.0.1:{HELPER_WS_PORT}/browser-extension",
-                    "capabilities": ["actions", "verification", "same_origin_fetch"],
-                }
-            ).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Access-Control-Allow-Origin", origin)
-            self.end_headers()
-            self.wfile.write(body)
+            self._handle_browser_pair()
             return
 
         if self.path.split("?", 1)[0] == "/browser/status":
@@ -1735,6 +1761,10 @@ class _HelperHandler(BaseHTTPRequestHandler):
             self._cors()
             self.end_headers()
             self.wfile.write(data)
+
+        if path_only == "/browser/pair":
+            self._handle_browser_pair()
+            return
 
         # ─── /ingest — data pushed in from a normal browser tab ──────────────
         # The CDP-free path: sites that fingerprint automation (Shopee) still serve

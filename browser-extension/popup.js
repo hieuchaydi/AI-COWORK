@@ -75,28 +75,50 @@ async function loadTabs() {
 }
 
 btnAutoPair.addEventListener("click", async () => {
-  try {
-    const r = await fetch("http://127.0.0.1:8766/browser/pair", { cache: "no-store" });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const data = await r.json();
-    if (data.token) {
-      pairingTokenInput.value = data.token;
-      gatewayUrlInput.value = data.wsUrl || "ws://127.0.0.1:8766/browser/v1/ws";
-      chrome.storage.local.set({
-        gatewayUrl: gatewayUrlInput.value,
-        pairingToken: data.token,
-      });
-      chrome.runtime.sendMessage({ action: "connect", url: gatewayUrlInput.value, token: data.token });
+  btnAutoPair.disabled = true;
+  const originalText = btnAutoPair.textContent;
+  btnAutoPair.textContent = "Pairing...";
+
+  chrome.runtime.sendMessage({ action: "autoPair" }, async (response) => {
+    btnAutoPair.disabled = false;
+    btnAutoPair.textContent = originalText;
+    if (response && response.ok && response.token) {
+      pairingTokenInput.value = response.token;
+      gatewayUrlInput.value = response.wsUrl || gatewayUrlInput.value;
+    } else {
+      // Fallback: direct fetch from popup context
+      try {
+        const extId = chrome.runtime.id || "";
+        const r = await fetch(`http://127.0.0.1:8766/browser/pair?ext_id=${encodeURIComponent(extId)}`, {
+          headers: { "X-Extension-Id": extId },
+          cache: "no-store",
+        });
+        if (!r.ok) {
+          const errText = await r.text();
+          throw new Error(`HTTP ${r.status}: ${errText}`);
+        }
+        const data = await r.json();
+        if (data.token) {
+          pairingTokenInput.value = data.token;
+          gatewayUrlInput.value = data.wsUrl || "ws://127.0.0.1:8766/browser/v1/ws";
+          await chrome.storage.local.set({
+            gatewayUrl: gatewayUrlInput.value,
+            fallbackWsUrl: data.fallbackWsUrl || "ws://127.0.0.1:8767/browser-extension",
+            pairingToken: data.token,
+          });
+          chrome.runtime.sendMessage({ action: "connect", url: gatewayUrlInput.value, token: data.token });
+        }
+      } catch (e) {
+        alert("Auto-pair failed: " + e.message);
+      }
     }
-  } catch (e) {
-    alert("Auto-pair failed: " + e.message);
-  }
+  });
 });
 
-btnConnect.addEventListener("click", () => {
+btnConnect.addEventListener("click", async () => {
   const url = gatewayUrlInput.value.trim();
   const token = pairingTokenInput.value.trim();
-  chrome.storage.local.set({ gatewayUrl: url, pairingToken: token });
+  await chrome.storage.local.set({ gatewayUrl: url, pairingToken: token });
   chrome.runtime.sendMessage({ action: "connect", url, token });
 });
 
