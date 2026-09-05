@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PLUGIN = ROOT / ".agents" / "plugins" / "media-scrape-autopilot"
+AUTO_EXECUTE_PLUGIN = ROOT / ".agents" / "plugins" / "auto-execute"
 
 
 def test_antigravity_media_plugin_manifest_and_hook_are_valid():
@@ -86,3 +87,22 @@ def test_antigravity_customizations_check_script_exists_and_covers_checks():
         )
         assert proc.returncode == 0, f"Script failed with output:\n{proc.stdout}\n{proc.stderr}"
         assert "Result: PASS" in proc.stdout
+
+
+def test_auto_execute_plugin_requires_strict_review_after_plan():
+    manifest = json.loads((AUTO_EXECUTE_PLUGIN / "plugin.json").read_text(encoding="utf-8"))
+    rules = (AUTO_EXECUTE_PLUGIN / "rules" / "AGENTS.md").read_text(encoding="utf-8")
+    review_skill = (AUTO_EXECUTE_PLUGIN / "skills" / "review" / "SKILL.md").read_text(encoding="utf-8")
+    readme = (AUTO_EXECUTE_PLUGIN / "README.md").read_text(encoding="utf-8")
+    combined = f"{rules}\n{review_skill}\n{readme}"
+
+    assert manifest["name"] == "auto-execute"
+    assert manifest["$schema"] == "https://antigravity.google/schemas/v1/plugin.json"
+    assert "name: review" in review_skill
+    assert "automatically after implementing a /plan" in review_skill
+    assert "adversarial mindset" in combined
+    assert "P0, P1, and P2" in combined
+    assert "maximum of three full review passes" in review_skill
+    assert "before `git commit`" in rules
+    assert "green tests as evidence, never as proof" in review_skill
+    assert "explicit standalone `/review` is read-only" in review_skill

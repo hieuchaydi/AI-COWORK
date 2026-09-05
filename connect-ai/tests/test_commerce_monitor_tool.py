@@ -66,6 +66,12 @@ def test_commerce_monitor_tools_are_exposed():
         "commerce_monitor_list",
         "commerce_monitor_history",
         "commerce_monitor_check_all",
+        "configure_profit_guard",
+        "get_pricing_recommendation",
+        "list_pending_price_approvals",
+        "approve_price_change",
+        "reject_price_change",
+        "get_pricing_audit_history",
     }
 
 
@@ -74,6 +80,8 @@ def test_commerce_monitor_tools_are_registered_in_engine():
 
     assert "commerce_monitor_track" in engine.registry.names()
     assert "commerce_monitor_check_all" in engine.registry.names()
+    assert "configure_profit_guard" in engine.registry.names()
+    assert "approve_price_change" in engine.registry.names()
 
 
 def test_commerce_monitor_tool_integration(tmp_path: Path):

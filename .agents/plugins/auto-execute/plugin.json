@@ -1,3 +1,5 @@
 {
-  "name": "auto-execute"
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "auto-execute",
+  "description": "Executes implementation plans end-to-end and performs a strict evidence-based /review before committing."
 }

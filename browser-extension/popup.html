@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <title>Browser Bridge</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="header">
+    <div class="title">AI Cowork Bridge</div>
+    <div id="statusBadge" class="badge disconnected">Disconnected</div>
+  </div>
+
+  <div class="section">
+    <label for="gatewayUrl">Gateway URL</label>
+    <div class="input-row">
+      <input type="text" id="gatewayUrl" placeholder="ws://127.0.0.1:8766/browser/v1/ws">
+      <button id="btnAutoPair" class="btn-secondary">Auto Pair</button>
+    </div>
+
+    <label for="pairingToken">Pairing Token</label>
+    <input type="password" id="pairingToken" placeholder="Paste or Auto-pair token">
+    <div class="btn-group">
+      <button id="btnConnect" class="btn-primary">Connect</button>
+      <button id="btnDisconnect" class="btn-danger">Disconnect</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Active Job & Verification</div>
+    <div id="jobStatusText" class="status-info">No job currently running</div>
+    <div id="verificationBox" class="alert-box" style="display: none;">
+      <div class="alert-title">⚠️ Yêu cầu xác minh người dùng</div>
+      <div id="verificationMsg" class="alert-desc">Vui lòng hoàn thành xác minh/captcha trên tab và nhấn Tiếp tục.</div>
+      <button id="btnResumeVerification" class="btn-success">Tiếp tục (Resume)</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Allowed / Active Tabs</div>
+    <ul id="tabList" class="tab-list">
+      <li class="tab-item text-muted">Loading tabs...</li>
+    </ul>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
+

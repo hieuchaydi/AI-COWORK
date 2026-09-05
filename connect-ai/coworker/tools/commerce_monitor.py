@@ -1,15 +1,18 @@
 """
-Commerce Monitoring Tools for Coworker Agent.
-Allows agents to track product prices, check stock/rating changes, and query price histories
-using compliant, sustainable methods.
+Commerce Monitoring & Profit Guard Tools for Coworker Agent.
+Allows agents to:
+1. Track product prices, stock/rating changes, and query histories.
+2. Configure Profit Guard cost profiles, generate competitive margin-protected price recommendations,
+   manage human-in-the-loop approvals, and update prices via official Seller APIs.
 """
 
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from .base import coworker_tool
 
@@ -21,6 +24,13 @@ if root_dir not in sys.path:
 
 from crawler.commerce.connectors.registry import get_connector_for_url
 from crawler.commerce.interfaces import AccessDeniedException
+from crawler.commerce.profit_guard.calculator import ProfitGuardCalculator
+from crawler.commerce.profit_guard.engine import ProfitGuardEngine
+from crawler.commerce.profit_guard.models import CostProfile
+from crawler.commerce.profit_guard.seller_updater import (
+    MockOfficialSellerApiProvider,
+    SellerUpdateRegistry,
+)
 from crawler.commerce.scheduler.runner import CommerceMonitorScheduler
 from crawler.commerce.storage.sqlite_store import CommerceSqliteStore
 
@@ -36,6 +46,17 @@ def _get_scheduler() -> CommerceMonitorScheduler:
         store=_get_store(),
         connector_resolver=get_connector_for_url,
     )
+
+
+def _get_profit_guard_engine() -> ProfitGuardEngine:
+    store = _get_store()
+    registry = SellerUpdateRegistry()
+    # Register mock official seller API provider for hermetic execution / testing
+    registry.register(MockOfficialSellerApiProvider("mock_seller_api"))
+    return ProfitGuardEngine(store=store, registry=registry)
+
+
+# ── Commerce Monitoring Tools ───────────────────────────────────────────
 
 
 @coworker_tool(category="crawl")
@@ -156,8 +177,212 @@ def commerce_monitor_check_all() -> Dict[str, Any]:
         return {"ok": False, "error": str(exc)}
 
 
+# ── Profit Guard Pricing & Approval Tools ───────────────────────────────
+
+
+@coworker_tool(category="crawl")
+def configure_profit_guard(
+    sku_id: str,
+    platform: str,
+    product_id: str,
+    cost_price: Union[float, int, str],
+    platform_fee_pct: Union[float, int, str] = 0.08,
+    platform_fee_fixed: Union[float, int, str] = 0.0,
+    tax_pct: Union[float, int, str] = 0.015,
+    additional_cost: Union[float, int, str] = 0.0,
+    min_margin_pct: Union[float, int, str] = 0.15,
+    max_price_change_pct: Union[float, int, str] = 0.10,
+    cooldown_seconds: int = 3600,
+    authorization_ref: Optional[str] = None,
+    seller_provider: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Configures Profit Guard cost profile and pricing boundaries for a SKU.
+
+    Args:
+        sku_id: Unique identifier for the SKU.
+        platform: E-commerce platform (e.g. 'tiki', 'shopee').
+        product_id: Platform item/product ID.
+        cost_price: Base Cost of Goods Sold (COGS).
+        platform_fee_pct: Platform commission/take-rate (default: 0.08 = 8%).
+        platform_fee_fixed: Fixed fee per transaction in VND (default: 0).
+        tax_pct: Taxes on selling price (default: 0.015 = 1.5%).
+        additional_cost: Additional packaging, handling or shipping cost (default: 0).
+        min_margin_pct: Minimum net profit margin on selling price (default: 0.15 = 15%).
+        max_price_change_pct: Maximum allowed single adjustment percentage (default: 0.10 = 10%).
+        cooldown_seconds: Minimum seconds between recommendations (default: 3600).
+        authorization_ref: Official Seller API token or credential reference.
+        seller_provider: Registered official Seller API provider name.
+
+    Returns:
+        Confirmation dictionary with calculated breakeven and floor protection prices.
+    """
+    try:
+        profile = CostProfile(
+            sku_id=sku_id,
+            platform=platform,
+            product_id=product_id,
+            cost_price=cost_price,
+            platform_fee_pct=platform_fee_pct,
+            platform_fee_fixed=platform_fee_fixed,
+            tax_pct=tax_pct,
+            additional_cost=additional_cost,
+            min_margin_pct=min_margin_pct,
+            max_price_change_pct=max_price_change_pct,
+            cooldown_seconds=cooldown_seconds,
+            authorization_ref=authorization_ref,
+            seller_provider=seller_provider,
+        )
+        engine = _get_profit_guard_engine()
+        res = engine.configure_sku(profile)
+        if res.get("ok"):
+            breakeven = ProfitGuardCalculator.calculate_breakeven_price(profile)
+            floor = ProfitGuardCalculator.calculate_floor_price(profile)
+            res["breakeven_price"] = str(breakeven)
+            res["floor_protection_price"] = str(floor)
+            res["min_margin_pct"] = f"{float(profile.min_margin_pct) * 100:.1f}%"
+        return res
+    except Exception as exc:
+        return {"ok": False, "error": "VALIDATION_ERROR", "message": str(exc)}
+
+
+@coworker_tool(category="crawl")
+def get_pricing_recommendation(
+    sku_id: str,
+    current_price: Optional[Union[float, int, str]] = None,
+    market_price: Optional[Union[float, int, str]] = None,
+) -> Dict[str, Any]:
+    """Evaluates competitive market price and generates a margin-protected price recommendation.
+
+    Args:
+        sku_id: Unique SKU identifier.
+        current_price: Current selling price. If omitted, attempts lookup from latest snapshot.
+        market_price: Competitor or target market price.
+
+    Returns:
+        Recommended price, cash profit, profit margin %, and reason.
+    """
+    engine = _get_profit_guard_engine()
+    profile = engine.store.get_cost_profile(sku_id)
+    if not profile:
+        return {"ok": False, "error": "PROFILE_NOT_FOUND", "message": f"SKU '{sku_id}' is not configured."}
+
+    # If current_price not passed, resolve from latest product snapshot
+    if current_price is None:
+        snap = engine.store.get_latest_snapshot(profile.product_id, profile.platform)
+        if snap:
+            current_price = snap.current_price
+        else:
+            return {
+                "ok": False,
+                "error": "PRICE_MISSING",
+                "message": f"No current price provided and no snapshot found for SKU '{sku_id}'.",
+            }
+
+    curr_dec = Decimal(str(current_price))
+    mkt_dec = Decimal(str(market_price)) if market_price is not None else None
+
+    return engine.generate_recommendation(
+        sku_id=sku_id,
+        current_price=curr_dec,
+        market_price=mkt_dec,
+        actor="coworker_tool",
+    )
+
+
+@coworker_tool(category="crawl")
+def list_pending_price_approvals(platform: Optional[str] = None) -> Dict[str, Any]:
+    """Lists all pending pricing recommendations waiting for human-in-the-loop approval.
+
+    Args:
+        platform: Optional platform filter (e.g. 'tiki', 'shopee').
+
+    Returns:
+        List of pending approval records with expiration status and margin details.
+    """
+    engine = _get_profit_guard_engine()
+    pending = engine.list_pending_approvals(platform=platform)
+    return {
+        "ok": True,
+        "count": len(pending),
+        "pending_approvals": pending,
+    }
+
+
+@coworker_tool(category="crawl")
+def approve_price_change(
+    recommendation_id: int,
+    approver: str = "seller_admin",
+    apply_immediately: bool = True,
+) -> Dict[str, Any]:
+    """Approves a price change recommendation and optionally applies it via official Seller API.
+
+    Args:
+        recommendation_id: The ID of the pending recommendation.
+        approver: Name or identifier of the approving user/admin.
+        apply_immediately: If True, calls official Seller API immediately upon approval.
+
+    Returns:
+        Approval status, transaction details, and execution result.
+    """
+    engine = _get_profit_guard_engine()
+    return asyncio.run(
+        engine.approve_price_change(
+            recommendation_id=recommendation_id,
+            approver=approver,
+            apply_immediately=apply_immediately,
+        )
+    )
+
+
+@coworker_tool(category="crawl")
+def reject_price_change(
+    recommendation_id: int,
+    approver: str = "seller_admin",
+    reason: str = "",
+) -> Dict[str, Any]:
+    """Rejects a pending price change recommendation with an optional reason.
+
+    Args:
+        recommendation_id: The ID of the pending recommendation.
+        approver: Name or identifier of the rejecting user/admin.
+        reason: Optional justification for rejection.
+
+    Returns:
+        Rejection status confirmation.
+    """
+    engine = _get_profit_guard_engine()
+    return engine.reject_price_change(
+        recommendation_id=recommendation_id,
+        approver=approver,
+        reason=reason,
+    )
+
+
+@coworker_tool(category="crawl")
+def get_pricing_audit_history(
+    sku_id: Optional[str] = None,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """Retrieves immutable audit log history for pricing recommendations and approvals.
+
+    Args:
+        sku_id: Optional SKU filter.
+        limit: Maximum number of audit records to return (default: 50).
+
+    Returns:
+        Chronological list of audit trail entries.
+    """
+    engine = _get_profit_guard_engine()
+    logs = engine.get_audit_history(sku_id=sku_id, limit=limit)
+    return {
+        "ok": True,
+        "count": len(logs),
+        "audit_logs": logs,
+    }
+
+
 def make_commerce_monitor_tools() -> list[Any]:
-    """Return the commerce tools registered by the Coworker runtime."""
+    """Return all commerce tools registered by the Coworker runtime."""
 
     return [
         commerce_monitor_track,
@@ -165,4 +390,10 @@ def make_commerce_monitor_tools() -> list[Any]:
         commerce_monitor_list,
         commerce_monitor_history,
         commerce_monitor_check_all,
+        configure_profit_guard,
+        get_pricing_recommendation,
+        list_pending_price_approvals,
+        approve_price_change,
+        reject_price_change,
+        get_pricing_audit_history,
     ]

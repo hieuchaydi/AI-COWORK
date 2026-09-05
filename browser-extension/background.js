@@ -1,19 +1,60 @@
-// AI cowork ingest worker.
+// AI Cowork — Manifest V3 Chrome Extension Browser Bridge (v2.0.0)
 //
-// Why an extension and not the agent's Playwright browser: Shopee flags a CDP-driven
-// browser on the very first request — measured 2026-08-08, both bundled Chromium and
-// real Chrome land on /verify/traffic/error even before login, and even when the visit
-// starts at the homepage. Requests issued from here carry this profile's ordinary
-// cookies and no automation surface, so the site sees a normal session.
+// Realtime WebSocket control bridge & ingest worker.
+// Operates in the user's real Chrome profile with ordinary session cookies.
 //
-// Flow: agent → GET helper /ingest/job?url=… → this worker long-polls /ingest/jobs →
-// fetches the site's own API → POSTs rows back to /ingest → helper writes CSV + JSON.
+// Features:
+// 1. Enveloped Protocol v1 (command, accepted, progress, result, error, cancel, ping/pong, verification.required).
+// 2. Precompiled Typed Action Registry (18 actions, strictly NO eval / NO new Function).
+// 3. Same-origin fetch enforcement in tab context.
+// 4. Verification & Captcha detection with graceful workflow pause/resume.
+// 5. Exponential backoff reconnect with random jitter and 20s keepalive heartbeats.
+// 6. Backward-compatible Shopee reviews extraction and HTTP long-poll fallback.
 
 const HELPER = "http://127.0.0.1:8766";
 const PAGE_SIZE = 50;
-const MAX_REVIEWS = 20000; // emergency cap; normal completion is batch < PAGE_SIZE.
-const PACE_MS = 700; // between pages — a burst is what gets a session flagged
+const MAX_REVIEWS = 20000;
+const PACE_MS = 700;
 
+// ── State Variables ──────────────────────────────────────────────────────────
+let bridgeSocket = null;
+let bridgeConnecting = null;
+let bridgeHeartbeat = null;
+let bridgeReconnectTimeout = null;
+let reconnectAttempts = 0;
+let jobChain = Promise.resolve();
+let extensionState = "disconnected";
+let activeJobs = new Map();
+let inFlightCommands = new Map();
+let verificationInfo = null;
+
+function setBadge(text, color = "#1a73e8") {
+  chrome.action.setBadgeText({ text: String(text || "") });
+  if (color) chrome.action.setBadgeBackgroundColor({ color });
+}
+
+function updateState(newState, details = null) {
+  extensionState = newState;
+  if (newState === "awaiting_user_verification") {
+    verificationInfo = details;
+    setBadge("PAUS", "#f9ab00");
+  } else if (newState === "connected") {
+    verificationInfo = null;
+    setBadge("OK", "#137333");
+  } else if (newState === "busy") {
+    setBadge("BUSY", "#1a73e8");
+  } else {
+    verificationInfo = null;
+    setBadge("");
+  }
+  chrome.storage.local.set({
+    extensionState,
+    verificationInfo,
+    currentJob: activeJobs.size > 0 ? Array.from(activeJobs.values())[0] : null,
+  });
+}
+
+// ── Ingest & Progress Helpers ────────────────────────────────────────────────
 async function reportProgress(job, progress) {
   if (!job || !job.id) return;
   try {
@@ -23,14 +64,10 @@ async function reportProgress(job, progress) {
       body: JSON.stringify({ job: job.id, progress }),
     });
   } catch (e) {
-    console.warn("[ingest] progress report failed:", e.message);
+    console.warn("[bridge] progress report failed:", e.message);
   }
 }
 
-// ── FIX A: keepalive ──────────────────────────────────────────────────────────
-// MV3 service workers are killed when idle (no pending fetch). We keep the worker
-// alive during a long job by pinging /ping every 20 s. The interval is cleared in
-// the finally block, so a crash still lets Chrome eventually GC the worker.
 function startKeepalive() {
   return setInterval(() => {
     fetch(`${HELPER}/ping`).catch(() => {});
@@ -46,7 +83,7 @@ function mediaUrl(value, kind = "image") {
   if (!value) return "";
   if (value.startsWith("//")) return "https:" + value;
   if (/^https?:\/\//i.test(value)) return value;
-  const base = kind === "video" ? "https://down-vn.img.susercontent.com/file/" : "https://down-vn.img.susercontent.com/file/";
+  const base = "https://down-vn.img.susercontent.com/file/";
   return base + value;
 }
 
@@ -57,9 +94,7 @@ function asList(value) {
 
 function normaliseRating(x) {
   const imageUrls = asList(x.images).map((v) => mediaUrl(v, "image")).filter(Boolean);
-  const videoUrls = asList(x.videos || x.video)
-    .map((v) => mediaUrl(v, "video"))
-    .filter(Boolean);
+  const videoUrls = asList(x.videos || x.video).map((v) => mediaUrl(v, "video")).filter(Boolean);
   const mediaUrls = [...imageUrls, ...videoUrls];
   return {
     user: x.author_username || "",
@@ -93,605 +128,922 @@ function crawlPercent(rows, total, base, span) {
 
 function idsFrom(url) {
   const u = new URL(url);
-  // Explicit ids in the query string — the agent sometimes queues API-style urls like
-  // /api/v2/item/get_ratings?itemid=…&shopid=… instead of the plain product page.
   const q = u.searchParams;
   const qItem = q.get("itemid") || q.get("item_id");
   if (qItem) return { shopid: q.get("shopid") || q.get("shop_id") || null, itemid: qItem };
   let m = u.pathname.match(/^\/product\/(\d+)\/(\d+)/) || u.href.match(/i\.(\d+)\.(\d+)/);
   if (m) return { shopid: m[1], itemid: m[2] };
-  // /<shopname>/<itemid>: the shop id is not in the URL, so ask Shopee for it.
   const tail = u.pathname.match(/\/(\d{6,})\/?$/);
   if (tail) return { shopid: null, itemid: tail[1] };
-  // Fallback: grab any 8+ digit number from the URL (itemid is always long)
   const any = u.href.match(/[.\-/](\d{8,})(?:[?&#/]|$)/);
   return any ? { shopid: null, itemid: any[1] } : {};
 }
 
 async function resolveShopId(itemid, originalUrl, progress) {
-  console.log("[ingest] resolveShopId: item", itemid, "url", originalUrl);
   if (progress) await progress({ stage: "resolve-shop", message: "Đang tìm shopid", itemid, percent: 10 });
-
-  // ── helper: pull shopid out of any string blob ──────────────────────
   function scrape(text) {
-    const m =
-      text.match(/"shopid"\s*:\s*"?(\d+)/) ||
-      text.match(/"shop_id"\s*:\s*"?(\d+)/) ||
-      text.match(/shopid=(\d+)/);
+    const m = text.match(/"shopid"\s*:\s*"?(\d+)/) || text.match(/"shop_id"\s*:\s*"?(\d+)/);
     return m ? m[1] : null;
   }
-
-  // ── Method 1: PDP API (fastest, try twice with a pause) ─────────────
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const r = await fetch(
-        `https://shopee.vn/api/v4/pdp/get_pc?item_id=${itemid}&detail_level=0`,
-        { credentials: "include", headers: { "x-requested-with": "XMLHttpRequest" } }
-      );
-      const j = await r.json().catch(() => null);
-      console.log("[ingest] pdp attempt", attempt, "→",
-        j ? JSON.stringify(j).slice(0, 500) : "(parse failed)");
-      if (j && j.data) {
-        const d = j.data.item || j.data;
-        const sid = d && (d.shop_id || d.shopid);
-        if (sid) {
-          if (progress) await progress({ stage: "resolve-shop", message: "Đã tìm shopid qua PDP API", shopid: String(sid), percent: 18 });
-          return String(sid);
-        }
-      }
-      if (j && j.error) console.warn("[ingest] pdp error:", j.error);
-    } catch (e) {
-      console.warn("[ingest] pdp fetch error:", e.message);
-    }
-    if (attempt === 0) await new Promise((s) => setTimeout(s, 1200));
-  }
-
-  // ── Method 2: fetch product page(s) HTML, scrape embedded JSON ──────
-  const pagesToTry = [
-    originalUrl,                              // the real URL the user gave
-    `https://shopee.vn/-i.0.${itemid}`,       // manufactured canonical-style URL
-  ].filter(Boolean);
-  for (const pageUrl of pagesToTry) {
-    try {
-      console.log("[ingest] HTML scrape:", pageUrl);
-      const r = await fetch(pageUrl, {
-        credentials: "include",
-        redirect: "follow",
-      });
-      // Check if Shopee redirected to a canonical URL containing shopid
-      const rm = r.url.match(/i\.(\d+)\.(\d+)/);
-      if (rm && rm[2] === itemid) {
-        console.log("[ingest] shopid from redirect:", rm[1]);
-        if (progress) await progress({ stage: "resolve-shop", message: "Đã tìm shopid qua redirect", shopid: rm[1], percent: 18 });
-        return rm[1];
-      }
-      const html = await r.text();
-      const sid = scrape(html);
-      if (sid) {
-        console.log("[ingest] shopid from HTML:", sid);
-        if (progress) await progress({ stage: "resolve-shop", message: "Đã tìm shopid trong HTML", shopid: sid, percent: 18 });
-        return sid;
-      }
-      console.warn("[ingest] no shopid in HTML of", r.url);
-    } catch (e) {
-      console.warn("[ingest] HTML error for", pageUrl, ":", e.message);
-    }
-  }
-
-  // ── Method 3: item/get API with shopid=0 ────────────────────────────
   try {
-    console.log("[ingest] trying item/get shopid=0…");
-    const r = await fetch(
-      `https://shopee.vn/api/v2/item/get?itemid=${itemid}&shopid=0`,
-      { credentials: "include", headers: { "x-requested-with": "XMLHttpRequest" } }
-    );
-    const j = await r.json().catch(() => null);
-    console.log("[ingest] item/get →",
-      j ? JSON.stringify(j).slice(0, 500) : "(parse failed)");
-    const d = j && (j.item || (j.data && j.data));
-    const sid = d && (d.shopid || d.shop_id);
-    if (sid) {
-      if (progress) await progress({ stage: "resolve-shop", message: "Đã tìm shopid qua item API", shopid: String(sid), percent: 18 });
-      return String(sid);
-    }
-  } catch (e) {
-    console.warn("[ingest] item/get error:", e.message);
-  }
-
-  // ── Method 4 (nuclear): open a real tab, let JS render, read DOM ────
-  // This works when fetch-based methods fail because Shopee's CSR hydrates
-  // the shopid into the page state only after JavaScript runs.
-  let tabId;
-  try {
-    const tabUrl = originalUrl || `https://shopee.vn/-i.0.${itemid}`;
-    console.log("[ingest] opening tab:", tabUrl);
-    const tab = await chrome.tabs.create({ url: tabUrl, active: false });
-    tabId = tab.id;
-
-    // Wait for 'complete' with a 15-second timeout
-    await Promise.race([
-      new Promise((resolve) => {
-        const onUp = (id, info) => {
-          if (id === tabId && info.status === "complete") {
-            chrome.tabs.onUpdated.removeListener(onUp);
-            resolve();
-          }
-        };
-        chrome.tabs.onUpdated.addListener(onUp);
-      }),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("tab load timeout")), 15000)
-      ),
-    ]);
-
-    // Give CSR a moment to hydrate
-    await new Promise((s) => setTimeout(s, 3000));
-
-    const results = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "MAIN",
-      func: () => {
-        // 1) canonical URL might now contain i.<shopid>.<itemid>
-        const um = location.href.match(/i\.(\d+)\.(\d+)/);
-        if (um) return um[1];
-        const pm = location.pathname.match(/\/product\/(\d+)\/(\d+)/);
-        if (pm) return pm[1];
-        // 2) scrape embedded JSON from the rendered DOM
-        const html = document.documentElement.innerHTML;
-        const hm =
-          html.match(/"shopid"\s*:\s*"?(\d+)/) ||
-          html.match(/"shop_id"\s*:\s*"?(\d+)/) ||
-          html.match(/shopid=(\d+)/);
-        return hm ? hm[1] : null;
-      },
-    });
-
-    const sid = results && results[0] && results[0].result;
-    if (sid) {
-      console.log("[ingest] shopid from tab:", sid);
-      if (progress) await progress({ stage: "resolve-shop", message: "Đã tìm shopid bằng tab thật", shopid: String(sid), percent: 18 });
-      chrome.tabs.remove(tabId).catch(() => {});
-      return String(sid);
-    }
-    console.warn("[ingest] tab method: no shopid found in rendered page");
-  } catch (e) {
-    console.warn("[ingest] tab method error:", e.message);
-  }
-  if (tabId) chrome.tabs.remove(tabId).catch(() => {});
-
-  console.error("[ingest] ALL 4 methods failed for item", itemid);
+    const r = await fetch(originalUrl, { headers: { "User-Agent": navigator.userAgent } });
+    const s = scrape(await r.text());
+    if (s) return s;
+  } catch {}
   return null;
 }
 
-async function collectReviews(url, progress) {
-  console.log("[ingest] collectReviews:", url);
-  let { shopid, itemid } = idsFrom(url);
-  console.log("[ingest] parsed ids → shopid:", shopid, "itemid:", itemid);
-  if (!itemid) throw new Error("không đọc được itemid từ " + url);
-  if (progress) await progress({ stage: "parse-url", message: "Đã đọc itemid từ URL", itemid, shopid, percent: shopid ? 18 : 8 });
-  if (!shopid) shopid = await resolveShopId(itemid, url, progress);
-  if (!shopid) throw new Error("không đọc được shopid cho item " + itemid);
-  if (progress) await progress({ stage: "fetch-background", message: "Đang lấy review bằng background fetch", itemid, shopid, percent: 20 });
+async function extractShopeeReviews(job, progress) {
+  const parsed = idsFrom(job.url);
+  let itemid = parsed.itemid;
+  let shopid = parsed.shopid;
+  if (!itemid) throw new Error(`Không đọc được itemid từ URL: ${job.url}`);
+  if (!shopid) shopid = await resolveShopId(itemid, job.url, progress);
+  if (!shopid) throw new Error(`Không tìm thấy shopid cho item ${itemid}`);
 
-  // ── Try 1: fetch ratings from the background service worker ─────────
-  try {
-    const rows = await _fetchRatingsBackground(shopid, itemid, progress);
-    return { itemid, rows };
-  } catch (bgErr) {
-    console.warn("[ingest] background fetch failed:", bgErr.message);
-    if (progress) await progress({ stage: "fallback-tab", message: "Background fetch lỗi, chuyển qua tab thật: " + bgErr.message, itemid, shopid, percent: 25 });
-    // ── FIX B: mở rộng fallback condition ──────────────────────────────
-    // Trước đây chỉ catch 403|429|Shopee error — thiếu các lỗi network/worker
-    // bị kill (TypeError, Failed to fetch, NetworkError, v.v.)
-    // Giờ: fallback về tab với MỌI lỗi để tránh bỏ sót.
-    console.log("[ingest] falling back to tab (any error triggers fallback)");
-  }
-
-  // ── Try 2: open a real tab on shopee.vn and fetch from page context ─
-  console.log("[ingest] falling back to tab-based ratings fetch…");
-  return await _fetchRatingsViaTab(shopid, itemid, url, progress);
-}
-
-// Background fetch — fast when Shopee trusts the service-worker origin.
-async function _fetchRatingsBackground(shopid, itemid, progress) {
-  const rows = [];
+  let all = [];
+  let offset = 0;
   let total = null;
-  for (let offset = 0; offset < MAX_REVIEWS; offset += PAGE_SIZE) {
-    const r = await fetch(
-      `https://shopee.vn/api/v2/item/get_ratings?itemid=${itemid}&shopid=${shopid}` +
-        `&type=0&filter=0&limit=${PAGE_SIZE}&offset=${offset}`,
-      { credentials: "include", headers: { "x-requested-with": "XMLHttpRequest" } }
-    );
-    if (!r.ok) throw new Error(`HTTP ${r.status} ở offset ${offset}`);
-    const j = await r.json();
-    if (j && j.error) throw new Error(`Shopee error ${j.error} (is_login=${j.is_login})`);
-    total = total || ratingTotal(j);
-    const batch = (j.data && j.data.ratings) || [];
-    for (const x of batch) {
-      rows.push(normaliseRating(x));
+
+  while (all.length < MAX_REVIEWS) {
+    const apiUrl = `https://shopee.vn/api/v2/item/get_ratings?filter=0&flag=1&itemid=${itemid}&limit=${PAGE_SIZE}&offset=${offset}&shopid=${shopid}&type=0`;
+    const res = await fetch(apiUrl);
+    if (!res.ok) {
+      if (res.status === 403 || res.url.includes("/verify/traffic")) {
+        throw new Error("Shopee challenge / verification required");
+      }
+      throw new Error(`Shopee API error HTTP ${res.status}`);
     }
-    setBadge(String(rows.length));
+    const json = await res.json();
+    if (json.error === 90309999 || (json.data && json.data.is_login === false)) {
+      throw new Error("Shopee error 90309999 (is_login=false)");
+    }
+    const ratings = (json.data && json.data.ratings) || [];
+    if (!ratings.length) break;
+    if (total === null) total = ratingTotal(json);
+
+    for (const r of ratings) all.push(normaliseRating(r));
     if (progress) {
-      const percent = crawlPercent(rows.length, total, 25, 70);
       await progress({
-        status: "running",
         stage: "fetch-background",
-        message: `Đã lấy ${rows.length} review`,
-        rows: rows.length,
-        total,
-        offset,
-        itemid,
-        shopid,
-        percent,
+        message: `Đã lấy ${all.length} đánh giá`,
+        rows: all.length,
+        percent: crawlPercent(all.length, total, 20, 70),
       });
     }
-    if (batch.length < PAGE_SIZE) break;
+    if (ratings.length < PAGE_SIZE) break;
+    offset += PAGE_SIZE;
     await new Promise((s) => setTimeout(s, PACE_MS));
   }
-  return rows;
-}
-
-// ── FIX C: Tab fetch với inject + polling thay vì async executeScript ─────────
-//
-// VẤN ĐỀ CŨ: chrome.scripting.executeScript với `func: async () => { ... }` KHÔNG
-// await async function — nó chỉ nhận Promise object (unresolved), không phải giá trị
-// thực → data luôn là undefined → tab đóng ngay, không lấy được review nào.
-//
-// CÁCH FIX: inject một script đồng bộ vào page, script đó tự khởi động async crawl
-// và ghi kết quả vào window.__ingestResult. Background poll window.__ingestResult
-// mỗi 2 giây cho đến khi có data hoặc timeout.
-async function _fetchRatingsViaTab(fallbackShopid, fallbackItemid, productUrl, progress) {
-  const tab = await chrome.tabs.create({ url: productUrl, active: true });
-  const tabId = tab.id;
-  if (progress) await progress({ status: "running", stage: "tab-opened", message: "Đã mở tab Chrome thật để crawl", tabId, percent: 30 });
-
-  try {
-    // Wait for the tab to finish loading
-    await Promise.race([
-      new Promise((resolve) => {
-        const onUp = (id, info) => {
-          if (id === tabId && info.status === "complete") {
-            chrome.tabs.onUpdated.removeListener(onUp);
-            resolve();
-          }
-        };
-        chrome.tabs.onUpdated.addListener(onUp);
-      }),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("tab load timeout")), 20000)
-      ),
-    ]);
-    // Give CSR time to hydrate — reviews won't be in the DOM without this.
-    if (progress) await progress({ status: "running", stage: "tab-loaded", message: "Tab đã load, chờ hydrate dữ liệu", tabId, percent: 35 });
-    await new Promise((s) => setTimeout(s, 3000));
-
-    // ── Step 1: inject script khởi động crawl (không dùng async func) ──
-    // Inject một IIFE đồng bộ vào page. IIFE đó kick-off async crawl ngầm
-    // và ghi kết quả vào window.__ingestResult khi xong.
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "MAIN",
-      args: [fallbackShopid, fallbackItemid],
-      func: (fbShopid, fbItemid) => {
-        // Reset trạng thái cho lần chạy này
-        window.__ingestResult = undefined;  // undefined = chưa xong; null = lỗi
-        window.__ingestProgress = { rows: 0, offset: 0, shopid: fbShopid, itemid: fbItemid };
-
-        let box = document.getElementById("__aiCoworkIngestProgress");
-        if (!box) {
-          box = document.createElement("div");
-          box.id = "__aiCoworkIngestProgress";
-          box.style.cssText = "position:fixed;z-index:2147483647;right:16px;bottom:16px;"
-            + "max-width:360px;background:#111827;color:#f9fafb;font:13px system-ui;"
-            + "padding:12px 14px;border-radius:8px;box-shadow:0 12px 28px rgba(0,0,0,.35);"
-            + "border:1px solid rgba(255,255,255,.12)";
-          document.documentElement.appendChild(box);
-        }
-        const say = (text) => {
-          box.textContent = text;
-        };
-        say("AI cowork: bắt đầu crawl review...");
-
-        // Kick-off async crawl — KHÔNG await ở đây (executeScript không đợi được)
-        (function startCrawl() {
-          // ── Extract shopid + itemid từ page đã load ──────────────────
-          let shopid, itemid;
-          let m = location.pathname.match(/\/product\/(\d+)\/(\d+)/);
-          if (m) { shopid = m[1]; itemid = m[2]; }
-          if (!shopid || !itemid) {
-            m = location.href.match(/i\.(\d+)\.(\d+)/);
-            if (m) { shopid = m[1]; itemid = m[2]; }
-          }
-          if (!shopid || !itemid) {
-            const html = document.documentElement.innerHTML;
-            shopid = shopid || (html.match(/"shopid"\s*:\s*"?(\d+)/) || [])[1];
-            itemid = itemid || (html.match(/"itemid"\s*:\s*"?(\d+)/) || [])[1];
-          }
-          shopid = shopid || fbShopid;
-          itemid = itemid || fbItemid;
-
-          if (!shopid || !itemid) {
-            window.__ingestResult = { error: "no shopid/itemid on page: " + location.href };
-            say("AI cowork: lỗi đọc shopid/itemid");
-            return;
-          }
-          say(`AI cowork: đang lấy review cho item ${itemid}`);
-
-          // ── Paginate ratings API ─────────────────────────────────────
-          const rows = [];
-          let offset = 0;
-          const PAGE = 50;
-          const MAX = 20000;
-          const PACE = 700;
-          let total = null;
-
-          function mediaUrl(value, kind = "image") {
-            if (!value) return "";
-            if (typeof value === "object") {
-              value = value.url || value.video_url || value.play_url || value.cover || value.image_id || value.id || "";
-            }
-            value = String(value || "").trim();
-            if (!value) return "";
-            if (value.startsWith("//")) return "https:" + value;
-            if (/^https?:\/\//i.test(value)) return value;
-            return "https://down-vn.img.susercontent.com/file/" + value;
-          }
-
-          function asList(value) {
-            if (Array.isArray(value)) return value;
-            return value ? [value] : [];
-          }
-
-          function normaliseRating(x) {
-            const imageUrls = asList(x.images).map((v) => mediaUrl(v, "image")).filter(Boolean);
-            const videoUrls = asList(x.videos || x.video)
-              .map((v) => mediaUrl(v, "video"))
-              .filter(Boolean);
-            const mediaUrls = [...imageUrls, ...videoUrls];
-            return {
-              user: x.author_username || "",
-              sao: x.rating_star,
-              noi_dung: (x.comment || "").replace(/\s+/g, " ").trim(),
-              thoi_gian: new Date((x.ctime || 0) * 1000)
-                .toISOString().slice(0, 19).replace("T", " "),
-              phan_loai: (x.product_items || [])
-                .map((p) => p.model_name).filter(Boolean).join("|"),
-              anh: imageUrls.length ? 1 : 0,
-              so_anh: imageUrls.length,
-              anh_urls: imageUrls.join("|"),
-              video: videoUrls.length ? 1 : 0,
-              so_video: videoUrls.length,
-              video_urls: videoUrls.join("|"),
-              media_urls: mediaUrls.join("|"),
-              huu_ich: x.like_count || 0,
-            };
-          }
-
-          function ratingTotal(j) {
-            const data = j && j.data;
-            const summary = data && (data.item_rating_summary || data.product_rating_summary || data.rating_summary);
-            const value = data && (data.total || data.count || (summary && (summary.rating_total || summary.total_count || summary.count)));
-            const n = Number(value);
-            return Number.isFinite(n) && n > 0 ? n : null;
-          }
-
-          function fetchPage() {
-            fetch(
-              `/api/v2/item/get_ratings?itemid=${itemid}&shopid=${shopid}` +
-                `&type=0&filter=0&limit=${PAGE}&offset=${offset}`
-            )
-              .then((r) => {
-                if (!r.ok) {
-                  window.__ingestResult = { error: `HTTP ${r.status} at offset ${offset}`, shopid, itemid };
-                  say(`AI cowork: lỗi HTTP ${r.status} tại offset ${offset}`);
-                  return;
-                }
-                return r.json();
-              })
-              .then((j) => {
-                if (!j) return; // error already set above
-                if (j && j.error) {
-                  window.__ingestResult = { error: `Shopee error ${j.error}`, shopid, itemid };
-                  say(`AI cowork: Shopee error ${j.error}`);
-                  return;
-                }
-                const batch = (j.data && j.data.ratings) || [];
-                total = total || ratingTotal(j);
-                for (const x of batch) {
-                  rows.push(normaliseRating(x));
-                }
-                offset += PAGE;
-                window.__ingestProgress = { rows: rows.length, total, offset, shopid, itemid };
-                say(`AI cowork: đã lấy ${rows.length} review`);
-                if (batch.length < PAGE || offset >= MAX) {
-                  // Done — publish result
-                  window.__ingestResult = { shopid, itemid, rows };
-                  say(`AI cowork: xong ${rows.length} review, đang lưu CSV...`);
-                } else {
-                  // Next page after pace delay
-                  setTimeout(fetchPage, PACE);
-                }
-              })
-              .catch((e) => {
-                window.__ingestResult = { error: String(e.message || e), shopid, itemid };
-                say("AI cowork: lỗi " + String(e.message || e));
-              });
-          }
-
-          fetchPage();
-        })();
-      },
-    });
-
-    // ── Step 2: poll window.__ingestResult mỗi 2s, timeout 180s ────────
-    // 180s = 3000 reviews / 50 per page * 700ms + buffer ≈ 42s thực tế,
-    // 180s là safety net cho mạng chậm.
-    const POLL_INTERVAL = 2000;
-    const POLL_TIMEOUT = 180_000;
-    const pollStart = Date.now();
-
-    let data = null;
-    while (true) {
-      await new Promise((s) => setTimeout(s, POLL_INTERVAL));
-
-      if (Date.now() - pollStart > POLL_TIMEOUT) {
-        throw new Error("tab-based fetch timed out after 180s");
-      }
-
-      let pollResult;
-      try {
-        const pr = await chrome.scripting.executeScript({
-          target: { tabId },
-          world: "MAIN",
-          func: () => window.__ingestResult,
-        });
-        pollResult = pr && pr[0] && pr[0].result;
-      } catch (e) {
-        // Tab may have navigated away or been closed — treat as error
-        throw new Error("tab poll failed: " + e.message);
-      }
-
-      if (pollResult === undefined || pollResult === null) {
-        // Still running — log progress if rows are counting up
-        console.log("[ingest] tab crawl in progress, polling…");
-        try {
-          const pp = await chrome.scripting.executeScript({
-            target: { tabId },
-            world: "MAIN",
-            func: () => window.__ingestProgress,
-          });
-          const tabProgress = pp && pp[0] && pp[0].result;
-          if (tabProgress && progress) {
-            const percent = crawlPercent(tabProgress.rows, tabProgress.total, 35, 60);
-            await progress({
-              status: "running",
-              stage: "fetch-tab",
-              message: `Tab thật đã lấy ${tabProgress.rows} review`,
-              rows: tabProgress.rows,
-              total: tabProgress.total,
-              offset: tabProgress.offset,
-              itemid: tabProgress.itemid,
-              shopid: tabProgress.shopid,
-              tabId,
-              percent,
-            });
-          }
-        } catch (e) {
-          console.warn("[ingest] tab progress poll failed:", e.message);
-        }
-        continue;
-      }
-
-      data = pollResult;
-      break;
-    }
-
-    if (!data) throw new Error("tab script returned no data");
-    if (data.error) throw new Error(data.error);
-
-    console.log(
-      "[ingest] tab fetch got", data.rows.length,
-      "reviews (shopid:", data.shopid, "itemid:", data.itemid, ")"
-    );
-    return { itemid: data.itemid, rows: data.rows };
-  } finally {
-    // Keep the visible crawl tab open so the user can inspect what happened.
-  }
-}
-
-function setBadge(text, color) {
-  chrome.action.setBadgeText({ text: text || "" });
-  if (color) chrome.action.setBadgeBackgroundColor({ color });
-}
-
-async function report(job, body) {
-  await fetch(`${HELPER}/ingest?name=shopee_${body.itemid || job.id}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ job: job.id, source: job.url, ...body }),
-  });
+  return all;
 }
 
 async function runJob(job) {
-  console.log("[ingest] ▶ starting job", job.id, "→", job.url);
-  setBadge("...", "#1a73e8");
-  const progress = (patch) => reportProgress(job, patch);
-  await progress({
-    status: "running",
-    stage: "started",
-    message: "Extension đã nhận job",
-    percent: 5,
-    rows: 0,
-    url: job.url,
-    kind: job.kind,
-  });
-
-  // ── FIX A: keepalive để MV3 service worker không bị Chrome kill ──────
-  // Khi job đang chạy (tab load + paginate = 30–120s), không có request nào
-  // pending → Chrome kill worker → tab bị đóng đột ngột. Ping /ping mỗi
-  // 20s giữ worker sống suốt quá trình. Cleared trong finally block.
+  console.log("[bridge] ▶ start job", job.id, job.kind, job.url);
+  activeJobs.set(job.id, job);
+  updateState("busy");
   const keepalive = startKeepalive();
 
+  const progress = (patch) => reportProgress(job, patch);
   try {
-    const { itemid, rows } = await collectReviews(job.url, progress);
-    await progress({
-      status: "saving",
-      stage: "saving",
-      message: `Đang lưu ${rows.length} review ra JSON/CSV`,
-      rows: rows.length,
-      itemid,
-      percent: 98,
+    await progress({ status: "running", stage: "init", message: "Bắt đầu cào", percent: 5 });
+    let rows = [];
+    if (job.kind === "shopee-reviews" || job.url.includes("shopee.vn")) {
+      rows = await extractShopeeReviews(job, progress);
+    }
+    await progress({ status: "saving", stage: "upload", message: `Đang lưu ${rows.length} dòng`, rows: rows.length, percent: 95 });
+    await fetch(`${HELPER}/ingest?name=${encodeURIComponent("shopee_" + job.id)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job: job.id, source: job.url, rows }),
     });
-    await report(job, { itemid, rows });
-    console.log("[ingest] ✔ job", job.id, "done —", rows.length, "reviews");
-    setBadge(String(rows.length), "#188038");
+    console.log("[bridge] ✔ job", job.id, "finished:", rows.length, "rows");
   } catch (e) {
-    console.error("[ingest] ✘ job", job.id, "failed:", e.message);
-    await progress({
-      status: "error",
-      stage: "failed",
-      message: String(e.message || e),
-      error: String(e.message || e),
-      percent: 100,
+    console.error("[bridge] ✘ job", job.id, "failed:", e.message);
+    if (e.message.includes("verification required") || e.message.includes("is_login=false")) {
+      triggerVerificationRequired({ job_id: job.id, url: job.url, reason: e.message });
+    }
+    await progress({ status: "error", stage: "failed", message: String(e.message || e), percent: 100 });
+    await fetch(`${HELPER}/ingest`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job: job.id, error: String(e.message || e) }),
     });
-    await report(job, { error: String(e.message || e) });
-    setBadge("err", "#d93025");
   } finally {
     clearInterval(keepalive);
+    activeJobs.delete(job.id);
+    updateState(verificationInfo ? "awaiting_user_verification" : (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN ? "connected" : "disconnected"));
   }
-  setTimeout(() => setBadge(""), 20000);
 }
 
-let looping = false;
+// ── Verification Challenge Trigger ──────────────────────────────────────────
+function triggerVerificationRequired(details) {
+  console.warn("[bridge] ⚠️ Verification required:", details);
+  updateState("awaiting_user_verification", details);
+  if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+    bridgeSend({
+      v: 1,
+      type: "verification.required",
+      id: "verif-" + Date.now(),
+      params: details,
+    });
+  }
+}
 
-async function loop() {
+function resumeVerification() {
+  console.log("[bridge] Resuming verification");
+  updateState("connected");
+  if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+    bridgeSend({
+      v: 1,
+      type: "verification.resolved",
+      id: "resumed-" + Date.now(),
+      params: { status: "resumed", message: "User confirmed verification in tab" },
+    });
+  }
+}
+
+// ── Action Registry Handlers (18 Precompiled Actions) ───────────────────────
+async function handleAction(action, params) {
+  params = params || {};
+  switch (action) {
+    case "browser.health":
+      return {
+        status: "ok",
+        version: "2.0.0",
+        connected: bridgeSocket ? bridgeSocket.readyState === WebSocket.OPEN : false,
+        activeJobsCount: activeJobs.size,
+        extensionState,
+      };
+
+    case "tab.list": {
+      const tabs = await chrome.tabs.query({});
+      return {
+        tabs: tabs.map((t) => ({
+          tabId: t.id,
+          url: t.url,
+          title: t.title,
+          active: t.active,
+          status: t.status,
+        })),
+      };
+    }
+
+    case "tab.getActive": {
+      const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      if (!activeTab) throw new Error("No active tab found");
+      return {
+        tabId: activeTab.id,
+        url: activeTab.url,
+        title: activeTab.title,
+        status: activeTab.status,
+      };
+    }
+
+    case "tab.open": {
+      const tab = await chrome.tabs.create({ url: params.url, active: params.active !== false });
+      return { tabId: tab.id, url: tab.url };
+    }
+
+    case "tab.focus": {
+      const tab = await chrome.tabs.update(params.tabId, { active: true });
+      if (tab.windowId) await chrome.windows.update(tab.windowId, { focused: true });
+      return { tabId: tab.id, focused: true };
+    }
+
+    case "page.navigate": {
+      const targetTabId = params.tabId || (await getActiveTabId());
+      const waitUntil = params.waitUntil || "load"; // load, domcontentloaded, networkidle
+
+      const navigationPromise = new Promise((resolve) => {
+        let timer = null;
+        const onUpdated = (tabId, changeInfo, tab) => {
+          if (tabId === targetTabId) {
+            if (waitUntil === "domcontentloaded") {
+              if (changeInfo.status === "loading" || changeInfo.status === "complete") {
+                cleanup();
+                resolve({ tabId: targetTabId, url: tab.url, loaded: true });
+              }
+            } else {
+              if (changeInfo.status === "complete") {
+                cleanup();
+                resolve({ tabId: targetTabId, url: tab.url, loaded: true });
+              }
+            }
+          }
+        };
+
+        const cleanup = () => {
+          if (timer) clearTimeout(timer);
+          chrome.tabs.onUpdated.removeListener(onUpdated);
+        };
+
+        chrome.tabs.onUpdated.addListener(onUpdated);
+        timer = setTimeout(() => {
+          cleanup();
+          resolve({ tabId: targetTabId, url: params.url, loaded: false, timeout: true });
+        }, Math.max(3000, Number(params.timeoutMs) || 30000));
+      });
+
+      await chrome.tabs.update(targetTabId, { url: params.url });
+      return await navigationPromise;
+    }
+
+    case "page.getUrl": {
+      const targetTabId = params.tabId || (await getActiveTabId());
+      const tab = await chrome.tabs.get(targetTabId);
+      return { tabId: tab.id, url: tab.url, title: tab.title };
+    }
+
+    case "page.getTitle": {
+      const targetTabId = params.tabId || (await getActiveTabId());
+      const tab = await chrome.tabs.get(targetTabId);
+      return { tabId: tab.id, title: tab.title };
+    }
+
+    case "page.waitFor": {
+      const targetTabId = params.tabId || (await getActiveTabId());
+      const state = params.state || "visible"; // visible, hidden, attached, detached
+      const timeoutMs = Math.max(100, Number(params.timeoutMs) || 5000);
+
+      const pollScript = async (selector, expectedState, maxWaitMs) => {
+        const start = Date.now();
+        const checkState = (el, st) => {
+          const isAttached = !!el;
+          if (st === "attached") return isAttached;
+          if (st === "detached") return !isAttached;
+          if (!isAttached) return st === "hidden";
+          const rects = el.getClientRects();
+          const isVisible =
+            rects.length > 0 &&
+            (el.offsetWidth > 0 || el.offsetHeight > 0) &&
+            window.getComputedStyle(el).visibility !== "hidden";
+          if (st === "visible") return isVisible;
+          if (st === "hidden") return !isVisible;
+          return false;
+        };
+
+        while (Date.now() - start < maxWaitMs) {
+          const el = document.querySelector(selector);
+          if (checkState(el, expectedState)) {
+            return { found: true, elapsedMs: Date.now() - start };
+          }
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        return { found: false, elapsedMs: Date.now() - start };
+      };
+
+      const res = await chrome.scripting.executeScript({
+        target: { tabId: targetTabId },
+        func: pollScript,
+        args: [params.selector, state, timeoutMs],
+      });
+
+      const outcome = res[0]?.result;
+      if (!outcome || !outcome.found) {
+        throw new Error(`Timeout waiting for selector '${params.selector}' to be ${state}`);
+      }
+      return { found: true, elapsedMs: outcome.elapsedMs };
+    }
+
+    case "dom.query": {
+      const targetTabId = params.tabId || (await getActiveTabId());
+      const res = await chrome.scripting.executeScript({
+        target: { tabId: targetTabId },
+        func: (selector) => {
+          const el = document.querySelector(selector);
+          return el ? { found: true, tag: el.tagName.toLowerCase() } : { found: false };
+        },
+        args: [params.selector],
+      });
+      return res[0]?.result || { found: false };
+    }
+
+    case "dom.queryAll": {
+      const targetTabId = params.tabId || (await getActiveTabId());
+      const res = await chrome.scripting.executeScript({
+        target: { tabId: targetTabId },
+        func: (selector, limit) => {
+          const nodes = Array.from(document.querySelectorAll(selector)).slice(0, limit || 50);
+          return nodes.map((n) => ({
+            tag: n.tagName.toLowerCase(),
+            text: (n.innerText || "").slice(0, 100),
+          }));
+        },
+        args: [params.selector, params.limit || 50],
+      });
+      return { count: res[0]?.result?.length || 0, items: res[0]?.result || [] };
+    }
+
+    case "dom.getText": {
+      const targetTabId = params.tabId || (await getActiveTabId());
+      const res = await chrome.scripting.executeScript({
+        target: { tabId: targetTabId },
+        func: (selector, maxChars) => {
+          const el = document.querySelector(selector);
+          return el ? (el.innerText || "").slice(0, maxChars || 8000) : null;
+        },
+        args: [params.selector, params.maxChars || 8000],
+      });
+      return { text: res[0]?.result };
+    }
+
+    case "dom.getAttribute": {
+      const targetTabId = params.tabId || (await getActiveTabId());
+      const res = await chrome.scripting.executeScript({
+        target: { tabId: targetTabId },
+        func: (selector, attr) => {
+          const el = document.querySelector(selector);
+          return el ? el.getAttribute(attr) : null;
+        },
+        args: [params.selector, params.attribute],
+      });
+      return { attribute: params.attribute, value: res[0]?.result };
+    }
+
+    case "dom.click": {
+      const targetTabId = params.tabId || (await getActiveTabId());
+      const res = await chrome.scripting.executeScript({
+        target: { tabId: targetTabId },
+        func: (selector) => {
+          const el = document.querySelector(selector);
+          if (!el) return { ok: false, error: "ELEMENT_NOT_FOUND" };
+          el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+          el.click();
+          return { ok: true, clicked: true };
+        },
+        args: [params.selector],
+      });
+      const outcome = res[0]?.result;
+      if (!outcome || !outcome.ok) {
+        throw new Error(`ELEMENT_NOT_FOUND: Element not found for selector '${params.selector}'`);
+      }
+      return outcome;
+    }
+
+    case "input.type": {
+      const targetTabId = params.tabId || (await getActiveTabId());
+      const res = await chrome.scripting.executeScript({
+        target: { tabId: targetTabId },
+        func: (selector, text, clearFirst, submit) => {
+          const el = document.querySelector(selector);
+          if (!el) return { ok: false, error: "ELEMENT_NOT_FOUND" };
+
+          const nativeSetter =
+            Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set ||
+            Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+
+          if (clearFirst) {
+            if (nativeSetter) {
+              nativeSetter.call(el, "");
+            } else {
+              el.value = "";
+            }
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+          }
+
+          const newVal = (clearFirst ? "" : el.value) + text;
+          if (nativeSetter) {
+            nativeSetter.call(el, newVal);
+          } else {
+            el.value = newVal;
+          }
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+
+          if (submit && el.form) {
+            el.form.dispatchEvent(new Event("submit", { bubbles: true }));
+          }
+          return { ok: true, typedLength: text.length };
+        },
+        args: [params.selector, params.text, params.clearFirst !== false, !!params.submit],
+      });
+      const outcome = res[0]?.result;
+      if (!outcome || !outcome.ok) {
+        throw new Error(`ELEMENT_NOT_FOUND: Element not found for selector '${params.selector}'`);
+      }
+      return outcome;
+    }
+
+    case "input.select": {
+      const targetTabId = params.tabId || (await getActiveTabId());
+      const res = await chrome.scripting.executeScript({
+        target: { tabId: targetTabId },
+        func: (selector, val) => {
+          const el = document.querySelector(selector);
+          if (!el) return { ok: false, error: "ELEMENT_NOT_FOUND" };
+          el.value = val;
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          return { ok: true, selected: val };
+        },
+        args: [params.selector, params.value],
+      });
+      const outcome = res[0]?.result;
+      if (!outcome || !outcome.ok) {
+        throw new Error(`ELEMENT_NOT_FOUND: Element not found for selector '${params.selector}'`);
+      }
+      return outcome;
+    }
+
+    case "page.snapshot": {
+      const format = (params.format || "text").toLowerCase();
+      if (format !== "text" && format !== "html") {
+        throw new Error(`UNSUPPORTED_ACTION_PARAM: format '${params.format}' is not supported (only 'text' and 'html')`);
+      }
+      const targetTabId = params.tabId || (await getActiveTabId());
+      const maxChars = Math.min(500000, Math.max(100, Number(params.maxChars) || 50000));
+      const res = await chrome.scripting.executeScript({
+        target: { tabId: targetTabId },
+        func: (fmt, maxLen) => {
+          if (fmt === "html") {
+            return (document.documentElement.outerHTML || "").slice(0, maxLen);
+          }
+          return (document.body ? document.body.innerText : "").slice(0, maxLen);
+        },
+        args: [format, maxChars],
+      });
+      return { format, snapshot: res[0]?.result || "" };
+    }
+
+    case "fetch.sameOrigin": {
+      const targetTabId = params.tabId || (await getActiveTabId());
+      const tab = await chrome.tabs.get(targetTabId);
+      if (!tab.url) throw new Error("Tab has no URL for origin verification");
+
+      let tabUrlObj;
+      try {
+        tabUrlObj = new URL(tab.url);
+      } catch {
+        throw new Error("Invalid tab URL");
+      }
+      if (tabUrlObj.protocol !== "http:" && tabUrlObj.protocol !== "https:") {
+        throw new Error(`Tab protocol '${tabUrlObj.protocol}' is not allowed for sameOrigin fetch`);
+      }
+      if (tabUrlObj.username || tabUrlObj.password) {
+        throw new Error("Tab URL containing userinfo (@) is not allowed");
+      }
+
+      let targetUrlObj;
+      try {
+        targetUrlObj = new URL(params.pathOrUrl, tab.url);
+      } catch {
+        throw new Error("Invalid target path or URL");
+      }
+
+      if (targetUrlObj.protocol !== "http:" && targetUrlObj.protocol !== "https:") {
+        throw new Error(`Target protocol '${targetUrlObj.protocol}' is not allowed`);
+      }
+      if (targetUrlObj.username || targetUrlObj.password) {
+        throw new Error("Target URL containing userinfo (@) is not allowed");
+      }
+
+      if (targetUrlObj.origin !== tabUrlObj.origin) {
+        throw new Error(`Cross-origin fetch rejected. Tab origin: ${tabUrlObj.origin}, Target: ${targetUrlObj.origin}`);
+      }
+
+      const forbiddenHeaders = [
+        "authorization",
+        "cookie",
+        "cookie2",
+        "host",
+        "origin",
+        "referer",
+        "content-length",
+        "connection",
+        "keep-alive",
+        "upgrade",
+        "proxy-authorization",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "sec-fetch-user",
+        "te",
+        "trailer",
+        "transfer-encoding",
+      ];
+      const safeHeaders = {};
+      if (params.headers && typeof params.headers === "object") {
+        for (const [k, v] of Object.entries(params.headers)) {
+          const lower = k.toLowerCase().trim();
+          if (forbiddenHeaders.includes(lower)) {
+            throw new Error(`Forbidden header in fetch.sameOrigin: '${k}'`);
+          }
+          safeHeaders[k] = v;
+        }
+      }
+
+      const maxBytes = Math.min(
+        10 * 1024 * 1024,
+        Math.max(1024, Number(params.maxResponseBytes) || 200 * 1024)
+      );
+
+      const targetUrl = targetUrlObj.href;
+
+      // Execute fetch within tab context so Chrome profile cookies attach naturally
+      const res = await chrome.scripting.executeScript({
+        target: { tabId: targetTabId },
+        func: async (url, method, headers, body, maxLimit) => {
+          const opts = {
+            method: method || "GET",
+            headers: headers || {},
+            credentials: "include",
+          };
+          if (body && ["POST", "PUT", "PATCH"].includes(opts.method.toUpperCase())) {
+            opts.body = typeof body === "object" ? JSON.stringify(body) : String(body);
+          }
+          const resp = await fetch(url, opts);
+          const text = await resp.text();
+          const byteLen = new TextEncoder().encode(text).length;
+          if (byteLen > maxLimit) {
+            return {
+              status: resp.status,
+              ok: false,
+              error: `Response size (${byteLen} bytes) exceeds limit of ${maxLimit} bytes`,
+            };
+          }
+          let parsedJson = null;
+          try {
+            parsedJson = JSON.parse(text);
+          } catch {}
+          return {
+            status: resp.status,
+            ok: resp.ok,
+            url: resp.url,
+            data: parsedJson !== null ? parsedJson : text,
+          };
+        },
+        args: [targetUrl, params.method || "GET", safeHeaders, params.body || null, maxBytes],
+      });
+
+      const fetchResult = res[0]?.result;
+      if (fetchResult && fetchResult.error) {
+        throw new Error(fetchResult.error);
+      }
+      if (fetchResult && (fetchResult.status === 403 || (typeof fetchResult.data === "string" && fetchResult.data.includes("/verify/traffic")))) {
+        triggerVerificationRequired({ tab_id: targetTabId, url: targetUrl, status: fetchResult.status });
+      }
+      return fetchResult;
+    }
+
+    case "job.cancel": {
+      const jobId = params.jobId;
+      if (activeJobs.has(jobId)) {
+        activeJobs.delete(jobId);
+        return { cancelled: true, jobId };
+      }
+      return { cancelled: false, message: "Job not running" };
+    }
+
+    default:
+      throw new Error(`Action not implemented: ${action}`);
+  }
+}
+
+async function getActiveTabId() {
+  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  if (tab && tab.id) return tab.id;
+  const [anyTab] = await chrome.tabs.query({});
+  if (anyTab && anyTab.id) return anyTab.id;
+  throw new Error("No available browser tab found");
+}
+
+// ── Envelope Dispatch & Command Execution ───────────────────────────────────
+async function dispatchEnvelope(envelope) {
+  if (!envelope || typeof envelope !== "object") return;
+
+  // Handle command envelopes
+  if (envelope.type === "command") {
+    const cmdId = envelope.id;
+    const action = envelope.action;
+    const params = envelope.params || {};
+    const deadlineMs = Math.max(1000, Number(envelope.deadlineMs) || 30000);
+
+    const abortController = new AbortController();
+    const timeoutId = setTimeout(() => {
+      if (inFlightCommands.has(cmdId)) {
+        inFlightCommands.delete(cmdId);
+        abortController.abort(new Error("TIMEOUT"));
+        bridgeSend({
+          v: 1,
+          type: "error",
+          id: cmdId,
+          action,
+          error: {
+            code: "TIMEOUT",
+            message: `Action '${action}' timed out after ${deadlineMs}ms in extension`,
+            retryable: true,
+            details: {},
+          },
+        });
+      }
+    }, deadlineMs);
+
+    inFlightCommands.set(cmdId, { abortController, timeoutId, action, startedAt: Date.now() });
+
+    // 1. Send ACCEPTED acknowledgement
+    bridgeSend({
+      v: 1,
+      type: "accepted",
+      id: cmdId,
+      params: { action, acceptedAt: Date.now() },
+    });
+
+    try {
+      const result = await handleAction(action, params);
+      if (!inFlightCommands.has(cmdId)) {
+        return; // Timed out or cancelled
+      }
+      clearTimeout(timeoutId);
+      inFlightCommands.delete(cmdId);
+
+      bridgeSend({
+        v: 1,
+        type: "result",
+        id: cmdId,
+        action,
+        result,
+      });
+    } catch (err) {
+      if (!inFlightCommands.has(cmdId)) {
+        return; // Timed out or cancelled
+      }
+      clearTimeout(timeoutId);
+      inFlightCommands.delete(cmdId);
+
+      console.error(`[bridge] Action '${action}' error:`, err.message);
+      let errCode = "INTERNAL_ERROR";
+      if (
+        err.message.includes("Cross-origin") ||
+        err.message.includes("Tab protocol") ||
+        err.message.includes("Target protocol") ||
+        err.message.includes("userinfo")
+      ) {
+        errCode = "SAME_ORIGIN_VIOLATION";
+      } else if (err.message.includes("ELEMENT_NOT_FOUND")) {
+        errCode = "ELEMENT_NOT_FOUND";
+      } else if (err.message.includes("UNSUPPORTED_ACTION_PARAM")) {
+        errCode = "UNSUPPORTED_ACTION_PARAM";
+      } else if (err.message.includes("Timeout waiting")) {
+        errCode = "TIMEOUT";
+      }
+
+      bridgeSend({
+        v: 1,
+        type: "error",
+        id: cmdId,
+        action,
+        error: {
+          code: errCode,
+          message: err.message,
+          retryable: errCode === "TIMEOUT",
+          details: {},
+        },
+      });
+    }
+    return;
+  }
+
+  // Handle cancel
+  if (envelope.type === "cancel") {
+    const targetId = envelope.params && envelope.params.targetCommandId;
+    let cancelled = false;
+    if (targetId && inFlightCommands.has(targetId)) {
+      const entry = inFlightCommands.get(targetId);
+      clearTimeout(entry.timeoutId);
+      entry.abortController.abort(new Error("CANCELLED"));
+      inFlightCommands.delete(targetId);
+      cancelled = true;
+
+      bridgeSend({
+        v: 1,
+        type: "error",
+        id: targetId,
+        action: entry.action,
+        error: {
+          code: "CANCELLED",
+          message: "Command was cancelled by gateway",
+          retryable: false,
+          details: {},
+        },
+      });
+    }
+    if (targetId && activeJobs.has(targetId)) {
+      activeJobs.delete(targetId);
+      cancelled = true;
+    }
+    bridgeSend({
+      v: 1,
+      type: "result",
+      id: envelope.id || ("cancel-" + Date.now()),
+      result: { cancelled, targetCommandId: targetId },
+    });
+    return;
+  }
+
+  // Handle verification resume/resolved
+  if (envelope.type === "verification.resolved" || envelope.type === "verification.resume") {
+    resumeVerification();
+    return;
+  }
+
+  // Handle ping
+  if (envelope.type === "ping" || envelope.type === "bridge.ping") {
+    bridgeSend({
+      v: 1,
+      type: "pong",
+      id: envelope.id || "pong-" + Date.now(),
+      params: { at: Date.now() },
+    });
+    return;
+  }
+
+  // Backward-compatible ingest.job message
+  if (envelope.type === "ingest.job") {
+    enqueueLegacyJob(envelope.job, "websocket");
+    return;
+  }
+}
+
+// ── WebSocket Bridge Connection ─────────────────────────────────────────────
+function bridgeSend(message) {
+  if (!bridgeSocket || bridgeSocket.readyState !== WebSocket.OPEN) return false;
+  bridgeSocket.send(JSON.stringify(message));
+  return true;
+}
+
+function closeBridgeSocket() {
+  if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
+  bridgeHeartbeat = null;
+  if (bridgeSocket) {
+    bridgeSocket.onclose = null;
+    try {
+      bridgeSocket.close();
+    } catch {}
+  }
+  bridgeSocket = null;
+  updateState("disconnected");
+}
+
+function scheduleBridgeReconnect() {
+  if (bridgeReconnectTimeout) return;
+  reconnectAttempts++;
+  // Exponential backoff with random jitter (1s, 1.5s, 2.25s ... capped at 30s)
+  const baseDelay = Math.min(30000, 1000 * Math.pow(1.5, Math.min(reconnectAttempts, 8)));
+  const jitter = Math.floor(Math.random() * 1000);
+  const delay = baseDelay + jitter;
+
+  console.log(`[bridge] Scheduling reconnect in ${(delay / 1000).toFixed(1)}s (attempt ${reconnectAttempts})`);
+  bridgeReconnectTimeout = setTimeout(() => {
+    bridgeReconnectTimeout = null;
+    connectBridge();
+  }, delay);
+}
+
+async function connectBridge() {
+  if (bridgeSocket && (bridgeSocket.readyState === WebSocket.OPEN || bridgeSocket.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+  if (bridgeConnecting) return bridgeConnecting;
+
+  bridgeConnecting = (async () => {
+    try {
+      let stored = await chrome.storage.local.get(["gatewayUrl", "pairingToken"]);
+      let token = stored.pairingToken;
+      let wsUrl = stored.gatewayUrl;
+
+      // Auto-pair if missing token
+      if (!token) {
+        const pairResponse = await fetch(`${HELPER}/browser/pair`, { cache: "no-store" });
+        if (!pairResponse.ok) throw new Error(`pair HTTP ${pairResponse.status}`);
+        const pair = await pairResponse.json();
+        token = pair.token;
+        wsUrl = pair.wsUrl || `${HELPER.replace("http", "ws")}/browser/v1/ws`;
+        await chrome.storage.local.set({ gatewayUrl: wsUrl, pairingToken: token });
+      }
+
+      if (!wsUrl) wsUrl = "ws://127.0.0.1:8766/browser/v1/ws";
+      const fullUrl = `${wsUrl}${wsUrl.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`;
+
+      const socket = new WebSocket(fullUrl);
+      bridgeSocket = socket;
+
+      socket.onopen = () => {
+        console.log("[bridge] WebSocket connected to", wsUrl);
+        reconnectAttempts = 0;
+        updateState("connected");
+
+        // Authenticate envelope
+        bridgeSend({
+          v: 1,
+          type: "authenticate",
+          id: "auth-" + Date.now(),
+          auth: { token },
+        });
+
+        // 20s Heartbeat keeps MV3 worker active
+        if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
+        bridgeHeartbeat = setInterval(() => {
+          bridgeSend({
+            v: 1,
+            type: "ping",
+            id: "ping-" + Date.now(),
+            params: { at: Date.now() },
+          });
+        }, 20000);
+      };
+
+      socket.onmessage = (event) => {
+        let envelope;
+        try {
+          envelope = JSON.parse(event.data);
+        } catch {
+          return;
+        }
+        dispatchEnvelope(envelope);
+      };
+
+      socket.onerror = (err) => {
+        console.warn("[bridge] WebSocket error:", err);
+      };
+
+      socket.onclose = () => {
+        console.log("[bridge] WebSocket disconnected");
+        if (bridgeSocket === socket) closeBridgeSocket();
+        fallbackHttpLoop();
+        scheduleBridgeReconnect();
+      };
+    } catch (error) {
+      console.warn("[bridge] WebSocket unavailable, falling back to HTTP:", error.message);
+      closeBridgeSocket();
+      fallbackHttpLoop();
+      scheduleBridgeReconnect();
+    }
+  })().finally(() => {
+    bridgeConnecting = null;
+  });
+
+  return bridgeConnecting;
+}
+
+// ── HTTP Long-Poll Fallback ──────────────────────────────────────────────────
+let looping = false;
+function enqueueLegacyJob(job, transport) {
+  if (!job || !job.id) return;
+  if (transport === "websocket") {
+    bridgeSend({
+      v: 1,
+      type: "accepted",
+      id: job.id,
+      jobId: job.id,
+      params: { kind: "legacy.ingest.job", jobId: job.id },
+    });
+  }
+  jobChain = jobChain.then(() => runJob(job)).catch((err) => console.error("[bridge] Job failed:", err));
+}
+
+async function fallbackHttpLoop() {
   if (looping) return;
   looping = true;
   try {
-    // Long-poll: returns as soon as a job exists, and the open request is what keeps
-    // this MV3 service worker from being shut down between jobs.
-    for (;;) {
+    while (!bridgeSocket || bridgeSocket.readyState !== WebSocket.OPEN) {
       let jobs = [];
       try {
         const r = await fetch(`${HELPER}/ingest/jobs?wait=25`);
         jobs = (await r.json()).jobs || [];
       } catch {
-        // Helper down (launcher not running) — back off, the alarm will retry.
         await new Promise((s) => setTimeout(s, 5000));
         return;
       }
-      for (const job of jobs) await runJob(job);
+      for (const job of jobs) enqueueLegacyJob(job, "http");
     }
   } finally {
     looping = false;
   }
 }
 
-// The alarm is the safety net: if Chrome kills the worker mid-poll, this restarts it.
+// ── Top-Level Listeners (MV3 Requirement) ───────────────────────────────────
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.alarms.create("poll", { periodInMinutes: 1 });
-  loop();
+  chrome.alarms.create("bridge_heartbeat_alarm", { periodInMinutes: 1 });
+  connectBridge();
 });
-chrome.runtime.onStartup.addListener(loop);
-chrome.alarms.onAlarm.addListener(loop);
-loop();
+
+chrome.runtime.onStartup.addListener(connectBridge);
+chrome.alarms.onAlarm.addListener(connectBridge);
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.action === "connect") {
+    closeBridgeSocket();
+    connectBridge();
+    sendResponse({ ok: true });
+  } else if (msg.action === "disconnect") {
+    closeBridgeSocket();
+    sendResponse({ ok: true });
+  } else if (msg.action === "resumeVerification") {
+    resumeVerification();
+    sendResponse({ ok: true });
+  }
+  return true;
+});
+
+// Auto-start
+connectBridge();

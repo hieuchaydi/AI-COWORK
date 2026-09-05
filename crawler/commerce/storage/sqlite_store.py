@@ -1,27 +1,43 @@
 """
-SQLite storage engine for monitored products, price snapshots, and alert history.
-Safe, local-first database implementation.
+SQLite storage engine for monitored products, price snapshots, alert history,
+and Profit Guard pricing recommendations, approvals, and audit logs.
+Safe, local-first database implementation with CWD-independent path resolution.
 """
 
-import json
-import sqlite3
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+import json
+import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+import sqlite3
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..interfaces import ProductIdentity, ProductSnapshot
+from ..profit_guard.models import (
+    ApprovalStatus,
+    AuditAction,
+    CostProfile,
+    PriceRecommendation,
+    PricingAuditLogEntry,
+)
 
 
 class CommerceSqliteStore:
-    """Thread-safe SQLite store for product snapshots and alerts."""
+    """Thread-safe SQLite store for product snapshots, alerts, and Profit Guard."""
 
     def __init__(self, db_path: Optional[str] = None):
         if db_path is None:
-            default_dir = Path("outputs/commerce")
-            default_dir.mkdir(parents=True, exist_ok=True)
-            self.db_path = str(default_dir / "commerce_monitor.db")
+            env_path = os.getenv("COMMERCE_DB_PATH")
+            if env_path:
+                self.db_path = str(Path(env_path).resolve())
+            else:
+                # Resolve relative to project root regardless of CWD
+                project_root = Path(__file__).resolve().parents[3]
+                default_dir = project_root / "outputs" / "commerce"
+                default_dir.mkdir(parents=True, exist_ok=True)
+                self.db_path = str(default_dir / "commerce_monitor.db")
         else:
-            p = Path(db_path)
+            p = Path(db_path).resolve()
             p.parent.mkdir(parents=True, exist_ok=True)
             self.db_path = str(p)
 
@@ -38,6 +54,16 @@ class CommerceSqliteStore:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("PRAGMA journal_mode = WAL")
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS platform_backoffs (
+                    platform TEXT PRIMARY KEY,
+                    backoff_until TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS monitored_products (
@@ -96,17 +122,93 @@ class CommerceSqliteStore:
                 )
                 """
             )
+
+            # ── Profit Guard Tables ──────────────────────────────────────
             cursor.execute(
                 """
-                CREATE TABLE IF NOT EXISTS platform_backoffs (
-                    platform TEXT PRIMARY KEY,
-                    backoff_until TEXT NOT NULL,
+                CREATE TABLE IF NOT EXISTS profit_guard_profiles (
+                    sku_id TEXT PRIMARY KEY,
+                    platform TEXT NOT NULL,
+                    product_id TEXT NOT NULL,
+                    cost_price TEXT NOT NULL,
+                    platform_fee_pct TEXT NOT NULL,
+                    platform_fee_fixed TEXT NOT NULL DEFAULT '0',
+                    tax_pct TEXT NOT NULL DEFAULT '0',
+                    additional_cost TEXT NOT NULL DEFAULT '0',
+                    min_margin_pct TEXT NOT NULL,
+                    max_price_change_pct TEXT NOT NULL DEFAULT '0.10',
+                    cooldown_seconds INTEGER NOT NULL DEFAULT 3600,
+                    authorization_ref TEXT,
+                    seller_provider TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    updated_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS price_recommendations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sku_id TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    current_price TEXT NOT NULL,
+                    market_price TEXT,
+                    breakeven_price TEXT NOT NULL,
+                    floor_price TEXT NOT NULL,
+                    recommended_price TEXT NOT NULL,
+                    profit_amount TEXT NOT NULL,
+                    profit_margin_pct TEXT NOT NULL,
                     reason TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    expires_at TEXT NOT NULL,
+                    approver TEXT,
+                    rejection_reason TEXT,
+                    applied_at TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_rec_sku_status
+                ON price_recommendations (sku_id, status)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pricing_audit_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recommendation_id INTEGER,
+                    sku_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    input_snapshot_json TEXT NOT NULL,
+                    formula_metadata_json TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_audit_sku
+                ON pricing_audit_logs (sku_id, created_at)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS seller_provider_backoff (
+                    provider_name TEXT PRIMARY KEY,
+                    backoff_until REAL NOT NULL,
+                    failure_count INTEGER DEFAULT 0,
+                    last_error TEXT
                 )
                 """
             )
             conn.commit()
+
+    # ── Monitored Products & Snapshots ──────────────────────────────────
 
     def upsert_monitored_product(
         self,
@@ -282,6 +384,8 @@ class CommerceSqliteStore:
             conn.execute("UPDATE price_alerts SET delivered = 1 WHERE id = ?", (alert_id,))
             conn.commit()
 
+    # ── Profit Guard Store Operations ───────────────────────────────────
+
     def set_platform_backoff(
         self,
         platform: str,
@@ -324,6 +428,322 @@ class CommerceSqliteStore:
             conn.execute("DELETE FROM platform_backoffs WHERE platform = ?", (platform,))
             conn.commit()
 
+    def upsert_cost_profile(self, profile: CostProfile):
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO profit_guard_profiles (
+                    sku_id, platform, product_id, cost_price, platform_fee_pct,
+                    platform_fee_fixed, tax_pct, additional_cost, min_margin_pct,
+                    max_price_change_pct, cooldown_seconds, authorization_ref,
+                    seller_provider, is_active, updated_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(sku_id) DO UPDATE SET
+                    platform = excluded.platform,
+                    product_id = excluded.product_id,
+                    cost_price = excluded.cost_price,
+                    platform_fee_pct = excluded.platform_fee_pct,
+                    platform_fee_fixed = excluded.platform_fee_fixed,
+                    tax_pct = excluded.tax_pct,
+                    additional_cost = excluded.additional_cost,
+                    min_margin_pct = excluded.min_margin_pct,
+                    max_price_change_pct = excluded.max_price_change_pct,
+                    cooldown_seconds = excluded.cooldown_seconds,
+                    authorization_ref = excluded.authorization_ref,
+                    seller_provider = excluded.seller_provider,
+                    is_active = excluded.is_active,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    profile.sku_id,
+                    profile.platform,
+                    profile.product_id,
+                    str(profile.cost_price),
+                    str(profile.platform_fee_pct),
+                    str(profile.platform_fee_fixed),
+                    str(profile.tax_pct),
+                    str(profile.additional_cost),
+                    str(profile.min_margin_pct),
+                    str(profile.max_price_change_pct),
+                    profile.cooldown_seconds,
+                    profile.authorization_ref,
+                    profile.seller_provider,
+                    1 if profile.is_active else 0,
+                    now_iso,
+                    profile.created_at.isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def get_cost_profile(self, sku_id: str) -> Optional[CostProfile]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM profit_guard_profiles WHERE sku_id = ?", (sku_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return CostProfile(
+                sku_id=row["sku_id"],
+                platform=row["platform"],
+                product_id=row["product_id"],
+                cost_price=Decimal(row["cost_price"]),
+                platform_fee_pct=Decimal(row["platform_fee_pct"]),
+                platform_fee_fixed=Decimal(row["platform_fee_fixed"]),
+                tax_pct=Decimal(row["tax_pct"]),
+                additional_cost=Decimal(row["additional_cost"]),
+                min_margin_pct=Decimal(row["min_margin_pct"]),
+                max_price_change_pct=Decimal(row["max_price_change_pct"]),
+                cooldown_seconds=row["cooldown_seconds"],
+                authorization_ref=row["authorization_ref"],
+                seller_provider=row["seller_provider"],
+                is_active=bool(row["is_active"]),
+                updated_at=datetime.fromisoformat(row["updated_at"]),
+                created_at=datetime.fromisoformat(row["created_at"]),
+            )
+
+    def list_cost_profiles(self, active_only: bool = True) -> List[CostProfile]:
+        query = "SELECT * FROM profit_guard_profiles"
+        if active_only:
+            query += " WHERE is_active = 1"
+        query += " ORDER BY sku_id ASC"
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            return [
+                CostProfile(
+                    sku_id=r["sku_id"],
+                    platform=r["platform"],
+                    product_id=r["product_id"],
+                    cost_price=Decimal(r["cost_price"]),
+                    platform_fee_pct=Decimal(r["platform_fee_pct"]),
+                    platform_fee_fixed=Decimal(r["platform_fee_fixed"]),
+                    tax_pct=Decimal(r["tax_pct"]),
+                    additional_cost=Decimal(r["additional_cost"]),
+                    min_margin_pct=Decimal(r["min_margin_pct"]),
+                    max_price_change_pct=Decimal(r["max_price_change_pct"]),
+                    cooldown_seconds=r["cooldown_seconds"],
+                    authorization_ref=r["authorization_ref"],
+                    seller_provider=r["seller_provider"],
+                    is_active=bool(r["is_active"]),
+                    updated_at=datetime.fromisoformat(r["updated_at"]),
+                    created_at=datetime.fromisoformat(r["created_at"]),
+                )
+                for r in rows
+            ]
+
+    def save_recommendation(self, rec: PriceRecommendation) -> int:
+        now_iso = rec.created_at.isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO price_recommendations (
+                    sku_id, platform, current_price, market_price,
+                    breakeven_price, floor_price, recommended_price,
+                    profit_amount, profit_margin_pct, reason, status,
+                    expires_at, approver, rejection_reason, applied_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    rec.sku_id,
+                    rec.platform,
+                    str(rec.current_price),
+                    str(rec.market_price) if rec.market_price is not None else None,
+                    str(rec.breakeven_price),
+                    str(rec.floor_price),
+                    str(rec.recommended_price),
+                    str(rec.profit_amount),
+                    str(rec.profit_margin_pct),
+                    rec.reason,
+                    rec.status.value,
+                    rec.expires_at.isoformat(),
+                    rec.approver,
+                    rec.rejection_reason,
+                    rec.applied_at.isoformat() if rec.applied_at else None,
+                    now_iso,
+                ),
+            )
+            conn.commit()
+            return cursor.lastrowid or 0
+
+    def get_recommendation(self, rec_id: int) -> Optional[PriceRecommendation]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM price_recommendations WHERE id = ?", (rec_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return self._row_to_recommendation(row)
+
+    def get_latest_recommendation(self, sku_id: str) -> Optional[PriceRecommendation]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM price_recommendations WHERE sku_id = ? ORDER BY created_at DESC LIMIT 1",
+                (sku_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return self._row_to_recommendation(row)
+
+    def list_recommendations(
+        self,
+        status: Optional[ApprovalStatus] = None,
+        sku_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[PriceRecommendation]:
+        query = "SELECT * FROM price_recommendations WHERE 1=1"
+        params: List[Any] = []
+
+        if status:
+            query += " AND status = ?"
+            params.append(status.value)
+        if sku_id:
+            query += " AND sku_id = ?"
+            params.append(sku_id)
+
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            return [self._row_to_recommendation(r) for r in rows]
+
+    def update_recommendation_status(
+        self,
+        rec_id: int,
+        status: ApprovalStatus,
+        approver: Optional[str] = None,
+        rejection_reason: Optional[str] = None,
+        applied_at: Optional[datetime] = None,
+        expected_status: Optional[ApprovalStatus] = None,
+    ) -> bool:
+        """
+        Atomically updates recommendation status with optimistic concurrency control.
+        If expected_status is provided, update only succeeds if current status matches expected_status.
+        """
+        query = "UPDATE price_recommendations SET status = ?"
+        params: List[Any] = [status.value]
+
+        if approver is not None:
+            query += ", approver = ?"
+            params.append(approver)
+        if rejection_reason is not None:
+            query += ", rejection_reason = ?"
+            params.append(rejection_reason)
+        if applied_at is not None:
+            query += ", applied_at = ?"
+            params.append(applied_at.isoformat())
+
+        query += " WHERE id = ?"
+        params.append(rec_id)
+
+        if expected_status is not None:
+            query += " AND status = ?"
+            params.append(expected_status.value)
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def record_audit_log(self, entry: PricingAuditLogEntry) -> int:
+        now_iso = entry.created_at.isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO pricing_audit_logs (
+                    recommendation_id, sku_id, action, actor,
+                    input_snapshot_json, formula_metadata_json, result_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry.recommendation_id,
+                    entry.sku_id,
+                    entry.action.value,
+                    entry.actor,
+                    json.dumps(entry.input_snapshot, ensure_ascii=False),
+                    json.dumps(entry.formula_metadata, ensure_ascii=False),
+                    json.dumps(entry.result, ensure_ascii=False),
+                    now_iso,
+                ),
+            )
+            conn.commit()
+            return cursor.lastrowid or 0
+
+    def get_audit_history(self, sku_id: Optional[str] = None, limit: int = 50) -> List[PricingAuditLogEntry]:
+        query = "SELECT * FROM pricing_audit_logs"
+        params: List[Any] = []
+        if sku_id:
+            query += " WHERE sku_id = ?"
+            params.append(sku_id)
+
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            return [
+                PricingAuditLogEntry(
+                    id=r["id"],
+                    recommendation_id=r["recommendation_id"],
+                    sku_id=r["sku_id"],
+                    action=AuditAction(r["action"]),
+                    actor=r["actor"],
+                    input_snapshot=json.loads(r["input_snapshot_json"]),
+                    formula_metadata=json.loads(r["formula_metadata_json"]),
+                    result=json.loads(r["result_json"]),
+                    created_at=datetime.fromisoformat(r["created_at"]),
+                )
+                for r in rows
+            ]
+
+    def get_provider_backoff(self, provider_name: str) -> Tuple[float, int]:
+        """Returns (backoff_until_timestamp, failure_count)."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT backoff_until, failure_count FROM seller_provider_backoff WHERE provider_name = ?",
+                (provider_name.lower(),),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return (0.0, 0)
+            return (float(row["backoff_until"]), int(row["failure_count"]))
+
+    def record_provider_backoff(self, provider_name: str, backoff_until: float, failure_count: int, last_error: str):
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO seller_provider_backoff (provider_name, backoff_until, failure_count, last_error)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(provider_name) DO UPDATE SET
+                    backoff_until = excluded.backoff_until,
+                    failure_count = excluded.failure_count,
+                    last_error = excluded.last_error
+                """,
+                (provider_name.lower(), backoff_until, failure_count, last_error),
+            )
+            conn.commit()
+
+    def clear_provider_backoff(self, provider_name: str):
+        with self._get_connection() as conn:
+            conn.execute(
+                "DELETE FROM seller_provider_backoff WHERE provider_name = ?",
+                (provider_name.lower(),),
+            )
+            conn.commit()
+
     @staticmethod
     def _row_to_snapshot(row: sqlite3.Row) -> ProductSnapshot:
         raw_dict = {}
@@ -350,4 +770,26 @@ class CommerceSqliteStore:
             url=row["url"],
             raw_attributes=raw_dict,
             timestamp=datetime.fromisoformat(row["created_at"]),
+        )
+
+    @staticmethod
+    def _row_to_recommendation(row: sqlite3.Row) -> PriceRecommendation:
+        return PriceRecommendation(
+            id=row["id"],
+            sku_id=row["sku_id"],
+            platform=row["platform"],
+            current_price=Decimal(row["current_price"]),
+            market_price=Decimal(row["market_price"]) if row["market_price"] is not None else None,
+            breakeven_price=Decimal(row["breakeven_price"]),
+            floor_price=Decimal(row["floor_price"]),
+            recommended_price=Decimal(row["recommended_price"]),
+            profit_amount=Decimal(row["profit_amount"]),
+            profit_margin_pct=Decimal(row["profit_margin_pct"]),
+            reason=row["reason"],
+            status=ApprovalStatus(row["status"]),
+            expires_at=datetime.fromisoformat(row["expires_at"]),
+            approver=row["approver"],
+            rejection_reason=row["rejection_reason"],
+            applied_at=datetime.fromisoformat(row["applied_at"]) if row["applied_at"] else None,
+            created_at=datetime.fromisoformat(row["created_at"]),
         )

@@ -48,6 +48,12 @@ _CRAWL_TOOL_NAMES = {
     "commerce_monitor_list",
     "commerce_monitor_history",
     "commerce_monitor_check_all",
+    "configure_profit_guard",
+    "get_pricing_recommendation",
+    "list_pending_price_approvals",
+    "approve_price_change",
+    "reject_price_change",
+    "get_pricing_audit_history",
 }
 _DEV_SHELL_TOOL_NAMES = {
     "run_shell",
@@ -203,6 +209,17 @@ _CRAWL_KEYWORDS = {
     "cào video",
     "zip_folder",
     "download_media_and_zip",
+    "profit_guard",
+    "định giá",
+    "giá bán",
+    "lợi nhuận",
+    "biên lợi nhuận",
+    "giá sàn",
+    "giá hòa vốn",
+    "pricing",
+    "margin",
+    "phê duyệt giá",
+    "bảo vệ lợi nhuận",
 }
 
 _DEV_SHELL_KEYWORDS = {

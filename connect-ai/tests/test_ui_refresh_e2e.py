@@ -59,6 +59,9 @@ class E2EProvider(ProviderClient):
         self.calls.append([dict(m) for m in messages])
         return self._turns.pop(0)
 
+    def queue_turn(self, turn):
+        self._turns.append(turn)
+
     def capabilities(self, model):
         return ModelCapabilities()
 
@@ -284,6 +287,26 @@ async def test_ui_refresh_cross_cutting_e2e(fake_slack, tmp_path, monkeypatch):
         assert len(mgr.session_messages(SID)) == msgcount_before  # no new turn/message
         assert len(provider.calls) == calls_before  # provider not re-invoked
         assert not mgr.is_running(SID)
+
+        # -- Step 4b: re-enable Slack -> new post DOES wake the session and invoke provider --------
+        resp_unmute = client.post(
+            f"/v1/sessions/{SID}/connections",
+            json={"connector": "slack", "enabled": True},
+        ).json()
+        assert resp_unmute["ok"] is True
+        assert "slack" in mgr.effective_connectors(SID, "ops")
+
+        provider.queue_turn(_text("Handled post-reenable alert."))
+        calls_before_reenable = len(provider.calls)
+        msgcount_before_reenable = len(mgr.session_messages(SID))
+        reenabled_text = "third alert after re-enabling slack"
+
+        await fake_slack.inbound(channel=CHANNEL, user=USER, text=reenabled_text)
+        assert await _wait_until(
+            lambda: len(provider.calls) > calls_before_reenable
+        ), "provider was not re-invoked after re-enabling connector"
+        assert await _wait_until(lambda: not mgr.is_running(SID))
+        assert len(mgr.session_messages(SID)) > msgcount_before_reenable
 
         # -- Step 5: attention == the persona's account-unconnected connector recommends ----------
         detail = client.get("/v1/personas/ops").json()
