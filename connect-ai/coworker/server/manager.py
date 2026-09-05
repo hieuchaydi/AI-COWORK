@@ -462,6 +462,7 @@ class SessionManager:
             )
         if record is not None and record.grants:
             self._apply_grants(engine, record.grants)
+        engine.agent_name = agent_name
         self._engines[session_id] = engine
         if is_new_session:
             self._emit_session_created(session_id, agent_name)
@@ -508,6 +509,9 @@ class SessionManager:
     def _persona_of(self, session_id: str, persona_id: Optional[str] = None) -> str:
         if persona_id:
             return persona_id
+        engine = self._engines.get(session_id)
+        if engine is not None and getattr(engine, "agent_name", None):
+            return engine.agent_name
         record = self.session_store.load(session_id)
         return (record.agent if record else None) or self.personas.default_id()
 
@@ -2788,7 +2792,10 @@ class SessionManager:
         self._maybe_autotitle(session_id)
 
     def is_running(self, session_id: str) -> bool:
-        return session_id in self._running_sessions
+        return (
+            session_id in self._running_sessions
+            or session_id in self._autotitle_inflight
+        )
 
     async def _resume_wake(self, wake) -> None:
         await self.deliver_to_session(wake.session_id, self._wake_message(wake))
@@ -2803,6 +2810,15 @@ class SessionManager:
         by self-wake and channel-subscription delivery. `source` is the display-only MessageSource
         sidecar for connector messages (framed `message` stays the model-facing text).
         """
+        if source and "connector" in source:
+            connector = str(source["connector"])
+            if not self._inbound_connector_allowed(session_id, connector):
+                logger.info(
+                    "skipping delivery to session %s: connector %s is muted",
+                    session_id,
+                    connector,
+                )
+                return
         engine = self.get_engine(session_id)
         if engine is None:
             return
@@ -2945,6 +2961,8 @@ class SessionManager:
         sid = self.mention_sessions.get(thread_target)
         if sid and self.session_store.load(sid) is not None:
             # Follow-up tag in a thread we already own → steer the same session.
+            if not self._inbound_connector_allowed(sid, src.platform):
+                return
             msg = (
                 f"💬 Follow-up in your Slack thread ({chan}) from {who}: {event.text}\n"
                 f'(Reply in the thread with the send_message tool, target "{thread_target}" '

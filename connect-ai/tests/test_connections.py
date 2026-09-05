@@ -244,3 +244,57 @@ def test_muted_connector_tools_absent(tmp_path):
     # the un-muted session still has github tools; the muted session's engine omits them
     assert "github_search" in on_engine.registry.names()
     assert "github_search" not in off_engine.registry.names()
+
+
+def test_deliver_to_session_boundary_gates_muted_connector(tmp_path):
+    """deliver_to_session must drop deliveries from muted connectors before waking the engine,
+    and allow delivery once re-enabled."""
+    from coworker.engine import AssistantTurn
+
+    turns = [AssistantTurn(text="ok", finish_reason="stop")]
+    mgr = SessionManager(workspace=tmp_path, provider=ScriptedProvider(turns))
+    mgr.secrets.put(
+        "slack:default",
+        {"bot_token": "xoxb-test", "app_token": "xapp-test", "enabled": True},
+    )
+    sid = "sBoundary"
+    mgr.session_store.save(
+        SessionRecord(
+            session_id=sid,
+            workspace=str(tmp_path),
+            model="gpt-5.5",
+            mode="interactive",
+            agent="cowork",
+        )
+    )
+    # Mute slack
+    mgr.session_connections.set(sid, "slack", False)
+    assert "slack" not in mgr.effective_connectors(sid, "cowork")
+
+    # Attempt deliver_to_session with source connector="slack"
+    asyncio.run(
+        mgr.deliver_to_session(
+            sid,
+            "slack message while muted",
+            source={"connector": "slack", "kind": "channel", "text": "test"},
+        )
+    )
+    assert len(mgr.session_messages(sid)) == 0
+    assert len(mgr.provider._turns) == 1  # provider was not called
+    assert not mgr.is_running(sid)
+
+    # Now un-mute (re-enable) slack
+    mgr.session_connections.set(sid, "slack", True)
+    assert "slack" in mgr.effective_connectors(sid, "cowork")
+
+    asyncio.run(
+        mgr.deliver_to_session(
+            sid,
+            "slack message after un-mute",
+            source={"connector": "slack", "kind": "channel", "text": "test2"},
+        )
+    )
+    assert len(mgr.session_messages(sid)) > 0
+    assert len(mgr.provider._turns) == 0  # provider turn consumed
+    assert not mgr.is_running(sid)
+
