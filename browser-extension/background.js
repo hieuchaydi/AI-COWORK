@@ -39,16 +39,21 @@ function updateState(newState, details = null) {
     verificationInfo = details;
     setBadge("PAUS", "#f9ab00");
   } else if (newState === "connected") {
-    verificationInfo = null;
-    setBadge("OK", "#137333");
+    if (!verificationInfo) {
+      setBadge("OK", "#137333");
+    } else {
+      setBadge("PAUS", "#f9ab00");
+    }
   } else if (newState === "busy") {
     setBadge("BUSY", "#1a73e8");
   } else {
-    verificationInfo = null;
-    setBadge("");
+    // disconnected
+    if (!verificationInfo) {
+      setBadge("");
+    }
   }
   chrome.storage.local.set({
-    extensionState,
+    extensionState: verificationInfo ? "awaiting_user_verification" : extensionState,
     verificationInfo,
     currentJob: activeJobs.size > 0 ? Array.from(activeJobs.values())[0] : null,
   });
@@ -153,11 +158,87 @@ async function resolveShopId(itemid, originalUrl, progress) {
   return null;
 }
 
+// Function injected and executed in the shopee.vn page context
+async function inTabExtractShopeeRatings(itemid, shopid, offset, limit) {
+  const url = `/api/v2/item/get_ratings?filter=0&flag=1&itemid=${itemid}&limit=${limit}&offset=${offset}&shopid=${shopid}&type=0`;
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "x-requested-with": "XMLHttpRequest",
+        "accept": "application/json"
+      },
+      credentials: "include"
+    });
+    if (!res.ok) {
+      if (res.status === 403 || res.url.includes("/verify/traffic")) {
+        return { ok: false, verificationRequired: true, status: res.status };
+      }
+      return { ok: false, status: res.status, error: "HTTP " + res.status };
+    }
+    const json = await res.json();
+    if (json.error === 90309999 || (json.data && json.data.is_login === false)) {
+      return { ok: false, verificationRequired: true, is_login: false, error: "Shopee verification / login required" };
+    }
+    return { ok: true, data: json.data };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
 async function extractShopeeReviews(job, progress) {
   const parsed = idsFrom(job.url);
   let itemid = parsed.itemid;
   let shopid = parsed.shopid;
   if (!itemid) throw new Error(`Không đọc được itemid từ URL: ${job.url}`);
+
+  // 1. Check for open Shopee tab
+  let targetTab = null;
+  try {
+    const tabs = await chrome.tabs.query({});
+    targetTab = tabs.find((t) => t.url && (t.url.includes(itemid) || (shopid && t.url.includes(shopid))));
+    if (!targetTab) {
+      targetTab = tabs.find((t) => t.url && t.url.includes("shopee.vn"));
+    }
+  } catch (err) {
+    console.warn("[bridge] Error querying tabs:", err.message);
+  }
+
+  // 2. If no tab open, open product page in background
+  if (!targetTab) {
+    try {
+      if (progress) await progress({ stage: "open-tab", message: "Đang mở tab Shopee...", percent: 10 });
+      targetTab = await chrome.tabs.create({ url: job.url, active: false });
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 12000);
+        const onUpdated = (tId, info) => {
+          if (tId === targetTab.id && info.status === "complete") {
+            clearTimeout(timer);
+            chrome.tabs.onUpdated.removeListener(onUpdated);
+            resolve();
+          }
+        };
+        chrome.tabs.onUpdated.addListener(onUpdated);
+      });
+    } catch (err) {
+      console.warn("[bridge] Failed to create tab:", err.message);
+    }
+  }
+
+  // 3. Resolve shopid: try tab DOM first, then fallback to HTTP resolve
+  if (!shopid && targetTab && targetTab.id) {
+    try {
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: targetTab.id },
+        func: () => {
+          const html = document.documentElement.innerHTML;
+          const m = html.match(/"shopid"\s*:\s*"?(\d+)/) || html.match(/"shop_id"\s*:\s*"?(\d+)/);
+          return m ? m[1] : null;
+        },
+      });
+      if (res && res.result) shopid = res.result;
+    } catch {}
+  }
+
   if (!shopid) shopid = await resolveShopId(itemid, job.url, progress);
   if (!shopid) throw new Error(`Không tìm thấy shopid cho item ${itemid}`);
 
@@ -166,26 +247,69 @@ async function extractShopeeReviews(job, progress) {
   let total = null;
 
   while (all.length < MAX_REVIEWS) {
-    const apiUrl = `https://shopee.vn/api/v2/item/get_ratings?filter=0&flag=1&itemid=${itemid}&limit=${PAGE_SIZE}&offset=${offset}&shopid=${shopid}&type=0`;
-    const res = await fetch(apiUrl);
-    if (!res.ok) {
-      if (res.status === 403 || res.url.includes("/verify/traffic")) {
+    let result = null;
+
+    // A. Preferred path: In-tab fetch with user cookies & anti-bot tokens
+    if (targetTab && targetTab.id) {
+      try {
+        const [execRes] = await chrome.scripting.executeScript({
+          target: { tabId: targetTab.id },
+          func: inTabExtractShopeeRatings,
+          args: [itemid, shopid, offset, PAGE_SIZE],
+        });
+        if (execRes && execRes.result) {
+          result = execRes.result;
+        }
+      } catch (scriptErr) {
+        console.warn("[bridge] In-tab execution failed, trying direct fetch:", scriptErr.message);
+      }
+    }
+
+    // B. Fallback path: Background fetch with proper headers
+    if (!result) {
+      const apiUrl = `https://shopee.vn/api/v2/item/get_ratings?filter=0&flag=1&itemid=${itemid}&limit=${PAGE_SIZE}&offset=${offset}&shopid=${shopid}&type=0`;
+      const res = await fetch(apiUrl, {
+        headers: { "X-Requested-With": "XMLHttpRequest", "Accept": "application/json" },
+      });
+      if (!res.ok) {
+        if (res.status === 403 || res.url.includes("/verify/traffic")) {
+          result = { ok: false, verificationRequired: true, status: res.status };
+        } else {
+          throw new Error(`Shopee API error HTTP ${res.status}`);
+        }
+      } else {
+        const json = await res.json();
+        if (json.error === 90309999 || (json.data && json.data.is_login === false)) {
+          result = { ok: false, verificationRequired: true, error: "Shopee error 90309999 (is_login=false)" };
+        } else {
+          result = { ok: true, data: json.data };
+        }
+      }
+    }
+
+    if (!result.ok) {
+      if (result.verificationRequired) {
+        // Bring tab to front so user can easily solve challenge or log in
+        if (targetTab && targetTab.id) {
+          try {
+            await chrome.tabs.update(targetTab.id, { active: true });
+            const tabObj = await chrome.tabs.get(targetTab.id);
+            if (tabObj.windowId) await chrome.windows.update(tabObj.windowId, { focused: true });
+          } catch {}
+        }
         throw new Error("Shopee challenge / verification required");
       }
-      throw new Error(`Shopee API error HTTP ${res.status}`);
+      throw new Error(result.error || `Shopee extraction failed with status ${result.status}`);
     }
-    const json = await res.json();
-    if (json.error === 90309999 || (json.data && json.data.is_login === false)) {
-      throw new Error("Shopee error 90309999 (is_login=false)");
-    }
-    const ratings = (json.data && json.data.ratings) || [];
+
+    const ratings = (result.data && result.data.ratings) || [];
     if (!ratings.length) break;
-    if (total === null) total = ratingTotal(json);
+    if (total === null) total = ratingTotal(result);
 
     for (const r of ratings) all.push(normaliseRating(r));
     if (progress) {
       await progress({
-        stage: "fetch-background",
+        stage: "fetch",
         message: `Đã lấy ${all.length} đánh giá`,
         rows: all.length,
         percent: crawlPercent(all.length, total, 20, 70),
@@ -252,6 +376,7 @@ function triggerVerificationRequired(details) {
 
 function resumeVerification() {
   console.log("[bridge] Resuming verification");
+  verificationInfo = null;
   updateState("connected");
   if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
     bridgeSend({
@@ -875,17 +1000,25 @@ function closeBridgeSocket() {
   if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
   bridgeHeartbeat = null;
   if (bridgeSocket) {
-    bridgeSocket.onclose = null;
+    const s = bridgeSocket;
+    bridgeSocket = null;
+    s.onclose = null;
+    s.onerror = null;
+    s.onmessage = null;
     try {
-      bridgeSocket.close();
+      if (s.readyState === WebSocket.OPEN || s.readyState === WebSocket.CONNECTING) {
+        s.close(1000, "Normal closure");
+      }
     } catch {}
   }
-  bridgeSocket = null;
   updateState("disconnected");
 }
 
 function scheduleBridgeReconnect() {
   if (bridgeReconnectTimeout) return;
+  if (bridgeSocket && (bridgeSocket.readyState === WebSocket.OPEN || bridgeSocket.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
   reconnectAttempts++;
   // Exponential backoff with random jitter (1s, 1.5s, 2.25s ... capped at 30s)
   const baseDelay = Math.min(30000, 1000 * Math.pow(1.5, Math.min(reconnectAttempts, 8)));
@@ -953,6 +1086,10 @@ async function connectBridge(overrideUrl, overrideToken) {
       socket.onopen = () => {
         opened = true;
         console.log("[bridge] WebSocket connected to", wsUrl);
+        if (bridgeReconnectTimeout) {
+          clearTimeout(bridgeReconnectTimeout);
+          bridgeReconnectTimeout = null;
+        }
         reconnectAttempts = 0;
         updateState("connected");
 
@@ -999,20 +1136,36 @@ async function connectBridge(overrideUrl, overrideToken) {
 
       socket.onclose = (ev) => {
         console.log("[bridge] WebSocket disconnected", ev.code, ev.reason);
-        if (bridgeSocket === socket) closeBridgeSocket();
-        if (!opened) {
-          console.warn("[bridge] Handshake failed or rejected by server, clearing pairing token for refresh");
+        if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
+        bridgeHeartbeat = null;
+        if (bridgeSocket === socket) {
+          bridgeSocket = null;
+          updateState("disconnected");
+        }
+        // ONLY clear pairingToken when explicitly rejected by server (code 4001, 4003)
+        if (ev.code === 4001 || ev.code === 4003) {
+          console.warn("[bridge] Authentication rejected by server, clearing pairing token");
           chrome.storage.local.remove("pairingToken");
-          if (stored.fallbackWsUrl && wsUrl !== stored.fallbackWsUrl) {
-            chrome.storage.local.set({ gatewayUrl: stored.fallbackWsUrl });
-          }
+        }
+        if (!opened && stored.fallbackWsUrl && wsUrl !== stored.fallbackWsUrl) {
+          chrome.storage.local.set({ gatewayUrl: stored.fallbackWsUrl });
         }
         fallbackHttpLoop();
         scheduleBridgeReconnect();
       };
     } catch (error) {
       console.warn("[bridge] WebSocket unavailable, falling back to HTTP:", error.message);
-      closeBridgeSocket();
+      if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
+      bridgeHeartbeat = null;
+      if (bridgeSocket) {
+        try {
+          if (bridgeSocket.readyState === WebSocket.OPEN || bridgeSocket.readyState === WebSocket.CONNECTING) {
+            bridgeSocket.close();
+          }
+        } catch {}
+        bridgeSocket = null;
+      }
+      updateState("disconnected");
       fallbackHttpLoop();
       scheduleBridgeReconnect();
     }

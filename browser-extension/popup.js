@@ -59,7 +59,14 @@ async function loadTabs() {
     tabs.slice(0, 8).forEach((tab) => {
       const li = document.createElement("li");
       li.className = "tab-item";
-      const title = document.createElement("span");
+      li.style.cursor = "pointer";
+      li.title = "Bấm để chuyển tới tab: " + (tab.title || tab.url || "");
+      li.addEventListener("click", async () => {
+        try {
+          await chrome.tabs.update(tab.id, { active: true });
+          if (tab.windowId) await chrome.windows.update(tab.windowId, { focused: true });
+        } catch {}
+      });
       title.textContent = (tab.title || tab.url || `Tab ${tab.id}`).slice(0, 32);
       title.title = tab.url || "";
       const idSpan = document.createElement("span");
