@@ -26,6 +26,7 @@ from browser_bridge.actions import (
     DomQueryParams,
     FetchSameOriginParams,
     PageNavigateParams,
+    PageScrollParams,
     TabOpenParams,
     validate_action_params,
 )
@@ -187,10 +188,12 @@ def test_action_registry_contains_18_actions():
         "page.snapshot",
         "fetch.sameOrigin",
         "job.cancel",
+        "page.scroll",
+        "extension.reload",
     }
     registered = set(ALL_ACTIONS)
     assert expected_actions.issubset(registered)
-    assert len(ALL_ACTIONS) >= 18
+    assert len(ALL_ACTIONS) >= 20
 
 
 def test_action_param_validation():
@@ -218,6 +221,15 @@ def test_action_param_validation():
     # Valid fetch.sameOrigin
     fso = validate_action_params(ActionName.FETCH_SAME_ORIGIN, {"pathOrUrl": "/api/v4/items", "method": "GET"})
     assert isinstance(fso, FetchSameOriginParams)
+
+    # Valid page.scroll
+    psc = validate_action_params(ActionName.PAGE_SCROLL, {"deltaY": 400, "behavior": "smooth"})
+    assert isinstance(psc, PageScrollParams)
+    assert psc.deltaY == 400
+
+    # Valid extension.reload
+    rel = validate_action_params(ActionName.EXTENSION_RELOAD, {})
+    assert rel is not None
 
 
 # ── Transport & Correlation Tests ───────────────────────────────────────────

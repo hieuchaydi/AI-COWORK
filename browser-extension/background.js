@@ -1,4 +1,4 @@
-// AI Cowork — Manifest V3 Chrome Extension Browser Bridge (v2.0.0)
+// AI Cowork — Manifest V3 Chrome Extension Browser Bridge (v2.2.0)
 //
 // Realtime WebSocket control bridge & ingest worker.
 // Operates in the user's real Chrome profile with ordinary session cookies.
@@ -270,6 +270,7 @@ function inTabScrapeShopeePage() {
   // Tìm nút Next page
   const nextBtn = document.querySelector('button.shopee-icon-button--right')
     || document.querySelector('.shopee-page-controller button:last-child')
+    || document.querySelector('.shopee-pagination button:last-child')
     || document.querySelector('button[aria-label="Next page"]')
     || document.querySelector('button[aria-label="Trang tiếp"]');
 
@@ -281,6 +282,7 @@ function inTabScrapeShopeePage() {
       || nextBtn.getAttribute('aria-disabled') === 'true';
     if (!isDisabled) {
       hasNext = true;
+      nextBtn.scrollIntoView({ block: 'center', behavior: 'instant' });
       nextBtn.click();
     }
   }
@@ -297,31 +299,117 @@ async function inTabExtractShopeeDOM(tabId, maxReviews, progress) {
     await progress({
       stage: "dom-scroll",
       message: "Đang cuộn trang đến phần đánh giá sản phẩm...",
-      percent: 25,
+      percent: 20,
     });
   }
 
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    func: () => {
-      const el = document.querySelector('.product-ratings-comments-view')
-        || document.querySelector('.product-ratings')
-        || document.querySelector('.shopee-product-rating')
-        || document.querySelector('[class*="product-rating"]');
-      if (el) {
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      } else {
-        window.scrollTo({ top: document.body.scrollHeight * 0.45, behavior: 'smooth' });
-      }
-    },
-  });
+  // Step 1: Click the "Đánh Giá" (rating) tab button to ensure review section is active
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        // Find rating tab button — look for buttons containing "Đánh Giá" text
+        const allButtons = document.querySelectorAll('div.flex > button, button[role="tab"], .product-tab button');
+        for (const btn of allButtons) {
+          const text = (btn.textContent || "").trim();
+          if (/đánh giá/i.test(text) || /rating/i.test(text)) {
+            btn.scrollIntoView({ block: 'center', behavior: 'instant' });
+            btn.click();
+            return { clicked: true, text };
+          }
+        }
+        return { clicked: false };
+      },
+    });
+  } catch {}
 
-  await new Promise((r) => setTimeout(r, 2500));
+  await new Promise((r) => setTimeout(r, 1500));
+
+  // Step 2: Progressive scrolling to trigger IntersectionObserver lazy-loading
+  const scrollSteps = [0.25, 0.45, 0.65, 0.80, 0.95];
+  for (const fraction of scrollSteps) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (frac) => {
+          window.scrollTo({ top: document.body.scrollHeight * frac, behavior: 'smooth' });
+        },
+        args: [fraction],
+      });
+    } catch {}
+    await new Promise((r) => setTimeout(r, 800));
+  }
+
+  // Step 3: Scroll to review section specifically
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        // Find the "ĐÁNH GIÁ SẢN PHẨM" heading or review container
+        const selectors = [
+          '.product-ratings-comments-view',
+          '.product-ratings',
+          '.shopee-product-rating',
+          '[class*="product-rating"]',
+        ];
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          if (el) {
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            return { found: sel };
+          }
+        }
+        // Fallback: find heading containing "ĐÁNH GIÁ"
+        const headings = document.querySelectorAll('h2, h3, div[class*="heading"], div[class*="title"]');
+        for (const h of headings) {
+          if (/đánh giá sản phẩm/i.test(h.textContent)) {
+            h.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            return { found: 'heading' };
+          }
+        }
+        window.scrollTo({ top: document.body.scrollHeight * 0.6, behavior: 'smooth' });
+        return { found: 'fallback-scroll' };
+      },
+    });
+  } catch {}
+
+  await new Promise((r) => setTimeout(r, 3000));
+
+  // Step 4: Wait for review cards to appear
+  let cardsFound = false;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const [checkRes] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => document.querySelectorAll('.shopee-product-rating').length,
+      });
+      if (checkRes && checkRes.result > 0) {
+        cardsFound = true;
+        break;
+      }
+    } catch {}
+    // Scroll down a bit more and wait
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => window.scrollBy({ top: 400, behavior: 'smooth' }),
+      });
+    } catch {}
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+
+  if (progress) {
+    await progress({
+      stage: "dom-crawl",
+      message: cardsFound ? "Tìm thấy đánh giá, đang cào..." : "Đang tìm đánh giá trên trang...",
+      percent: 30,
+    });
+  }
 
   const all = [];
   const seenKeys = new Set();
   let page = 1;
-  const maxPages = 40;
+  const maxPages = Math.min(100, Math.ceil(maxReviews / 6));
 
   while (all.length < maxReviews && page <= maxPages) {
     let res = null;
@@ -338,11 +426,12 @@ async function inTabExtractShopeeDOM(tabId, maxReviews, progress) {
 
     if (!res || !res.reviews || res.reviews.length === 0) {
       if (page === 1) {
+        // Retry: scroll down more and try again
         await chrome.scripting.executeScript({
           target: { tabId },
-          func: () => window.scrollBy({ top: 350, behavior: 'smooth' }),
+          func: () => window.scrollBy({ top: 500, behavior: 'smooth' }),
         });
-        await new Promise((r) => setTimeout(r, 2000));
+        await new Promise((r) => setTimeout(r, 3000));
         try {
           const [retryRes] = await chrome.scripting.executeScript({
             target: { tabId },
@@ -381,11 +470,14 @@ async function inTabExtractShopeeDOM(tabId, maxReviews, progress) {
     }
 
     if (progress) {
+      const pct = total => total > 0
+        ? Math.min(90, 30 + Math.floor((all.length / total) * 60))
+        : Math.min(90, 30 + page * 2);
       await progress({
         stage: "dom-crawl",
         message: `Đang cào trang ${page} (đã thu thập ${all.length} đánh giá)`,
         rows: all.length,
-        percent: Math.min(85, 30 + page * 2),
+        percent: pct(maxReviews),
       });
     }
 
@@ -394,7 +486,7 @@ async function inTabExtractShopeeDOM(tabId, maxReviews, progress) {
     }
 
     page++;
-    await new Promise((r) => setTimeout(r, 2000));
+    await new Promise((r) => setTimeout(r, 2500));
   }
 
   return all;
@@ -434,6 +526,29 @@ async function extractShopeeReviews(job, progress) {
         };
         chrome.tabs.onUpdated.addListener(onUpdated);
       });
+      try {
+        targetTab = await chrome.tabs.create({ url: job.url, active: false });
+      } catch (tabErr) {
+        if (tabErr.message.includes("No current window") || tabErr.message.includes("window")) {
+          const win = await chrome.windows.create({ url: job.url, focused: false });
+          targetTab = (win.tabs && win.tabs[0]) || null;
+        } else {
+          throw tabErr;
+        }
+      }
+      if (targetTab && targetTab.id) {
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, 12000);
+          const onUpdated = (tId, info) => {
+            if (tId === targetTab.id && info.status === "complete") {
+              clearTimeout(timer);
+              chrome.tabs.onUpdated.removeListener(onUpdated);
+              resolve();
+            }
+          };
+          chrome.tabs.onUpdated.addListener(onUpdated);
+        });
+      }
     } catch (err) {
       console.warn("[bridge] Failed to create tab:", err.message);
     }
@@ -455,7 +570,27 @@ async function extractShopeeReviews(job, progress) {
   }
 
   if (!shopid) shopid = await resolveShopId(itemid, job.url, progress);
-  if (!shopid) throw new Error(`Không tìm thấy shopid cho item ${itemid}`);
+  if (!shopid) {
+    // shopid not found — try DOM extraction directly (doesn't need shopid)
+    if (targetTab && targetTab.id) {
+      if (progress) {
+        await progress({
+          stage: "dom-crawl",
+          message: "Không tìm thấy shopid, thử cào trực tiếp từ DOM...",
+          percent: 25,
+        });
+      }
+      try {
+        const domResults = await inTabExtractShopeeDOM(targetTab.id, MAX_REVIEWS, progress);
+        if (domResults && domResults.length > 0) {
+          return domResults;
+        }
+      } catch (domErr) {
+        console.warn("[bridge] DOM extraction without shopid failed:", domErr.message);
+      }
+    }
+    throw new Error(`Không tìm thấy shopid cho item ${itemid}`);
+  }
 
   let all = [];
   let offset = 0;
@@ -629,7 +764,7 @@ async function handleAction(action, params) {
     case "browser.health":
       return {
         status: "ok",
-        version: "2.0.0",
+        version: "2.2.0",
         connected: bridgeSocket ? bridgeSocket.readyState === WebSocket.OPEN : false,
         activeJobsCount: activeJobs.size,
         extensionState,
@@ -662,6 +797,17 @@ async function handleAction(action, params) {
     case "tab.open": {
       const tab = await chrome.tabs.create({ url: params.url, active: params.active !== false });
       return { tabId: tab.id, url: tab.url };
+      try {
+        const tab = await chrome.tabs.create({ url: params.url, active: params.active !== false });
+        return { tabId: tab.id, url: tab.url };
+      } catch (err) {
+        if (err.message.includes("No current window") || err.message.includes("window")) {
+          const win = await chrome.windows.create({ url: params.url, focused: params.active !== false });
+          const tab = (win.tabs && win.tabs[0]) || { id: null, url: params.url };
+          return { tabId: tab.id, url: tab.url };
+        }
+        throw err;
+      }
     }
 
     case "tab.focus": {
@@ -1051,6 +1197,51 @@ async function handleAction(action, params) {
         return { cancelled: true, jobId };
       }
       return { cancelled: false, message: "Job not running" };
+    }
+
+    case "page.scroll": {
+      const targetTabId = params.tabId || (await getActiveTabId());
+      const res = await chrome.scripting.executeScript({
+        target: { tabId: targetTabId },
+        func: (opts) => {
+          const el = opts.selector ? document.querySelector(opts.selector) : null;
+          const target = el || window;
+          if (el) {
+            el.scrollBy({
+              top: opts.deltaY || 0,
+              left: opts.deltaX || 0,
+              behavior: opts.behavior || "smooth",
+            });
+          } else if (opts.top !== undefined || opts.left !== undefined) {
+            window.scrollTo({
+              top: opts.top !== undefined ? opts.top : window.scrollY,
+              left: opts.left !== undefined ? opts.left : window.scrollX,
+              behavior: opts.behavior || "smooth",
+            });
+          } else {
+            window.scrollBy({
+              top: opts.deltaY || 300,
+              left: opts.deltaX || 0,
+              behavior: opts.behavior || "smooth",
+            });
+          }
+          return {
+            scrollX: window.scrollX,
+            scrollY: window.scrollY,
+            scrollHeight: document.body.scrollHeight,
+            clientHeight: document.documentElement.clientHeight,
+          };
+        },
+        args: [{ selector: params.selector, top: params.top, left: params.left, deltaY: params.deltaY, deltaX: params.deltaX, behavior: params.behavior || "smooth" }],
+      });
+      return res[0]?.result || {};
+    }
+
+    case "extension.reload": {
+      setTimeout(() => {
+        try { chrome.runtime.reload(); } catch (e) { console.error("Reload failed:", e); }
+      }, 150);
+      return { reloading: true, version: "2.2.0" };
     }
 
     default:
@@ -1476,6 +1667,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     connectBridge(msg.url, msg.token);
     sendResponse({ ok: true });
   } else if (msg.action === "autoPair") {
+    if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+      sendResponse({ ok: true, connected: true });
+      return true;
+    }
     closeBridgeSocket();
     fetchPairingToken().then((pair) => {
       if (pair) {

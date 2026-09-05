@@ -31,6 +31,8 @@ class ActionName(str, Enum):
     PAGE_SNAPSHOT = "page.snapshot"
     FETCH_SAME_ORIGIN = "fetch.sameOrigin"
     JOB_CANCEL = "job.cancel"
+    PAGE_SCROLL = "page.scroll"
+    EXTENSION_RELOAD = "extension.reload"
 
 
 ALL_ACTIONS: Set[str] = {a.value for a in ActionName}
@@ -178,6 +180,16 @@ class JobCancelParams(BaseActionParams):
     jobId: str = Field(..., description="ID of the job or command to cancel")
 
 
+class PageScrollParams(BaseActionParams):
+    tabId: Optional[int] = Field(default=None, description="Target tab ID")
+    selector: Optional[str] = Field(default=None, description="Optional CSS selector to scroll within")
+    top: Optional[int] = Field(default=None, description="Absolute scroll position (scrollTo)")
+    left: Optional[int] = Field(default=None, description="Absolute horizontal scroll position")
+    deltaY: Optional[int] = Field(default=None, description="Relative vertical scroll amount (scrollBy)")
+    deltaX: Optional[int] = Field(default=None, description="Relative horizontal scroll amount")
+    behavior: str = Field(default="smooth", description="smooth | instant | auto")
+
+
 class EmptyParams(BaseActionParams):
     pass
 
@@ -215,12 +227,15 @@ def validate_action_params(action: str, params: Dict[str, Any]) -> BaseModel:
         return FetchSameOriginParams(**params)
     elif action == ActionName.JOB_CANCEL:
         return JobCancelParams(**params)
+    elif action == ActionName.PAGE_SCROLL:
+        return PageScrollParams(**params)
     elif action in (
         ActionName.BROWSER_HEALTH,
         ActionName.TAB_LIST,
         ActionName.TAB_GET_ACTIVE,
         ActionName.PAGE_GET_URL,
         ActionName.PAGE_GET_TITLE,
+        ActionName.EXTENSION_RELOAD,
     ):
         return EmptyParams(**params)
 

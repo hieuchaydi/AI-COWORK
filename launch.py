@@ -1256,6 +1256,26 @@ class _HelperHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if self.path.split("?", 1)[0] == "/browser/action":
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            action = (qs.get("action", [""])[0] or "").strip()
+            params_raw = (qs.get("params", ["{}"])[0] or "{}").strip()
+            try:
+                params = json.loads(params_raw)
+            except Exception:
+                params = {}
+            if not action:
+                self._json(400, {"ok": False, "error": "action is required"})
+                return
+            ok, res, err = _BROWSER_WS.transport.execute_command(action, params)
+            self._json(200 if ok else 500, {
+                "ok": ok,
+                "action": action,
+                "result": res,
+                "error": err.to_dict() if err else None,
+            })
+            return
+
         if self.path.split("?", 1)[0] == "/browser/resume":
             qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
             auth_header = self.headers.get("Authorization", "")
@@ -1786,6 +1806,22 @@ class _HelperHandler(BaseHTTPRequestHandler):
 
         if path_only == "/browser/pair":
             self._handle_browser_pair()
+            return
+
+        if path_only == "/browser/action":
+            body = _read_json()
+            action = (body.get("action") or "").strip()
+            params = body.get("params") or {}
+            if not action:
+                _reply(400, {"ok": False, "error": "action is required"})
+                return
+            ok, res, err = _BROWSER_WS.transport.execute_command(action, params)
+            _reply(200 if ok else 500, {
+                "ok": ok,
+                "action": action,
+                "result": res,
+                "error": err.to_dict() if err else None,
+            })
             return
 
         # ─── /ingest — data pushed in from a normal browser tab ──────────────
