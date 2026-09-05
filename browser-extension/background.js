@@ -25,6 +25,7 @@ let reconnectAttempts = 0;
 let jobChain = Promise.resolve();
 let extensionState = "disconnected";
 let activeJobs = new Map();
+let inFlightCommands = new Map();
 let verificationInfo = null;
 
 function setBadge(text, color = "#1a73e8") {
@@ -312,8 +313,40 @@ async function handleAction(action, params) {
 
     case "page.navigate": {
       const targetTabId = params.tabId || (await getActiveTabId());
+      const waitUntil = params.waitUntil || "load"; // load, domcontentloaded, networkidle
+
+      const navigationPromise = new Promise((resolve) => {
+        let timer = null;
+        const onUpdated = (tabId, changeInfo, tab) => {
+          if (tabId === targetTabId) {
+            if (waitUntil === "domcontentloaded") {
+              if (changeInfo.status === "loading" || changeInfo.status === "complete") {
+                cleanup();
+                resolve({ tabId: targetTabId, url: tab.url, loaded: true });
+              }
+            } else {
+              if (changeInfo.status === "complete") {
+                cleanup();
+                resolve({ tabId: targetTabId, url: tab.url, loaded: true });
+              }
+            }
+          }
+        };
+
+        const cleanup = () => {
+          if (timer) clearTimeout(timer);
+          chrome.tabs.onUpdated.removeListener(onUpdated);
+        };
+
+        chrome.tabs.onUpdated.addListener(onUpdated);
+        timer = setTimeout(() => {
+          cleanup();
+          resolve({ tabId: targetTabId, url: params.url, loaded: false, timeout: true });
+        }, Math.max(3000, Number(params.timeoutMs) || 30000));
+      });
+
       await chrome.tabs.update(targetTabId, { url: params.url });
-      return { tabId: targetTabId, url: params.url, navigated: true };
+      return await navigationPromise;
     }
 
     case "page.getUrl": {
@@ -330,14 +363,47 @@ async function handleAction(action, params) {
 
     case "page.waitFor": {
       const targetTabId = params.tabId || (await getActiveTabId());
+      const state = params.state || "visible"; // visible, hidden, attached, detached
+      const timeoutMs = Math.max(100, Number(params.timeoutMs) || 5000);
+
+      const pollScript = async (selector, expectedState, maxWaitMs) => {
+        const start = Date.now();
+        const checkState = (el, st) => {
+          const isAttached = !!el;
+          if (st === "attached") return isAttached;
+          if (st === "detached") return !isAttached;
+          if (!isAttached) return st === "hidden";
+          const rects = el.getClientRects();
+          const isVisible =
+            rects.length > 0 &&
+            (el.offsetWidth > 0 || el.offsetHeight > 0) &&
+            window.getComputedStyle(el).visibility !== "hidden";
+          if (st === "visible") return isVisible;
+          if (st === "hidden") return !isVisible;
+          return false;
+        };
+
+        while (Date.now() - start < maxWaitMs) {
+          const el = document.querySelector(selector);
+          if (checkState(el, expectedState)) {
+            return { found: true, elapsedMs: Date.now() - start };
+          }
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        return { found: false, elapsedMs: Date.now() - start };
+      };
+
       const res = await chrome.scripting.executeScript({
         target: { tabId: targetTabId },
-        func: (selector) => {
-          return !!document.querySelector(selector);
-        },
-        args: [params.selector],
+        func: pollScript,
+        args: [params.selector, state, timeoutMs],
       });
-      return { found: !!(res && res[0] && res[0].result) };
+
+      const outcome = res[0]?.result;
+      if (!outcome || !outcome.found) {
+        throw new Error(`Timeout waiting for selector '${params.selector}' to be ${state}`);
+      }
+      return { found: true, elapsedMs: outcome.elapsedMs };
     }
 
     case "dom.query": {
@@ -401,13 +467,18 @@ async function handleAction(action, params) {
         target: { tabId: targetTabId },
         func: (selector) => {
           const el = document.querySelector(selector);
-          if (!el) return { ok: false, error: "Element not found" };
+          if (!el) return { ok: false, error: "ELEMENT_NOT_FOUND" };
+          el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
           el.click();
           return { ok: true, clicked: true };
         },
         args: [params.selector],
       });
-      return res[0]?.result;
+      const outcome = res[0]?.result;
+      if (!outcome || !outcome.ok) {
+        throw new Error(`ELEMENT_NOT_FOUND: Element not found for selector '${params.selector}'`);
+      }
+      return outcome;
     }
 
     case "input.type": {
@@ -416,11 +487,30 @@ async function handleAction(action, params) {
         target: { tabId: targetTabId },
         func: (selector, text, clearFirst, submit) => {
           const el = document.querySelector(selector);
-          if (!el) return { ok: false, error: "Element not found" };
-          if (clearFirst) el.value = "";
-          el.value += text;
+          if (!el) return { ok: false, error: "ELEMENT_NOT_FOUND" };
+
+          const nativeSetter =
+            Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set ||
+            Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+
+          if (clearFirst) {
+            if (nativeSetter) {
+              nativeSetter.call(el, "");
+            } else {
+              el.value = "";
+            }
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+          }
+
+          const newVal = (clearFirst ? "" : el.value) + text;
+          if (nativeSetter) {
+            nativeSetter.call(el, newVal);
+          } else {
+            el.value = newVal;
+          }
           el.dispatchEvent(new Event("input", { bubbles: true }));
           el.dispatchEvent(new Event("change", { bubbles: true }));
+
           if (submit && el.form) {
             el.form.dispatchEvent(new Event("submit", { bubbles: true }));
           }
@@ -428,7 +518,11 @@ async function handleAction(action, params) {
         },
         args: [params.selector, params.text, params.clearFirst !== false, !!params.submit],
       });
-      return res[0]?.result;
+      const outcome = res[0]?.result;
+      if (!outcome || !outcome.ok) {
+        throw new Error(`ELEMENT_NOT_FOUND: Element not found for selector '${params.selector}'`);
+      }
+      return outcome;
     }
 
     case "input.select": {
@@ -437,29 +531,38 @@ async function handleAction(action, params) {
         target: { tabId: targetTabId },
         func: (selector, val) => {
           const el = document.querySelector(selector);
-          if (!el) return { ok: false, error: "Element not found" };
+          if (!el) return { ok: false, error: "ELEMENT_NOT_FOUND" };
           el.value = val;
           el.dispatchEvent(new Event("change", { bubbles: true }));
           return { ok: true, selected: val };
         },
         args: [params.selector, params.value],
       });
-      return res[0]?.result;
+      const outcome = res[0]?.result;
+      if (!outcome || !outcome.ok) {
+        throw new Error(`ELEMENT_NOT_FOUND: Element not found for selector '${params.selector}'`);
+      }
+      return outcome;
     }
 
     case "page.snapshot": {
+      const format = (params.format || "text").toLowerCase();
+      if (format !== "text" && format !== "html") {
+        throw new Error(`UNSUPPORTED_ACTION_PARAM: format '${params.format}' is not supported (only 'text' and 'html')`);
+      }
       const targetTabId = params.tabId || (await getActiveTabId());
+      const maxChars = Math.min(500000, Math.max(100, Number(params.maxChars) || 50000));
       const res = await chrome.scripting.executeScript({
         target: { tabId: targetTabId },
-        func: (format, maxChars) => {
-          if (format === "html") {
-            return (document.documentElement.outerHTML || "").slice(0, maxChars);
+        func: (fmt, maxLen) => {
+          if (fmt === "html") {
+            return (document.documentElement.outerHTML || "").slice(0, maxLen);
           }
-          return (document.body ? document.body.innerText : "").slice(0, maxChars);
+          return (document.body ? document.body.innerText : "").slice(0, maxLen);
         },
-        args: [params.format || "text", params.maxChars || 50000],
+        args: [format, maxChars],
       });
-      return { format: params.format || "text", snapshot: res[0]?.result };
+      return { format, snapshot: res[0]?.result || "" };
     }
 
     case "fetch.sameOrigin": {
@@ -467,17 +570,79 @@ async function handleAction(action, params) {
       const tab = await chrome.tabs.get(targetTabId);
       if (!tab.url) throw new Error("Tab has no URL for origin verification");
 
-      // Verify same origin
-      const tabOrigin = new URL(tab.url).origin;
-      const targetUrl = new URL(params.pathOrUrl, tabOrigin).href;
-      if (!targetUrl.startsWith(tabOrigin)) {
-        throw new Error(`Cross-origin fetch rejected. Tab origin: ${tabOrigin}, Target: ${targetUrl}`);
+      let tabUrlObj;
+      try {
+        tabUrlObj = new URL(tab.url);
+      } catch {
+        throw new Error("Invalid tab URL");
       }
+      if (tabUrlObj.protocol !== "http:" && tabUrlObj.protocol !== "https:") {
+        throw new Error(`Tab protocol '${tabUrlObj.protocol}' is not allowed for sameOrigin fetch`);
+      }
+      if (tabUrlObj.username || tabUrlObj.password) {
+        throw new Error("Tab URL containing userinfo (@) is not allowed");
+      }
+
+      let targetUrlObj;
+      try {
+        targetUrlObj = new URL(params.pathOrUrl, tab.url);
+      } catch {
+        throw new Error("Invalid target path or URL");
+      }
+
+      if (targetUrlObj.protocol !== "http:" && targetUrlObj.protocol !== "https:") {
+        throw new Error(`Target protocol '${targetUrlObj.protocol}' is not allowed`);
+      }
+      if (targetUrlObj.username || targetUrlObj.password) {
+        throw new Error("Target URL containing userinfo (@) is not allowed");
+      }
+
+      if (targetUrlObj.origin !== tabUrlObj.origin) {
+        throw new Error(`Cross-origin fetch rejected. Tab origin: ${tabUrlObj.origin}, Target: ${targetUrlObj.origin}`);
+      }
+
+      const forbiddenHeaders = [
+        "authorization",
+        "cookie",
+        "cookie2",
+        "host",
+        "origin",
+        "referer",
+        "content-length",
+        "connection",
+        "keep-alive",
+        "upgrade",
+        "proxy-authorization",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "sec-fetch-user",
+        "te",
+        "trailer",
+        "transfer-encoding",
+      ];
+      const safeHeaders = {};
+      if (params.headers && typeof params.headers === "object") {
+        for (const [k, v] of Object.entries(params.headers)) {
+          const lower = k.toLowerCase().trim();
+          if (forbiddenHeaders.includes(lower)) {
+            throw new Error(`Forbidden header in fetch.sameOrigin: '${k}'`);
+          }
+          safeHeaders[k] = v;
+        }
+      }
+
+      const maxBytes = Math.min(
+        10 * 1024 * 1024,
+        Math.max(1024, Number(params.maxResponseBytes) || 200 * 1024)
+      );
+
+      const targetUrl = targetUrlObj.href;
 
       // Execute fetch within tab context so Chrome profile cookies attach naturally
       const res = await chrome.scripting.executeScript({
         target: { tabId: targetTabId },
-        func: async (url, method, headers, body) => {
+        func: async (url, method, headers, body, maxLimit) => {
           const opts = {
             method: method || "GET",
             headers: headers || {},
@@ -488,6 +653,14 @@ async function handleAction(action, params) {
           }
           const resp = await fetch(url, opts);
           const text = await resp.text();
+          const byteLen = new TextEncoder().encode(text).length;
+          if (byteLen > maxLimit) {
+            return {
+              status: resp.status,
+              ok: false,
+              error: `Response size (${byteLen} bytes) exceeds limit of ${maxLimit} bytes`,
+            };
+          }
           let parsedJson = null;
           try {
             parsedJson = JSON.parse(text);
@@ -496,13 +669,16 @@ async function handleAction(action, params) {
             status: resp.status,
             ok: resp.ok,
             url: resp.url,
-            data: parsedJson !== null ? parsedJson : text.slice(0, 200000),
+            data: parsedJson !== null ? parsedJson : text,
           };
         },
-        args: [targetUrl, params.method || "GET", params.headers || {}, params.body || null],
+        args: [targetUrl, params.method || "GET", safeHeaders, params.body || null, maxBytes],
       });
 
       const fetchResult = res[0]?.result;
+      if (fetchResult && fetchResult.error) {
+        throw new Error(fetchResult.error);
+      }
       if (fetchResult && (fetchResult.status === 403 || (typeof fetchResult.data === "string" && fetchResult.data.includes("/verify/traffic")))) {
         triggerVerificationRequired({ tab_id: targetTabId, url: targetUrl, status: fetchResult.status });
       }
@@ -540,6 +716,29 @@ async function dispatchEnvelope(envelope) {
     const cmdId = envelope.id;
     const action = envelope.action;
     const params = envelope.params || {};
+    const deadlineMs = Math.max(1000, Number(envelope.deadlineMs) || 30000);
+
+    const abortController = new AbortController();
+    const timeoutId = setTimeout(() => {
+      if (inFlightCommands.has(cmdId)) {
+        inFlightCommands.delete(cmdId);
+        abortController.abort(new Error("TIMEOUT"));
+        bridgeSend({
+          v: 1,
+          type: "error",
+          id: cmdId,
+          action,
+          error: {
+            code: "TIMEOUT",
+            message: `Action '${action}' timed out after ${deadlineMs}ms in extension`,
+            retryable: true,
+            details: {},
+          },
+        });
+      }
+    }, deadlineMs);
+
+    inFlightCommands.set(cmdId, { abortController, timeoutId, action, startedAt: Date.now() });
 
     // 1. Send ACCEPTED acknowledgement
     bridgeSend({
@@ -551,6 +750,12 @@ async function dispatchEnvelope(envelope) {
 
     try {
       const result = await handleAction(action, params);
+      if (!inFlightCommands.has(cmdId)) {
+        return; // Timed out or cancelled
+      }
+      clearTimeout(timeoutId);
+      inFlightCommands.delete(cmdId);
+
       bridgeSend({
         v: 1,
         type: "result",
@@ -559,16 +764,38 @@ async function dispatchEnvelope(envelope) {
         result,
       });
     } catch (err) {
+      if (!inFlightCommands.has(cmdId)) {
+        return; // Timed out or cancelled
+      }
+      clearTimeout(timeoutId);
+      inFlightCommands.delete(cmdId);
+
       console.error(`[bridge] Action '${action}' error:`, err.message);
+      let errCode = "INTERNAL_ERROR";
+      if (
+        err.message.includes("Cross-origin") ||
+        err.message.includes("Tab protocol") ||
+        err.message.includes("Target protocol") ||
+        err.message.includes("userinfo")
+      ) {
+        errCode = "SAME_ORIGIN_VIOLATION";
+      } else if (err.message.includes("ELEMENT_NOT_FOUND")) {
+        errCode = "ELEMENT_NOT_FOUND";
+      } else if (err.message.includes("UNSUPPORTED_ACTION_PARAM")) {
+        errCode = "UNSUPPORTED_ACTION_PARAM";
+      } else if (err.message.includes("Timeout waiting")) {
+        errCode = "TIMEOUT";
+      }
+
       bridgeSend({
         v: 1,
         type: "error",
         id: cmdId,
         action,
         error: {
-          code: err.message.includes("Cross-origin") ? "SAME_ORIGIN_VIOLATION" : "INTERNAL_ERROR",
+          code: errCode,
           message: err.message,
-          retryable: false,
+          retryable: errCode === "TIMEOUT",
           details: {},
         },
       });
@@ -579,15 +806,37 @@ async function dispatchEnvelope(envelope) {
   // Handle cancel
   if (envelope.type === "cancel") {
     const targetId = envelope.params && envelope.params.targetCommandId;
-    if (targetId && activeJobs.has(targetId)) {
-      activeJobs.delete(targetId);
+    let cancelled = false;
+    if (targetId && inFlightCommands.has(targetId)) {
+      const entry = inFlightCommands.get(targetId);
+      clearTimeout(entry.timeoutId);
+      entry.abortController.abort(new Error("CANCELLED"));
+      inFlightCommands.delete(targetId);
+      cancelled = true;
+
       bridgeSend({
         v: 1,
-        type: "result",
-        id: envelope.id || ("cancel-" + Date.now()),
-        result: { cancelled: true, targetCommandId: targetId },
+        type: "error",
+        id: targetId,
+        action: entry.action,
+        error: {
+          code: "CANCELLED",
+          message: "Command was cancelled by gateway",
+          retryable: false,
+          details: {},
+        },
       });
     }
+    if (targetId && activeJobs.has(targetId)) {
+      activeJobs.delete(targetId);
+      cancelled = true;
+    }
+    bridgeSend({
+      v: 1,
+      type: "result",
+      id: envelope.id || ("cancel-" + Date.now()),
+      result: { cancelled, targetCommandId: targetId },
+    });
     return;
   }
 

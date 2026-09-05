@@ -111,30 +111,33 @@ class SimpleWebSocketTestClient:
 
     def recv_json(self, timeout: float = 3.0) -> Optional[Dict[str, Any]]:
         self.sock.settimeout(timeout)
-        b0_b1 = self._recv_exact(2)
-        if len(b0_b1) < 2:
+        try:
+            b0_b1 = self._recv_exact(2)
+            if len(b0_b1) < 2:
+                return None
+            b0, b1 = b0_b1[0], b0_b1[1]
+            opcode = b0 & 0x0F
+            has_mask = bool(b1 & 0x80)
+            length = b1 & 0x7F
+
+            if length == 126:
+                ext = self._recv_exact(2)
+                length = int.from_bytes(ext, "big")
+            elif length == 127:
+                ext = self._recv_exact(8)
+                length = int.from_bytes(ext, "big")
+
+            mask = self._recv_exact(4) if has_mask else None
+            data = self._recv_exact(length)
+
+            if has_mask and mask:
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+
+            if opcode == 0x8:  # Close
+                return None
+            return json.loads(data.decode("utf-8"))
+        except (ConnectionError, OSError):
             return None
-        b0, b1 = b0_b1[0], b0_b1[1]
-        opcode = b0 & 0x0F
-        has_mask = bool(b1 & 0x80)
-        length = b1 & 0x7F
-
-        if length == 126:
-            ext = self._recv_exact(2)
-            length = int.from_bytes(ext, "big")
-        elif length == 127:
-            ext = self._recv_exact(8)
-            length = int.from_bytes(ext, "big")
-
-        mask = self._recv_exact(4) if has_mask else None
-        data = self._recv_exact(length)
-
-        if has_mask and mask:
-            data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
-
-        if opcode == 0x8:  # Close
-            return None
-        return json.loads(data.decode("utf-8"))
 
     def close(self) -> None:
         try:
@@ -389,4 +392,130 @@ def test_e2e_pipelined_handshake_frame_buffering(gateway_server):
             sock.close()
         except Exception:
             pass
+
+
+def test_e2e_command_timeout_and_cancel_dispatch(gateway_server):
+    server, port, token = gateway_server
+    client = SimpleWebSocketTestClient("127.0.0.1", port)
+    try:
+        status = client.connect(token=token)
+        assert status == 101
+        _ = client.recv_json()  # hello
+
+        result_container = []
+
+        def execute_worker():
+            ok, res, err = server.transport.execute_command(
+                action="tab.list",
+                deadline_ms=500,
+            )
+            result_container.append((ok, res, err))
+
+        t = threading.Thread(target=execute_worker)
+        t.start()
+
+        # Client receives command envelope
+        cmd = client.recv_json(timeout=2.0)
+        assert cmd is not None
+        assert cmd.get("type") == "command"
+        cmd_id = cmd.get("id")
+
+        # Intentionally DO NOT respond, wait for gateway timeout
+        t.join(timeout=2.0)
+        assert len(result_container) == 1
+        ok, res, err = result_container[0]
+        assert ok is False
+        assert err is not None
+        assert err.code == "TIMEOUT"
+
+        # Client must receive automatic CANCEL envelope from Gateway
+        cancel_env = client.recv_json(timeout=2.0)
+        assert cancel_env is not None
+        assert cancel_env.get("type") == "cancel"
+        assert cancel_env.get("params", {}).get("targetCommandId") == cmd_id
+    finally:
+        client.close()
+
+
+def test_e2e_rfc6455_version_enforcement(gateway_server):
+    _, port, token = gateway_server
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(3.0)
+    try:
+        sock.connect(("127.0.0.1", port))
+        sec_key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+        req = (
+            f"GET /browser/v1/ws?token={token} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {sec_key}\r\n"
+            "Sec-WebSocket-Version: 12\r\n"  # Invalid version (must be 13)
+            "Origin: chrome-extension://abcdefghijklmnopabcdefghijklmnop\r\n\r\n"
+        ).encode("ascii")
+        sock.sendall(req)
+
+        resp = sock.recv(1024)
+        assert b"400 Bad Request" in resp
+    finally:
+        sock.close()
+
+
+def test_e2e_token_rotation(gateway_server):
+    server, port, token1 = gateway_server
+    client1 = SimpleWebSocketTestClient("127.0.0.1", port)
+    try:
+        assert client1.connect(token=token1) == 101
+        _ = client1.recv_json()
+        assert server.is_connected is True
+
+        # Rotate token
+        token2 = server.rotate_token()
+        assert token2 != token1
+
+        # Previous connection should be terminated
+        time.sleep(0.1)
+
+        # Reconnecting with old token fails with 401
+        client_old = SimpleWebSocketTestClient("127.0.0.1", port)
+        try:
+            assert client_old.connect(token=token1) == 401
+        finally:
+            client_old.close()
+
+        # Connecting with new token succeeds with 101
+        client_new = SimpleWebSocketTestClient("127.0.0.1", port)
+        try:
+            assert client_new.connect(token=token2) == 101
+            _ = client_new.recv_json()
+            assert server.is_connected is True
+        finally:
+            client_new.close()
+    finally:
+        client1.close()
+
+
+def test_e2e_control_frame_payload_limit(gateway_server):
+    server, port, token = gateway_server
+    client = SimpleWebSocketTestClient("127.0.0.1", port)
+    try:
+        assert client.connect(token=token) == 101
+        _ = client.recv_json()
+
+        # Send Ping control frame (opcode 0x9) with 130 bytes (> 125B limit)
+        huge_payload = b"p" * 130
+        mask = secrets.token_bytes(4)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(huge_payload))
+        # 0x89: FIN=1, Opcode=9 (Ping), 0x80 | 126 (size as 2 bytes)
+        frame = bytes([0x89, 0x80 | 126]) + len(huge_payload).to_bytes(2, "big") + mask + masked
+        client.sock.sendall(frame)
+
+        # Server must reject and close connection due to RFC 6455 violation
+        time.sleep(0.1)
+        next_data = client.recv_json(timeout=1.0)
+        assert next_data is None
+        assert server.is_connected is False
+    finally:
+        client.close()
+
 

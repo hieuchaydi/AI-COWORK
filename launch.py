@@ -38,7 +38,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from browser_ws_bridge import BrowserWebSocketBridge
+from browser_ws_bridge import BrowserWebSocketBridge, validate_extension_origin, verify_pairing_token
 
 
 # Our banners and Vietnamese hints use non-cp1252 characters (⇒, ✓, ─). A Windows
@@ -1178,8 +1178,9 @@ class _HelperHandler(BaseHTTPRequestHandler):
         # visited page could turn localhost into a confused-deputy browser controller.
         if self.path.split("?", 1)[0] == "/browser/pair":
             origin = self.headers.get("Origin", "")
-            if not origin.startswith("chrome-extension://"):
-                self._json(403, {"ok": False, "error": "extension origin required"})
+            valid, ext_id = validate_extension_origin(origin, _BROWSER_WS.allowlisted_extension_ids)
+            if not valid:
+                self._json(403, {"ok": False, "error": "Unauthorized extension origin"})
                 return
             body = json.dumps(
                 {
@@ -1218,6 +1219,23 @@ class _HelperHandler(BaseHTTPRequestHandler):
 
         if self.path.split("?", 1)[0] == "/browser/resume":
             qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            auth_header = self.headers.get("Authorization", "")
+            req_token = qs.get("token", [""])[0] or self.headers.get("X-Bridge-Token", "")
+            if not req_token and auth_header.startswith("Bearer "):
+                req_token = auth_header[7:].strip()
+
+            origin = self.headers.get("Origin", "")
+            valid_origin, _ = validate_extension_origin(origin, _BROWSER_WS.allowlisted_extension_ids)
+
+            # Require valid pairing token, API token, or request from authorized extension origin
+            token_valid = req_token and (
+                verify_pairing_token(req_token, _BROWSER_WS.token)
+                or verify_pairing_token(req_token, API_TOKEN)
+            )
+            if not token_valid and not valid_origin:
+                self._json(401, {"ok": False, "error": "Unauthorized: Valid token or extension origin required"})
+                return
+
             job_id = (qs.get("id", [""])[0] or qs.get("jobId", [""])[0] or "").strip()
             msg = {
                 "v": 1,
@@ -1225,7 +1243,8 @@ class _HelperHandler(BaseHTTPRequestHandler):
                 "params": {"jobId": job_id} if job_id else {},
             }
             sent = _BROWSER_WS.send(msg)
-            self._json(200, {"ok": True, "sent": sent, "jobId": job_id})
+            _BROWSER_WS.transport.resume_verification()
+            self._json(200, {"ok": True, "resumed": True, "sent": sent, "jobId": job_id})
             return
 
         # ── Dynamic Tools ─────────────────────────────────────────────────────

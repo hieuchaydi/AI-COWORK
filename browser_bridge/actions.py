@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ActionName(str, Enum):
@@ -48,61 +48,80 @@ DISALLOWED_FETCH_HEADERS: Set[str] = {
     "sec-",
     "proxy-",
     "user-agent",
+    "authorization",
 }
 
 
-class TabOpenParams(BaseModel):
+class BaseActionParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class TabOpenParams(BaseActionParams):
     url: str = Field(..., description="Destination URL to open")
     active: bool = Field(default=True, description="Whether to make the tab active")
 
 
-class TabFocusParams(BaseModel):
+class TabFocusParams(BaseActionParams):
     tabId: int = Field(..., description="ID of the tab to bring to foreground")
 
 
-class PageNavigateParams(BaseModel):
+class PageNavigateParams(BaseActionParams):
     url: str = Field(..., description="Target URL")
     tabId: Optional[int] = Field(default=None, description="Target tab ID; active tab if omitted")
     waitUntil: Optional[str] = Field(default="load", description="load | domcontentloaded | networkidle")
 
+    @field_validator("waitUntil")
+    @classmethod
+    def validate_wait_until(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in {"load", "domcontentloaded", "networkidle"}:
+            raise ValueError(f"Invalid waitUntil '{v}'. Must be 'load', 'domcontentloaded', or 'networkidle'")
+        return v
 
-class PageWaitForParams(BaseModel):
+
+class PageWaitForParams(BaseActionParams):
     selector: str = Field(..., description="CSS/DOM selector to wait for")
     tabId: Optional[int] = Field(default=None, description="Target tab ID")
     state: str = Field(default="visible", description="visible | hidden | attached | detached")
     timeoutMs: int = Field(default=15000, ge=100, le=60000)
 
+    @field_validator("state")
+    @classmethod
+    def validate_state(cls, v: str) -> str:
+        if v not in {"visible", "hidden", "attached", "detached"}:
+            raise ValueError(f"Invalid state '{v}'. Must be 'visible', 'hidden', 'attached', or 'detached'")
+        return v
 
-class DomQueryParams(BaseModel):
+
+class DomQueryParams(BaseActionParams):
     selector: str = Field(..., description="CSS selector")
     tabId: Optional[int] = Field(default=None, description="Target tab ID")
 
 
-class DomQueryAllParams(BaseModel):
+class DomQueryAllParams(BaseActionParams):
     selector: str = Field(..., description="CSS selector")
     tabId: Optional[int] = Field(default=None, description="Target tab ID")
     limit: int = Field(default=50, ge=1, le=500)
 
 
-class DomGetTextParams(BaseModel):
+class DomGetTextParams(BaseActionParams):
     selector: str = Field(..., description="CSS selector")
     tabId: Optional[int] = Field(default=None, description="Target tab ID")
     maxChars: Optional[int] = Field(default=8000, ge=10, le=100000)
 
 
-class DomGetAttributeParams(BaseModel):
+class DomGetAttributeParams(BaseActionParams):
     selector: str = Field(..., description="CSS selector")
     attribute: str = Field(..., description="Attribute name e.g. href, src, value")
     tabId: Optional[int] = Field(default=None, description="Target tab ID")
 
 
-class DomClickParams(BaseModel):
+class DomClickParams(BaseActionParams):
     selector: str = Field(..., description="CSS selector to click")
     tabId: Optional[int] = Field(default=None, description="Target tab ID")
     waitForNavigation: bool = Field(default=False)
 
 
-class InputTypeParams(BaseModel):
+class InputTypeParams(BaseActionParams):
     selector: str = Field(..., description="CSS selector of input/textarea")
     text: str = Field(..., description="Text to type")
     tabId: Optional[int] = Field(default=None, description="Target tab ID")
@@ -110,19 +129,26 @@ class InputTypeParams(BaseModel):
     submit: bool = Field(default=False, description="Press Enter after typing")
 
 
-class InputSelectParams(BaseModel):
+class InputSelectParams(BaseActionParams):
     selector: str = Field(..., description="CSS selector of select element")
     value: str = Field(..., description="Option value or label to select")
     tabId: Optional[int] = Field(default=None, description="Target tab ID")
 
 
-class PageSnapshotParams(BaseModel):
+class PageSnapshotParams(BaseActionParams):
     tabId: Optional[int] = Field(default=None, description="Target tab ID")
-    format: str = Field(default="text", description="text | html | accessibility")
+    format: str = Field(default="text", description="text | html")
     maxChars: int = Field(default=50000, ge=100, le=500000)
 
+    @field_validator("format")
+    @classmethod
+    def validate_format(cls, v: str) -> str:
+        if v not in {"text", "html"}:
+            raise ValueError(f"Invalid snapshot format '{v}'. Only 'text' and 'html' are supported")
+        return v
 
-class FetchSameOriginParams(BaseModel):
+
+class FetchSameOriginParams(BaseActionParams):
     pathOrUrl: str = Field(..., description="Relative path or absolute same-origin URL")
     tabId: Optional[int] = Field(default=None, description="Target tab ID providing origin and cookies")
     method: str = Field(default="GET", description="HTTP method")
@@ -130,12 +156,29 @@ class FetchSameOriginParams(BaseModel):
     body: Optional[Any] = Field(default=None, description="Optional request payload")
     maxResponseBytes: int = Field(default=2 * 1024 * 1024, ge=1024, le=10 * 1024 * 1024)
 
+    @field_validator("method")
+    @classmethod
+    def validate_method(cls, v: str) -> str:
+        upper = v.upper()
+        if upper not in ALLOWED_FETCH_METHODS:
+            raise ValueError(f"Unsupported HTTP method: '{v}'. Must be one of {sorted(ALLOWED_FETCH_METHODS)}")
+        return upper
 
-class JobCancelParams(BaseModel):
+    @field_validator("headers")
+    @classmethod
+    def validate_headers(cls, headers: Dict[str, str]) -> Dict[str, str]:
+        for k in headers.keys():
+            k_lower = k.lower().strip()
+            if k_lower in DISALLOWED_FETCH_HEADERS or k_lower.startswith(("sec-", "proxy-")):
+                raise ValueError(f"Header '{k}' is forbidden in fetch.sameOrigin")
+        return headers
+
+
+class JobCancelParams(BaseActionParams):
     jobId: str = Field(..., description="ID of the job or command to cancel")
 
 
-class EmptyParams(BaseModel):
+class EmptyParams(BaseActionParams):
     pass
 
 
@@ -172,7 +215,14 @@ def validate_action_params(action: str, params: Dict[str, Any]) -> BaseModel:
         return FetchSameOriginParams(**params)
     elif action == ActionName.JOB_CANCEL:
         return JobCancelParams(**params)
+    elif action in (
+        ActionName.BROWSER_HEALTH,
+        ActionName.TAB_LIST,
+        ActionName.TAB_GET_ACTIVE,
+        ActionName.PAGE_GET_URL,
+        ActionName.PAGE_GET_TITLE,
+    ):
+        return EmptyParams(**params)
 
-    # Actions without mandatory parameters (e.g. browser.health, tab.list, tab.getActive, page.getUrl, page.getTitle)
-    return EmptyParams()
+    raise ValueError(f"Unhandled action schema: '{action}'")
 

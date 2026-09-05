@@ -51,29 +51,67 @@ def validate_extension_origin(
     return True, ext_id
 
 
+def mask_token(token: Optional[str]) -> str:
+    """Masks a token string for safe logging."""
+    if not token:
+        return ""
+    if len(token) <= 8:
+        return "***"
+    return f"{token[:4]}...{token[-4:]}"
+
+
+def get_allowed_extension_ids() -> Set[str]:
+    """Retrieves allowlisted extension IDs from environment or configuration."""
+    import os
+    env_val = os.environ.get("ALLOWED_EXTENSION_IDS", "").strip()
+    if env_val:
+        return {x.strip() for x in env_val.split(",") if x.strip()}
+    return set()
+
+
 def is_same_origin(target_url: str, tab_url: str) -> bool:
-    """Verifies that target_url and tab_url share the exact same scheme, host, and port."""
+    """Verifies that target_url and tab_url share the exact same scheme, host, and port.
+
+    Permits only 'http' and 'https' protocols. Rejects URLs containing userinfo (@),
+    mismatched ports/subdomains, non-web schemes (chrome, file, data, javascript),
+    or malformed URL structures. Relative paths are resolved securely against tab_url.
+    """
     if not target_url or not tab_url:
         return False
 
-    # Relative paths like '/api/v1/item' are inherently same-origin
-    if target_url.startswith("/") and not target_url.startswith("//"):
-        return True
-
-    try:
-        t_parsed = urllib.parse.urlsplit(target_url)
-        tab_parsed = urllib.parse.urlsplit(tab_url)
-
-        if not t_parsed.scheme or not t_parsed.netloc:
-            # Not an absolute URL with scheme and host
+    if "://" in target_url:
+        lower_target = target_url.lower()
+        if not (lower_target.startswith("http://") or lower_target.startswith("https://")):
+            return False
+        if lower_target.count("://") > 1:
             return False
 
-        t_port = t_parsed.port or (443 if t_parsed.scheme == "https" else 80)
-        tab_port = tab_parsed.port or (443 if tab_parsed.scheme == "https" else 80)
+    try:
+        tab_parsed = urllib.parse.urlsplit(tab_url)
+        if tab_parsed.scheme.lower() not in ("http", "https"):
+            return False
+        if not tab_parsed.hostname:
+            return False
+        if tab_parsed.username or tab_parsed.password or "@" in tab_parsed.netloc:
+            return False
+
+        # Resolve target relative URL safely against tab_url
+        resolved = urllib.parse.urljoin(tab_url, target_url)
+        t_parsed = urllib.parse.urlsplit(resolved)
+
+        if t_parsed.scheme.lower() not in ("http", "https"):
+            return False
+        if not t_parsed.hostname:
+            return False
+        if t_parsed.username or t_parsed.password or "@" in t_parsed.netloc:
+            return False
+
+        t_port = t_parsed.port or (443 if t_parsed.scheme.lower() == "https" else 80)
+        tab_port = tab_parsed.port or (443 if tab_parsed.scheme.lower() == "https" else 80)
 
         return (
             t_parsed.scheme.lower() == tab_parsed.scheme.lower()
-            and (t_parsed.hostname or "").lower() == (tab_parsed.hostname or "").lower()
+            and t_parsed.hostname.lower() == tab_parsed.hostname.lower()
             and t_port == tab_port
         )
     except Exception:

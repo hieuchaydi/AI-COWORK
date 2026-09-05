@@ -25,6 +25,8 @@ from .protocol import (
 from .security import (
     AuditLogger,
     generate_pairing_token,
+    get_allowed_extension_ids,
+    mask_token,
     validate_extension_origin,
     verify_pairing_token,
 )
@@ -88,14 +90,19 @@ def _read_frame(source: socket.socket | _BufferedSocketReader, max_bytes: int = 
 
     first, second = read_fn(2)
     fin = bool(first & 0x80)
+    rsv = (first & 0x70) >> 4
     opcode = first & 0x0F
     masked = bool(second & 0x80)
     size = second & 0x7F
 
+    if rsv != 0:
+        raise WebSocketProtocolError("RSV bits must be 0")
     if not fin:
         raise WebSocketProtocolError("Fragmented frames not supported")
     if not masked:
         raise WebSocketProtocolError("Client frames must be masked")
+    if opcode in (0x8, 0x9, 0xA) and size > 125:
+        raise WebSocketProtocolError("Control frames payload must be 125 bytes or less")
 
     if size == 126:
         size = struct.unpack("!H", read_fn(2))[0]
@@ -171,7 +178,9 @@ class BrowserGatewayServer:
         on_disconnect: Optional[Callable[[], None]] = None,
     ):
         self.token = token or generate_pairing_token()
-        self.allowlisted_extension_ids = allowlisted_extension_ids
+        self.allowlisted_extension_ids = (
+            allowlisted_extension_ids if allowlisted_extension_ids is not None else get_allowed_extension_ids()
+        ) or None
         self.max_concurrency = max_concurrency
         self.on_message = on_message
         self.on_connect = on_connect
@@ -187,7 +196,30 @@ class BrowserGatewayServer:
         self.transport = WebSocketTransport(
             send_fn=self.broadcast_or_send,
             is_connected_fn=lambda: self.is_connected,
+            max_concurrency=self.max_concurrency,
         )
+
+    def rotate_token(self) -> str:
+        """Rotates the active pairing token and terminates current connection."""
+        with self._lock:
+            new_token = generate_pairing_token()
+            self.token = new_token
+            conn = self._active_conn
+            self._active_conn = None
+        if conn:
+            conn.close()
+        logger.info("Rotated pairing token to %s", mask_token(new_token))
+        return new_token
+
+    def revoke_token(self) -> None:
+        """Revokes pairing token and closes any active extension connection."""
+        with self._lock:
+            self.token = ""
+            conn = self._active_conn
+            self._active_conn = None
+        if conn:
+            conn.close()
+        logger.info("Revoked pairing token")
 
     def __enter__(self) -> "BrowserGatewayServer":
         return self
@@ -315,6 +347,7 @@ class BrowserGatewayServer:
         initial_data: bytes = b"",
     ) -> None:
         """Upgrades an already-parsed HTTP connection on an existing server to WebSocket."""
+        sock.settimeout(60.0)
         supplied_token = urllib.parse.parse_qs(query).get("token", [""])[0]
         origin = headers.get("origin", "")
 
@@ -326,14 +359,24 @@ class BrowserGatewayServer:
             return
 
         if not verify_pairing_token(supplied_token, self.token):
-            logger.warning("Rejected WebSocket connection with invalid token")
+            logger.warning("Rejected WebSocket connection with invalid token: %s", mask_token(supplied_token))
             self.audit.record("auth.rejected", details={"reason": "token_mismatch", "ext_id": ext_id})
             self._reject(sock, 401, "Unauthorized: Invalid Pairing Token")
             return
 
+        version = headers.get("sec-websocket-version", "")
+        if version != "13":
+            self._reject(sock, 400, "Bad Request: Sec-WebSocket-Version 13 Required")
+            return
+
+        connection = headers.get("connection", "").lower()
+        if "upgrade" not in connection:
+            self._reject(sock, 400, "Bad Request: Connection header must contain Upgrade")
+            return
+
         sec_key = headers.get("sec-websocket-key", "")
-        if not sec_key:
-            self._reject(sock, 400, "Bad Request: Missing sec-websocket-key")
+        if headers.get("upgrade", "").lower() != "websocket" or not sec_key:
+            self._reject(sock, 400, "Bad Request: Missing sec-websocket-key or Upgrade websocket")
             return
 
         accept = base64.b64encode(hashlib.sha1((sec_key + _WS_MAGIC).encode("ascii")).digest()).decode("ascii")
@@ -408,6 +451,7 @@ class BrowserGatewayServer:
     def handle_socket(self, sock: socket.socket) -> None:
         conn: Optional[GatewayClientConnection] = None
         try:
+            sock.settimeout(60.0)
             request_line, headers, leftover = self._read_http_handshake(sock)
             method, target, _ = request_line.split(" ", 2)
             parsed = urllib.parse.urlsplit(target)
@@ -429,15 +473,25 @@ class BrowserGatewayServer:
 
             # Token check
             if not verify_pairing_token(supplied_token, self.token):
-                logger.warning("Rejected WebSocket connection with invalid token")
+                logger.warning("Rejected WebSocket connection with invalid token: %s", mask_token(supplied_token))
                 self.audit.record("auth.rejected", details={"reason": "token_mismatch", "ext_id": ext_id})
                 self._reject(sock, 401, "Unauthorized: Invalid Pairing Token")
                 return
 
-            # WebSocket upgrade check
+            # RFC 6455 checks
+            version = headers.get("sec-websocket-version", "")
+            if version != "13":
+                self._reject(sock, 400, "Bad Request: Sec-WebSocket-Version 13 Required")
+                return
+
+            connection = headers.get("connection", "").lower()
+            if "upgrade" not in connection:
+                self._reject(sock, 400, "Bad Request: Connection header must contain Upgrade")
+                return
+
             sec_key = headers.get("sec-websocket-key", "")
             if headers.get("upgrade", "").lower() != "websocket" or not sec_key:
-                self._reject(sock, 400, "Bad Request: Missing WebSocket Upgrade Headers")
+                self._reject(sock, 400, "Bad Request: Missing sec-websocket-key or Upgrade websocket")
                 return
 
             # Accept handshake

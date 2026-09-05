@@ -11,7 +11,7 @@ import re
 import uuid
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class MessageType(str, Enum):
@@ -93,17 +93,24 @@ class MessageEnvelope(BaseModel):
 
     def __init__(self, **data: Any) -> None:
         try:
-            raw_str = json.dumps(data.get("params") or {})
-            if len(raw_str.encode("utf-8")) > MAX_MESSAGE_BYTES:
+            raw_bytes = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            if len(raw_bytes) > MAX_MESSAGE_BYTES:
                 raise ValueError(f"Message payload exceeds maximum allowed size of {MAX_MESSAGE_BYTES} bytes")
         except (TypeError, OverflowError):
             pass
         super().__init__(**data)
 
+    @model_validator(mode="after")
+    def validate_total_size(self) -> "MessageEnvelope":
+        raw = json.dumps(self.model_dump(exclude_none=True), ensure_ascii=False).encode("utf-8")
+        if len(raw) > MAX_MESSAGE_BYTES:
+            raise ValueError(f"Message payload exceeds maximum allowed size of {MAX_MESSAGE_BYTES} bytes")
+        return self
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MessageEnvelope":
-        raw_str = json.dumps(data, ensure_ascii=False)
-        if len(raw_str.encode("utf-8")) > MAX_MESSAGE_BYTES:
+        raw_bytes = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        if len(raw_bytes) > MAX_MESSAGE_BYTES:
             raise ValueError(f"Message payload exceeds maximum allowed size of {MAX_MESSAGE_BYTES} bytes")
         return cls.model_validate(data)
 

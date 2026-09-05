@@ -73,6 +73,42 @@ class _PendingCommand:
         self.progress: Optional[Dict[str, Any]] = None
 
 
+class _IdempotencyCache:
+    """Bounded, TTL-based idempotency cache to prevent unbounded memory growth."""
+
+    def __init__(self, capacity: int = 500, ttl_sec: float = 300.0):
+        self.capacity = capacity
+        self.ttl_sec = ttl_sec
+        self.cache: Dict[str, Tuple[float, Tuple[bool, Any, Optional[BridgeError]]]] = {}
+        self.lock = threading.Lock()
+
+    def get(self, command_id: str) -> Optional[Tuple[bool, Any, Optional[BridgeError]]]:
+        now = time.monotonic()
+        with self.lock:
+            if command_id in self.cache:
+                ts, val = self.cache[command_id]
+                if now - ts <= self.ttl_sec:
+                    return val
+                del self.cache[command_id]
+            return None
+
+    def set(self, command_id: str, val: Tuple[bool, Any, Optional[BridgeError]]) -> None:
+        now = time.monotonic()
+        with self.lock:
+            if len(self.cache) >= self.capacity:
+                expired = [k for k, (ts, _) in self.cache.items() if now - ts > self.ttl_sec]
+                for k in expired:
+                    del self.cache[k]
+                while len(self.cache) >= self.capacity:
+                    oldest_k = next(iter(self.cache))
+                    del self.cache[oldest_k]
+            self.cache[command_id] = (now, val)
+
+    def clear(self) -> None:
+        with self.lock:
+            self.cache.clear()
+
+
 class WebSocketTransport(BrowserTransport):
     """Realtime WebSocket transport utilizing enveloped v1 protocol with correlation and timeouts."""
 
@@ -81,11 +117,14 @@ class WebSocketTransport(BrowserTransport):
         send_fn: Callable[[Dict[str, Any]], bool],
         *,
         is_connected_fn: Callable[[], bool],
+        max_concurrency: int = 10,
     ):
         self._send_fn = send_fn
         self._is_connected_fn = is_connected_fn
+        self._max_concurrency = max(1, max_concurrency)
+        self._semaphore = threading.BoundedSemaphore(self._max_concurrency)
         self._pending: Dict[str, _PendingCommand] = {}
-        self._idempotency_cache: Dict[str, Tuple[bool, Any, Optional[BridgeError]]] = {}
+        self._idempotency_cache = _IdempotencyCache(capacity=500, ttl_sec=300.0)
         self._lock = threading.RLock()
         self._state = ExtensionState.DISCONNECTED
         self._verification_info: Optional[Dict[str, Any]] = None
@@ -141,8 +180,7 @@ class WebSocketTransport(BrowserTransport):
             if pending:
                 pending.result = env.result
                 pending.event.set()
-            with self._lock:
-                self._idempotency_cache[cmd_id] = (True, env.result, None)
+                self._idempotency_cache.set(cmd_id, (True, env.result, None))
             return
 
         if env.type == MessageType.ERROR:
@@ -150,8 +188,7 @@ class WebSocketTransport(BrowserTransport):
             if pending:
                 pending.error = err
                 pending.event.set()
-            with self._lock:
-                self._idempotency_cache[cmd_id] = (False, None, err)
+                self._idempotency_cache.set(cmd_id, (False, None, err))
             return
 
         if env.type == MessageType.VERIFICATION_REQUIRED:
@@ -175,6 +212,15 @@ class WebSocketTransport(BrowserTransport):
             logger.debug("Tab state update: %s", env.params)
             return
 
+    def reset_pending(self, reason: str = "Connection reset") -> None:
+        """Aborts all currently in-flight pending commands (e.g. upon socket drop)."""
+        with self._lock:
+            pending_cmds = list(self._pending.values())
+            self._pending.clear()
+        for p in pending_cmds:
+            p.error = BridgeError.create(ErrorCode.INTERNAL_ERROR, reason, retryable=True)
+            p.event.set()
+
     def execute_command(
         self,
         action: str,
@@ -188,10 +234,10 @@ class WebSocketTransport(BrowserTransport):
         pars = params or {}
 
         # 1. Check idempotency cache
-        with self._lock:
-            if cid in self._idempotency_cache:
-                logger.info("Returning cached result for idempotent command %s", cid)
-                return self._idempotency_cache[cid]
+        cached = self._idempotency_cache.get(cid)
+        if cached is not None:
+            logger.info("Returning cached result for idempotent command %s", cid)
+            return cached
 
         # 2. Check connection
         if not self.is_connected():
@@ -201,7 +247,17 @@ class WebSocketTransport(BrowserTransport):
                 retryable=True,
             )
 
-        # 3. Validate action & parameters
+        # 3. Check verification pause state
+        if self.get_state() == ExtensionState.AWAITING_USER_VERIFICATION:
+            if action not in ("browser.health", "tab.list", "tab.getActive"):
+                return False, None, BridgeError.create(
+                    ErrorCode.VERIFICATION_REQUIRED,
+                    "Human verification required on page. Workflow paused.",
+                    retryable=True,
+                    details=self.get_verification_info(),
+                )
+
+        # 4. Validate action & parameters
         try:
             validate_action_params(action, pars)
         except Exception as exc:
@@ -211,56 +267,68 @@ class WebSocketTransport(BrowserTransport):
                 retryable=False,
             )
 
-        # 4. Create pending command
-        timeout_sec = max(1.0, deadline_ms / 1000.0)
-        pending = _PendingCommand(cid, action, time.monotonic() + timeout_sec)
-        with self._lock:
-            self._pending[cid] = pending
-            if self._state == ExtensionState.CONNECTED:
-                self._state = ExtensionState.BUSY
-
-        # 5. Send command envelope
-        env = MessageEnvelope(
-            type=MessageType.COMMAND,
-            id=cid,
-            sessionId=session_id,
-            deadlineMs=deadline_ms,
-            action=action,
-            params=pars,
-        )
-
-        sent = self._send_fn(env.to_dict())
-        if not sent:
-            with self._lock:
-                self._pending.pop(cid, None)
+        # 5. Acquire concurrency semaphore (Backpressure)
+        acquired = self._semaphore.acquire(blocking=True, timeout=2.0)
+        if not acquired:
             return False, None, BridgeError.create(
                 ErrorCode.INTERNAL_ERROR,
-                "Failed to transmit command to extension socket",
+                f"Gateway concurrency limit ({self._max_concurrency}) reached",
                 retryable=True,
             )
 
-        # 6. Wait for response or timeout
-        finished = pending.event.wait(timeout=timeout_sec)
+        try:
+            # 6. Create pending command
+            timeout_sec = max(1.0, deadline_ms / 1000.0)
+            pending = _PendingCommand(cid, action, time.monotonic() + timeout_sec)
+            with self._lock:
+                self._pending[cid] = pending
+                if self._state == ExtensionState.CONNECTED:
+                    self._state = ExtensionState.BUSY
 
-        with self._lock:
-            self._pending.pop(cid, None)
-            if self._state == ExtensionState.BUSY:
-                self._state = ExtensionState.CONNECTED
-
-        if not finished:
-            err = BridgeError.create(
-                ErrorCode.TIMEOUT,
-                f"Command '{action}' timed out after {timeout_sec:.1f}s",
-                retryable=True,
+            # 7. Send command envelope
+            env = MessageEnvelope(
+                type=MessageType.COMMAND,
+                id=cid,
+                sessionId=session_id,
+                deadlineMs=deadline_ms,
+                action=action,
+                params=pars,
             )
-            # Try to cancel
-            self.cancel_command(cid)
-            return False, None, err
 
-        if pending.error:
-            return False, None, pending.error
+            sent = self._send_fn(env.to_dict())
+            if not sent:
+                with self._lock:
+                    self._pending.pop(cid, None)
+                return False, None, BridgeError.create(
+                    ErrorCode.INTERNAL_ERROR,
+                    "Failed to transmit command to extension socket",
+                    retryable=True,
+                )
 
-        return True, pending.result, None
+            # 8. Wait for response or timeout
+            finished = pending.event.wait(timeout=timeout_sec)
+
+            with self._lock:
+                self._pending.pop(cid, None)
+                if self._state == ExtensionState.BUSY:
+                    self._state = ExtensionState.CONNECTED
+
+            if not finished:
+                err = BridgeError.create(
+                    ErrorCode.TIMEOUT,
+                    f"Command '{action}' timed out after {timeout_sec:.1f}s",
+                    retryable=True,
+                )
+                # Try to cancel
+                self.cancel_command(cid)
+                return False, None, err
+
+            if pending.error:
+                return False, None, pending.error
+
+            return True, pending.result, None
+        finally:
+            self._semaphore.release()
 
     def cancel_command(self, command_id: str) -> bool:
         env = MessageEnvelope(
@@ -289,14 +357,20 @@ class HttpPollingTransport(BrowserTransport):
 
         def _def_queue(url: str, kind: str) -> Dict[str, Any]:
             target = f"{self.base_url}/ingest/job?url={urllib.parse.quote(url)}&kind={urllib.parse.quote(kind)}"
-            with urllib.request.urlopen(target, timeout=10) as resp:
-                return json.loads(resp.read().decode())
+            try:
+                with urllib.request.urlopen(target, timeout=10) as resp:
+                    return json.loads(resp.read().decode())
+            except Exception as exc:
+                return {"ok": False, "error": f"HTTP queue request failed: {exc}"}
 
         def _def_result(job_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
             target = f"{self.base_url}/ingest/result?id={urllib.parse.quote(job_id)}"
-            with urllib.request.urlopen(target, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-                return data.get("result"), data.get("progress")
+            try:
+                with urllib.request.urlopen(target, timeout=10) as resp:
+                    data = json.loads(resp.read().decode())
+                    return data.get("result"), data.get("progress")
+            except Exception:
+                return None, None
 
         self._queue_fn = queue_fn or _def_queue
         self._get_result_fn = get_result_fn or _def_result
@@ -328,6 +402,12 @@ class HttpPollingTransport(BrowserTransport):
 
         job = self._queue_fn(url, action)
         job_id = job.get("id", "")
+        if not job_id:
+            return False, None, BridgeError.create(
+                ErrorCode.INTERNAL_ERROR,
+                job.get("error") or "Failed to queue job: missing job ID in response",
+                retryable=True,
+            )
         deadline = time.monotonic() + (deadline_ms / 1000.0)
 
         while time.monotonic() < deadline:

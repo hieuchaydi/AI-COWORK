@@ -410,3 +410,197 @@ def test_buffered_socket_reader_logic():
     # Read remaining 2 bytes from wire
     assert reader.read_exact(2) == b"78"
 
+
+def test_all_message_types_serialization():
+    types_to_test = [
+        MessageType.COMMAND,
+        MessageType.ACCEPTED,
+        MessageType.PROGRESS,
+        MessageType.RESULT,
+        MessageType.ERROR,
+        MessageType.CANCEL,
+        MessageType.VERIFICATION_REQUIRED,
+        MessageType.VERIFICATION_RESOLVED,
+        MessageType.PING,
+        MessageType.PONG,
+    ]
+    for mtype in types_to_test:
+        env = MessageEnvelope(
+            type=mtype,
+            id=f"test-{mtype}",
+            params={"kind": str(mtype)},
+            result={"ok": True} if mtype == MessageType.RESULT else None,
+            error=BridgeError.create(ErrorCode.TIMEOUT, "test") if mtype == MessageType.ERROR else None,
+        )
+        d = env.to_dict()
+        assert d["type"] == mtype.value
+        recovered = MessageEnvelope.from_dict(d)
+        assert recovered.type == mtype
+
+
+def test_same_origin_bypass_vectors():
+    tab_url = "https://shop.example.com/product/123"
+
+    # Same host, same port, same scheme
+    assert is_same_origin("https://shop.example.com/api/details", tab_url) is True
+    assert is_same_origin("/api/details", tab_url) is True
+    assert is_same_origin("details", tab_url) is True
+
+    # Bypass vectors
+    # 1. Subdomain suffix bypass (e.g. shop.example.com.attacker.com)
+    assert is_same_origin("https://shop.example.com.attacker.com/api", tab_url) is False
+    # 2. Userinfo bypass (e.g. https://shop.example.com@attacker.com)
+    assert is_same_origin("https://shop.example.com@attacker.com/api", tab_url) is False
+    assert is_same_origin("https://attacker.com@shop.example.com/api", tab_url) is False
+    # 3. Port mismatch
+    assert is_same_origin("https://shop.example.com:8443/api", tab_url) is False
+    # 4. Scheme mismatch
+    assert is_same_origin("http://shop.example.com/api", tab_url) is False
+    # 5. Non-web schemes
+    assert is_same_origin("data:text/html,payload", tab_url) is False
+    assert is_same_origin("file:///etc/passwd", tab_url) is False
+    assert is_same_origin("javascript:alert(1)", tab_url) is False
+    assert is_same_origin("chrome://extensions", tab_url) is False
+    # 6. Invalid / malformed URLs
+    assert is_same_origin("", tab_url) is False
+    assert is_same_origin("://malformed", tab_url) is False
+
+
+def test_empty_params_and_extra_forbidden():
+    from pydantic import ValidationError
+
+    # Empty params valid for tab.list and browser.health
+    p1 = validate_action_params(ActionName.BROWSER_HEALTH, {})
+    assert p1 is not None
+    p2 = validate_action_params(ActionName.TAB_LIST, {})
+    assert p2 is not None
+
+    # Extra fields forbidden
+    with pytest.raises(ValidationError):
+        validate_action_params(ActionName.BROWSER_HEALTH, {"unexpected_field": 123})
+
+
+def test_enum_validation_and_disallowed_params():
+    from pydantic import ValidationError
+    from browser_bridge.actions import PageNavigateParams, PageSnapshotParams, PageWaitForParams
+
+    # Invalid waitUntil enum
+    with pytest.raises(ValidationError):
+        PageNavigateParams(url="https://example.com", waitUntil="instant")
+
+    # Invalid state enum
+    with pytest.raises(ValidationError):
+        PageWaitForParams(selector="button", state="clickable")
+
+    # Invalid snapshot format
+    with pytest.raises(ValidationError):
+        PageSnapshotParams(format="accessibility")
+
+    # Forbidden authorization header in fetch.sameOrigin
+    with pytest.raises(ValidationError, match="(?i)authorization"):
+        validate_action_params(
+            ActionName.FETCH_SAME_ORIGIN,
+            {"pathOrUrl": "/api", "headers": {"Authorization": "Bearer secret"}},
+        )
+
+
+def test_verification_pause_blocks_actions():
+    connected = [True]
+    transport = WebSocketTransport(
+        send_fn=lambda env: True,
+        is_connected_fn=lambda: connected[0],
+    )
+    transport.set_state(ExtensionState.AWAITING_USER_VERIFICATION, {"reason": "Captcha"})
+
+    # Action that modifies page must be blocked
+    ok, res, err = transport.execute_command(
+        action=ActionName.PAGE_NAVIGATE,
+        params={"url": "https://example.com"},
+    )
+    assert ok is False
+    assert err is not None
+    assert err.code == ErrorCode.VERIFICATION_REQUIRED.value
+
+    # Whitelisted inspection action must be allowed
+    ok2, res2, err2 = transport.execute_command(
+        action=ActionName.TAB_LIST,
+        deadline_ms=500,
+    )
+    # Even if it times out waiting for mock response, it was NOT blocked by verification check
+    assert err2.code != ErrorCode.VERIFICATION_REQUIRED.value
+
+
+def test_websocket_transport_concurrency_semaphore():
+    import threading
+
+    transport = WebSocketTransport(
+        send_fn=lambda env: True,
+        is_connected_fn=lambda: True,
+        max_concurrency=1,
+    )
+    transport.set_state(ExtensionState.CONNECTED)
+
+    results = []
+
+    def task1():
+        ok, res, err = transport.execute_command(
+            action=ActionName.TAB_LIST,
+            deadline_ms=1500,
+            command_id="cmd-task-1",
+        )
+        results.append((1, ok, err))
+
+    def task2():
+        time.sleep(0.05)
+        # Attempt to run second concurrent command while task1 is occupying the single permit
+        ok, res, err = transport.execute_command(
+            action=ActionName.TAB_LIST,
+            deadline_ms=1500,
+            command_id="cmd-task-2",
+        )
+        results.append((2, ok, err))
+
+    t1 = threading.Thread(target=task1)
+    t2 = threading.Thread(target=task2)
+    t1.start()
+    t2.start()
+
+    time.sleep(0.2)
+    # Satisfy task1
+    transport.handle_inbound_envelope({
+        "v": 1,
+        "type": "result",
+        "id": "cmd-task-1",
+        "result": [],
+    })
+
+    time.sleep(0.2)
+    # Satisfy task2
+    transport.handle_inbound_envelope({
+        "v": 1,
+        "type": "result",
+        "id": "cmd-task-2",
+        "result": [],
+    })
+
+    t1.join(timeout=2.0)
+    t2.join(timeout=2.0)
+
+    assert len(results) == 2
+    for item in results:
+        assert item[1] is True  # ok == True
+
+
+def test_http_polling_network_error_handling():
+    # Transport pointing to nonexistent port returns BridgeError safely without unhandled crash
+    transport = HttpPollingTransport(base_url="http://127.0.0.1:59999")
+    ok, res, err = transport.execute_command(
+        action="shopee-reviews",
+        params={"url": "https://shopee.vn/product/1/2"},
+        deadline_ms=1000,
+    )
+    assert ok is False
+    assert err is not None
+    assert err.code == ErrorCode.INTERNAL_ERROR.value
+    assert err.retryable is True
+
