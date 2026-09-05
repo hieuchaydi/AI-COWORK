@@ -560,8 +560,14 @@ async function extractShopeeReviews(job, progress) {
       const [res] = await chrome.scripting.executeScript({
         target: { tabId: targetTab.id },
         func: () => {
+          let m = location.href.match(/i\.(\d+)\.(\d+)/) || location.pathname.match(/^\/product\/(\d+)\/(\d+)/);
+          if (m) return m[1];
+          const can = document.querySelector('link[rel="canonical"]')?.href || "";
+          m = can.match(/i\.(\d+)\.(\d+)/) || can.match(/\/product\/(\d+)\/(\d+)/);
+          if (m) return m[1];
           const html = document.documentElement.innerHTML;
           const m = html.match(/"shopid"\s*:\s*"?(\d+)/) || html.match(/"shop_id"\s*:\s*"?(\d+)/);
+          m = html.match(/"shopid"\s*:\s*"?(\d+)/) || html.match(/"shop_id"\s*:\s*"?(\d+)/);
           return m ? m[1] : null;
         },
       });
