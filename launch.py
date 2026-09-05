@@ -25,6 +25,7 @@ import io
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -36,6 +37,8 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+from browser_ws_bridge import BrowserWebSocketBridge
 
 
 # Our banners and Vietnamese hints use non-cp1252 characters (⇒, ✓, ─). A Windows
@@ -133,6 +136,7 @@ API_PORT = "8765"
 OW_MODEL = "gemini:gemini-3.5-flash-lite"
 GUI_PORT = "1420"
 HELPER_PORT = 8766  # tiny sidecar: Google/connectors wizards + outputs/artifacts serving
+HELPER_WS_PORT = int(os.environ.get("BROWSER_WS_PORT", "8767"))
 
 
 def _outputs_root() -> Path:
@@ -151,6 +155,11 @@ _INGEST_JOB_EVENT = threading.Event()
 _INGEST_RESULTS: dict[str, dict] = {}
 _INGEST_PROGRESS: dict[str, dict] = {}
 _INGEST_PROGRESS_LOCK = threading.Lock()
+
+# Chrome extension control channel. The token is process-local and is disclosed only
+# to a chrome-extension:// origin by /browser/pair. This prevents an arbitrary website
+# from opening a loopback control socket while keeping installation zero-config.
+_BROWSER_WS = BrowserWebSocketBridge(secrets.token_urlsafe(32))
 
 # ── Dynamic Tool Registry ─────────────────────────────────────────────────────
 # Agent tự viết tool mới qua GET /tools/register?name=…&desc=…&code=…
@@ -296,6 +305,37 @@ def _claim_ingest_jobs(wait_seconds: float) -> list[dict]:
         if remaining <= 0:
             return []
         _INGEST_JOB_EVENT.wait(min(remaining, 1.0))
+
+
+def _ack_ingest_job(job_id: str) -> None:
+    if not job_id:
+        return
+    with _INGEST_JOBS_LOCK:
+        for i, j in enumerate(_INGEST_JOBS):
+            if j.get("id") == job_id:
+                _INGEST_JOBS.pop(i)
+                break
+
+
+def _on_browser_ws_connect() -> None:
+    """Replay unclaimed jobs after first connect or a reconnect."""
+    with _INGEST_JOBS_LOCK:
+        pending = list(_INGEST_JOBS)
+    for job in pending:
+        if not _BROWSER_WS.send({"type": "ingest.job", "job": job}):
+            break
+
+
+def _on_browser_ws_message(message: dict) -> None:
+    kind = message.get("type")
+    if kind == "ingest.ack":
+        _ack_ingest_job(str(message.get("jobId") or ""))
+    elif kind == "bridge.ping":
+        _BROWSER_WS.send({"type": "bridge.pong", "at": time.time()})
+
+
+_BROWSER_WS.on_connect = _on_browser_ws_connect
+_BROWSER_WS.on_message = _on_browser_ws_message
 
 
 def _write_ingest_csv(json_name: str, rows: list) -> str | None:
@@ -1111,11 +1151,74 @@ class _HelperHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        # WebSocket upgrade request for browser bridge
+        clean_path = self.path.split("?", 1)[0]
+        if clean_path in ("/browser/v1/ws", "/browser-extension") or self.headers.get("Upgrade", "").lower() == "websocket":
+            q_str = self.path.split("?", 1)[1] if "?" in self.path else ""
+            headers_dict = {str(k).lower(): str(v) for k, v in self.headers.items()}
+            _BROWSER_WS.upgrade_http_connection(self.connection, clean_path, q_str, headers_dict)
+            return
+
         # /ping — keepalive for the browser extension's MV3 service worker.
         # The extension pings this every 20 s while a job is running to prevent Chrome
         # from killing the idle worker (MV3 workers are terminated when no fetch is pending).
         if self.path.split("?", 1)[0] == "/ping":
             self._json(200, {"ok": True})
+            return
+
+        # /browser/pair — one-time bootstrap for the MV3 extension's loopback
+        # WebSocket. Never expose the token to a normal web origin: otherwise any
+        # visited page could turn localhost into a confused-deputy browser controller.
+        if self.path.split("?", 1)[0] == "/browser/pair":
+            origin = self.headers.get("Origin", "")
+            if not origin.startswith("chrome-extension://"):
+                self._json(403, {"ok": False, "error": "extension origin required"})
+                return
+            body = json.dumps(
+                {
+                    "ok": True,
+                    "protocolVersion": "1.0",
+                    "token": _BROWSER_WS.token,
+                    "wsUrl": f"ws://127.0.0.1:{HELPER_PORT}/browser/v1/ws",
+                    "fallbackWsUrl": f"ws://127.0.0.1:{HELPER_WS_PORT}/browser-extension",
+                    "capabilities": ["actions", "verification", "same_origin_fetch"],
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if self.path.split("?", 1)[0] == "/browser/status":
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "transport": "extension-websocket" if _BROWSER_WS.connected else "http-long-poll",
+                    "connected": _BROWSER_WS.connected,
+                    "protocolVersion": "1.0",
+                    "wsPort": HELPER_WS_PORT,
+                    "httpPort": HELPER_PORT,
+                    "wsUrl": f"ws://127.0.0.1:{HELPER_PORT}/browser/v1/ws",
+                    "pendingJobs": len(_INGEST_JOBS),
+                },
+            )
+            return
+
+        if self.path.split("?", 1)[0] == "/browser/resume":
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            job_id = (qs.get("id", [""])[0] or qs.get("jobId", [""])[0] or "").strip()
+            msg = {
+                "v": 1,
+                "type": "verification.resolved",
+                "params": {"jobId": job_id} if job_id else {},
+            }
+            sent = _BROWSER_WS.send(msg)
+            self._json(200, {"ok": True, "sent": sent, "jobId": job_id})
             return
 
         # ── Dynamic Tools ─────────────────────────────────────────────────────
@@ -1971,6 +2074,14 @@ class _HelperHandler(BaseHTTPRequestHandler):
 
 
 def _start_helper() -> ThreadingHTTPServer | None:
+    try:
+        ws_port = _BROWSER_WS.start("127.0.0.1", HELPER_WS_PORT)
+        print(f"[launch] Browser extension WebSocket on ws://127.0.0.1:{ws_port}/browser-extension")
+    except OSError as exc:
+        print(
+            f"[launch] browser WebSocket :{HELPER_WS_PORT} not started ({exc}); using HTTP long-poll",
+            file=sys.stderr,
+        )
     try:
         srv = ThreadingHTTPServer(("127.0.0.1", HELPER_PORT), _HelperHandler)
     except OSError as exc:
