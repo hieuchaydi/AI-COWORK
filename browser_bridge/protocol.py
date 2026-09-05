@@ -27,6 +27,7 @@ class MessageType(str, Enum):
     PONG = "pong"
     TAB_STATE = "tab.state"
     VERIFICATION_REQUIRED = "verification.required"
+    VERIFICATION_RESOLVED = "verification.resolved"
 
 
 class ErrorCode(str, Enum):

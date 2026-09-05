@@ -167,6 +167,10 @@ class WebSocketTransport(BrowserTransport):
                 pending.event.set()
             return
 
+        if env.type == MessageType.VERIFICATION_RESOLVED:
+            self.resume_verification()
+            return
+
         if env.type == MessageType.TAB_STATE:
             logger.debug("Tab state update: %s", env.params)
             return

@@ -38,6 +38,29 @@ class WebSocketProtocolError(Exception):
     pass
 
 
+class _BufferedSocketReader:
+    """Socket reader that drains any leftover handshake buffer before reading the wire."""
+
+    def __init__(self, sock: socket.socket, initial_data: bytes = b""):
+        self.sock = sock
+        self.buf = bytearray(initial_data)
+
+    def read_exact(self, size: int) -> bytes:
+        chunks = []
+        if self.buf:
+            take = min(len(self.buf), size)
+            chunks.append(bytes(self.buf[:take]))
+            del self.buf[:take]
+            size -= take
+        while size > 0:
+            chunk = self.sock.recv(size)
+            if not chunk:
+                raise ConnectionError("Peer closed socket")
+            chunks.append(chunk)
+            size -= len(chunk)
+        return b"".join(chunks)
+
+
 def _read_exact(sock: socket.socket, size: int) -> bytes:
     chunks = []
     remaining = size
@@ -60,8 +83,10 @@ def _encode_frame(payload: bytes, opcode: int = 0x1) -> bytes:
     return head + bytes([127]) + struct.pack("!Q", size) + payload
 
 
-def _read_frame(sock: socket.socket, max_bytes: int = MAX_MESSAGE_BYTES) -> tuple[int, bytes]:
-    first, second = _read_exact(sock, 2)
+def _read_frame(source: socket.socket | _BufferedSocketReader, max_bytes: int = MAX_MESSAGE_BYTES) -> tuple[int, bytes]:
+    read_fn = source.read_exact if isinstance(source, _BufferedSocketReader) else lambda sz: _read_exact(source, sz)
+
+    first, second = read_fn(2)
     fin = bool(first & 0x80)
     opcode = first & 0x0F
     masked = bool(second & 0x80)
@@ -73,15 +98,15 @@ def _read_frame(sock: socket.socket, max_bytes: int = MAX_MESSAGE_BYTES) -> tupl
         raise WebSocketProtocolError("Client frames must be masked")
 
     if size == 126:
-        size = struct.unpack("!H", _read_exact(sock, 2))[0]
+        size = struct.unpack("!H", read_fn(2))[0]
     elif size == 127:
-        size = struct.unpack("!Q", _read_exact(sock, 8))[0]
+        size = struct.unpack("!Q", read_fn(8))[0]
 
     if size > max_bytes:
         raise WebSocketProtocolError(f"Payload size {size} exceeds limit {max_bytes}")
 
-    mask = _read_exact(sock, 4)
-    payload = bytearray(_read_exact(sock, size))
+    mask = read_fn(4)
+    payload = bytearray(read_fn(size))
     for i in range(size):
         payload[i] ^= mask[i % 4]
 
@@ -97,7 +122,9 @@ class GatewayClientConnection:
         self.send_lock = threading.Lock()
         self.closed = False
 
-    def send(self, payload: Dict[str, Any]) -> None:
+    def send(self, payload: Dict[str, Any] | MessageEnvelope) -> None:
+        if hasattr(payload, "to_dict"):
+            payload = payload.to_dict()
         raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(raw) > MAX_MESSAGE_BYTES:
             raise ValueError(f"Outbound payload {len(raw)} exceeds {MAX_MESSAGE_BYTES}")
@@ -141,12 +168,14 @@ class BrowserGatewayServer:
         max_concurrency: int = 10,
         on_message: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_connect: Optional[Callable[[], None]] = None,
+        on_disconnect: Optional[Callable[[], None]] = None,
     ):
         self.token = token or generate_pairing_token()
         self.allowlisted_extension_ids = allowlisted_extension_ids
         self.max_concurrency = max_concurrency
         self.on_message = on_message
         self.on_connect = on_connect
+        self.on_disconnect = on_disconnect
         self.audit = AuditLogger()
 
         self._active_conn: Optional[GatewayClientConnection] = None
@@ -159,6 +188,12 @@ class BrowserGatewayServer:
             send_fn=self.broadcast_or_send,
             is_connected_fn=lambda: self.is_connected,
         )
+
+    def __enter__(self) -> "BrowserGatewayServer":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.stop()
 
     @property
     def is_connected(self) -> bool:
@@ -256,12 +291,20 @@ class BrowserGatewayServer:
                 logger.warning("on_connect callback raised: %s", e)
 
     def _unregister(self, conn: GatewayClientConnection) -> None:
+        was_active = False
         with self._lock:
             if self._active_conn is conn:
                 self._active_conn = None
+                was_active = True
         conn.close()
-        self.transport.set_state(ExtensionState.DISCONNECTED)
-        self.audit.record("client.disconnected", details={"extension_id": conn.extension_id})
+        if was_active:
+            self.transport.set_state(ExtensionState.DISCONNECTED)
+            self.audit.record("client.disconnected", details={"extension_id": conn.extension_id})
+            if self.on_disconnect:
+                try:
+                    self.on_disconnect()
+                except Exception as e:
+                    logger.warning("on_disconnect callback raised: %s", e)
 
     def upgrade_http_connection(
         self,
@@ -269,6 +312,7 @@ class BrowserGatewayServer:
         path: str,
         query: str,
         headers: Dict[str, str],
+        initial_data: bytes = b"",
     ) -> None:
         """Upgrades an already-parsed HTTP connection on an existing server to WebSocket."""
         supplied_token = urllib.parse.parse_qs(query).get("token", [""])[0]
@@ -304,13 +348,23 @@ class BrowserGatewayServer:
 
         conn = GatewayClientConnection(sock, extension_id=ext_id or "unknown")
         self._register(conn)
-        self._run_frame_loop(sock, conn)
+        self._run_frame_loop(sock, conn, initial_data=initial_data)
 
-    def _run_frame_loop(self, sock: socket.socket, conn: GatewayClientConnection) -> None:
+    def _run_frame_loop(
+        self,
+        sock: socket.socket,
+        conn: GatewayClientConnection,
+        initial_data: bytes = b"",
+    ) -> None:
+        reader = _BufferedSocketReader(sock, initial_data)
         try:
             while True:
-                opcode, raw = _read_frame(sock)
+                opcode, raw = _read_frame(reader)
                 if opcode == 0x8:  # Close
+                    try:
+                        conn.send_control(0x8, raw[:125])
+                    except Exception:
+                        pass
                     break
                 elif opcode == 0x9:  # Ping
                     conn.send_control(0xA, raw)
@@ -354,7 +408,7 @@ class BrowserGatewayServer:
     def handle_socket(self, sock: socket.socket) -> None:
         conn: Optional[GatewayClientConnection] = None
         try:
-            request_line, headers = self._read_http_handshake(sock)
+            request_line, headers, leftover = self._read_http_handshake(sock)
             method, target, _ = request_line.split(" ", 2)
             parsed = urllib.parse.urlsplit(target)
             supplied_token = urllib.parse.parse_qs(parsed.query).get("token", [""])[0]
@@ -399,7 +453,7 @@ class BrowserGatewayServer:
 
             conn = GatewayClientConnection(sock, extension_id=ext_id or "unknown")
             self._register(conn)
-            self._run_frame_loop(sock, conn)
+            self._run_frame_loop(sock, conn, initial_data=leftover)
         except (ConnectionError, OSError, WebSocketProtocolError, ValueError) as exc:
             logger.debug("Client socket terminated: %s", exc)
         finally:
@@ -410,7 +464,7 @@ class BrowserGatewayServer:
                     pass
 
     @staticmethod
-    def _read_http_handshake(sock: socket.socket) -> tuple[str, dict[str, str]]:
+    def _read_http_handshake(sock: socket.socket) -> tuple[str, dict[str, str], bytes]:
         data = bytearray()
         while b"\r\n\r\n" not in data:
             chunk = sock.recv(2048)
@@ -419,14 +473,16 @@ class BrowserGatewayServer:
             data.extend(chunk)
             if len(data) > 16 * 1024:
                 raise WebSocketProtocolError("Handshake headers exceed 16KB")
-        head = bytes(data).split(b"\r\n\r\n", 1)[0].decode("latin-1")
+        parts = bytes(data).split(b"\r\n\r\n", 1)
+        head = parts[0].decode("latin-1")
+        leftover = parts[1] if len(parts) > 1 else b""
         lines = head.split("\r\n")
         headers = {}
         for line in lines[1:]:
             name, sep, val = line.partition(":")
             if sep:
                 headers[name.strip().lower()] = val.strip()
-        return lines[0], headers
+        return lines[0], headers, leftover
 
     @staticmethod
     def _reject(sock: socket.socket, status: int, reason: str) -> None:

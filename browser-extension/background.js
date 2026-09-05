@@ -255,9 +255,9 @@ function resumeVerification() {
   if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
     bridgeSend({
       v: 1,
-      type: "progress",
+      type: "verification.resolved",
       id: "resumed-" + Date.now(),
-      progress: { status: "resumed", message: "User confirmed verification in tab" },
+      params: { status: "resumed", message: "User confirmed verification in tab" },
     });
   }
 }
@@ -576,6 +576,27 @@ async function dispatchEnvelope(envelope) {
     return;
   }
 
+  // Handle cancel
+  if (envelope.type === "cancel") {
+    const targetId = envelope.params && envelope.params.targetCommandId;
+    if (targetId && activeJobs.has(targetId)) {
+      activeJobs.delete(targetId);
+      bridgeSend({
+        v: 1,
+        type: "result",
+        id: envelope.id || ("cancel-" + Date.now()),
+        result: { cancelled: true, targetCommandId: targetId },
+      });
+    }
+    return;
+  }
+
+  // Handle verification resume/resolved
+  if (envelope.type === "verification.resolved" || envelope.type === "verification.resume") {
+    resumeVerification();
+    return;
+  }
+
   // Handle ping
   if (envelope.type === "ping" || envelope.type === "bridge.ping") {
     bridgeSend({
@@ -720,7 +741,13 @@ let looping = false;
 function enqueueLegacyJob(job, transport) {
   if (!job || !job.id) return;
   if (transport === "websocket") {
-    bridgeSend({ v: 1, type: "accepted", id: job.id, params: { kind: "legacy.ingest.job" } });
+    bridgeSend({
+      v: 1,
+      type: "accepted",
+      id: job.id,
+      jobId: job.id,
+      params: { kind: "legacy.ingest.job", jobId: job.id },
+    });
   }
   jobChain = jobChain.then(() => runJob(job)).catch((err) => console.error("[bridge] Job failed:", err));
 }

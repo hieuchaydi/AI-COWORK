@@ -325,3 +325,88 @@ def test_transport_manager_fallback():
     connected[0] = True
     assert manager.active_transport_name == "websocket"
 
+
+def test_browser_ws_bridge_wrapper_and_lifecycle():
+    from browser_ws_bridge import BrowserWebSocketBridge
+
+    # Empty token must fail
+    with pytest.raises(ValueError, match="must not be empty"):
+        BrowserWebSocketBridge("")
+
+    disconnect_called = [False]
+    connect_called = [False]
+
+    bridge = BrowserWebSocketBridge(
+        "test-valid-token-12345678901234567890",
+        on_connect=lambda: connect_called.__setitem__(0, True),
+        on_disconnect=lambda: disconnect_called.__setitem__(0, True),
+    )
+
+    assert bridge.connected is False
+
+    # Send returns False when not connected
+    assert bridge.send({"type": "test"}) is False
+
+    # Send accepts MessageEnvelope
+    env = MessageEnvelope(type=MessageType.PING)
+    assert bridge.send(env) is False
+
+    # Context manager test
+    with bridge as b:
+        assert b is bridge
+
+    # on_disconnect callback triggering
+    assert bridge.on_disconnect is not None
+
+
+def test_websocket_transport_verification_resolved_flow():
+    connected = [True]
+    transport = WebSocketTransport(
+        send_fn=lambda env: True,
+        is_connected_fn=lambda: connected[0],
+    )
+    transport.set_state(ExtensionState.CONNECTED)
+
+    # Trigger verification
+    verify_env = MessageEnvelope(
+        type=MessageType.VERIFICATION_REQUIRED,
+        params={"reason": "Captcha challenge"},
+    )
+    transport.handle_inbound_envelope(verify_env.to_dict())
+    assert transport.get_state() == ExtensionState.AWAITING_USER_VERIFICATION
+    assert transport.get_verification_info() == {"reason": "Captcha challenge"}
+
+    # Inbound verification.resolved resets state
+    resolved_env = MessageEnvelope(
+        type=MessageType.VERIFICATION_RESOLVED,
+        params={"status": "resumed"},
+    )
+    transport.handle_inbound_envelope(resolved_env.to_dict())
+    assert transport.get_state() == ExtensionState.CONNECTED
+    assert transport.get_verification_info() is None
+
+
+def test_buffered_socket_reader_logic():
+    from browser_bridge.server import _BufferedSocketReader
+
+    class DummySocket:
+        def __init__(self, wire_bytes: bytes):
+            self.wire = bytearray(wire_bytes)
+
+        def recv(self, n: int) -> bytes:
+            take = min(len(self.wire), n)
+            chunk = bytes(self.wire[:take])
+            del self.wire[:take]
+            return chunk
+
+    # Reader with initial leftover data of 4 bytes, wire with 4 bytes
+    sock = DummySocket(b"5678")
+    reader = _BufferedSocketReader(sock, initial_data=b"1234")
+
+    # Read first 2 bytes from buffer
+    assert reader.read_exact(2) == b"12"
+    # Read next 4 bytes (2 from buffer, 2 from wire)
+    assert reader.read_exact(4) == b"3456"
+    # Read remaining 2 bytes from wire
+    assert reader.read_exact(2) == b"78"
+

@@ -42,6 +42,7 @@ class BrowserWebSocketBridge(BrowserGatewayServer):
         *,
         on_message: Optional[Callable[[dict[str, Any]], None]] = None,
         on_connect: Optional[Callable[[], None]] = None,
+        on_disconnect: Optional[Callable[[], None]] = None,
         allowlisted_extension_ids: Optional[Set[str]] = None,
     ) -> None:
         if not token:
@@ -51,13 +52,16 @@ class BrowserWebSocketBridge(BrowserGatewayServer):
             allowlisted_extension_ids=allowlisted_extension_ids,
             on_message=on_message,
             on_connect=on_connect,
+            on_disconnect=on_disconnect,
         )
 
     @property
     def connected(self) -> bool:
         return self.is_connected
 
-    def send(self, payload: dict[str, Any]) -> bool:
+    def send(self, payload: dict[str, Any] | MessageEnvelope) -> bool:
+        if hasattr(payload, "to_dict"):
+            payload = payload.to_dict()
         return self.broadcast_or_send(payload)
 
 

@@ -268,6 +268,11 @@ def _queue_ingest_job(url: str, kind: str) -> dict:
         },
     )
     _INGEST_JOB_EVENT.set()
+    if _BROWSER_WS.connected:
+        try:
+            _BROWSER_WS.send({"type": "ingest.job", "job": job})
+        except Exception as exc:
+            print(f"[ingest] failed to push job to websocket: {exc}", file=sys.stderr)
     print(f"[ingest] job queued: {kind} {url}", file=sys.stderr)
     return job
 
@@ -328,9 +333,10 @@ def _on_browser_ws_connect() -> None:
 
 def _on_browser_ws_message(message: dict) -> None:
     kind = message.get("type")
-    if kind == "ingest.ack":
-        _ack_ingest_job(str(message.get("jobId") or ""))
-    elif kind == "bridge.ping":
+    if kind in ("ingest.ack", "accepted"):
+        job_id = str(message.get("jobId") or message.get("id") or "")
+        _ack_ingest_job(job_id)
+    elif kind in ("bridge.ping", "ping"):
         _BROWSER_WS.send({"type": "bridge.pong", "at": time.time()})
 
 
@@ -1154,6 +1160,7 @@ class _HelperHandler(BaseHTTPRequestHandler):
         # WebSocket upgrade request for browser bridge
         clean_path = self.path.split("?", 1)[0]
         if clean_path in ("/browser/v1/ws", "/browser-extension") or self.headers.get("Upgrade", "").lower() == "websocket":
+            self.close_connection = True
             q_str = self.path.split("?", 1)[1] if "?" in self.path else ""
             headers_dict = {str(k).lower(): str(v) for k, v in self.headers.items()}
             _BROWSER_WS.upgrade_http_connection(self.connection, clean_path, q_str, headers_dict)
@@ -2804,6 +2811,10 @@ def main() -> None:
     )
 
     def _cleanup() -> None:
+        try:
+            _BROWSER_WS.stop()
+        except Exception:
+            pass
         _stop(gui_proc, "connect-ai-gui")
         _stop(server_proc, "connect-ai-server")
         for handle in (server_log, gui_log):

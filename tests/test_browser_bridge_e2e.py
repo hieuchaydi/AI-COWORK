@@ -272,3 +272,121 @@ def test_e2e_human_verification_and_resume_flow(gateway_server):
     finally:
         client.close()
 
+
+def test_e2e_reconnect_does_not_corrupt_active_state(gateway_server):
+    server, port, token = gateway_server
+    client1 = SimpleWebSocketTestClient("127.0.0.1", port)
+    client2 = SimpleWebSocketTestClient("127.0.0.1", port)
+    try:
+        # Client 1 connects
+        s1 = client1.connect(token=token)
+        assert s1 == 101
+        _ = client1.recv_json()
+        assert server.is_connected is True
+
+        # Client 2 connects (replaces client 1 as active connection)
+        s2 = client2.connect(token=token)
+        assert s2 == 101
+        _ = client2.recv_json()
+        assert server.is_connected is True
+
+        # Client 1 closes its socket
+        client1.close()
+        time.sleep(0.2)
+
+        # Server transport state MUST remain CONNECTED because client 2 is active!
+        assert server.is_connected is True
+        assert server.transport.get_state() == ExtensionState.CONNECTED
+
+        # Can still execute command via client 2
+        result_container = []
+
+        def execute_worker():
+            ok, res, err = server.transport.execute_command(
+                action="tab.list",
+                deadline_ms=4000,
+            )
+            result_container.append((ok, res, err))
+
+        t = threading.Thread(target=execute_worker)
+        t.start()
+
+        cmd = client2.recv_json(timeout=3.0)
+        assert cmd is not None
+        assert cmd.get("action") == "tab.list"
+
+        client2.send_json({
+            "v": 1,
+            "type": "result",
+            "id": cmd.get("id"),
+            "result": [{"id": 42}],
+        })
+
+        t.join(timeout=3.0)
+        assert len(result_container) == 1
+        ok, res, err = result_container[0]
+        assert ok is True
+        assert res == [{"id": 42}]
+    finally:
+        client1.close()
+        client2.close()
+
+
+def test_e2e_pipelined_handshake_frame_buffering(gateway_server):
+    server, port, token = gateway_server
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(5.0)
+    try:
+        sock.connect(("127.0.0.1", port))
+        sec_key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+        req = (
+            f"GET /browser/v1/ws?token={token} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {sec_key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "Origin: chrome-extension://abcdefghijklmnopabcdefghijklmnop\r\n\r\n"
+        ).encode("ascii")
+
+        # Create a masked ping frame to send simultaneously with the handshake request
+        ping_payload = json.dumps({"v": 1, "type": "ping"}).encode("utf-8")
+        mask = secrets.token_bytes(4)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(ping_payload))
+        frame = bytes([0x81, 0x80 | len(ping_payload)]) + mask + masked
+
+        # Send BOTH together in a single sendall call (pipelined)
+        sock.sendall(req + frame)
+
+        # Read HTTP response
+        resp = bytearray()
+        unread = bytearray()
+        while b"\r\n\r\n" not in resp:
+            chunk = sock.recv(1024)
+            if not chunk:
+                break
+            resp.extend(chunk)
+
+        parts = resp.split(b"\r\n\r\n", 1)
+        assert b"101 Switching Protocols" in parts[0]
+        if len(parts) > 1:
+            unread.extend(parts[1])
+
+        # Receive frames via SimpleWebSocketTestClient
+        client = SimpleWebSocketTestClient("127.0.0.1", port)
+        client.sock = sock
+        client._unread = unread
+
+        hello = client.recv_json(timeout=2.0)
+        assert hello is not None
+        assert hello.get("type") == "hello"
+
+        pong = client.recv_json(timeout=2.0)
+        assert pong is not None
+        assert pong.get("type") == "pong"
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
