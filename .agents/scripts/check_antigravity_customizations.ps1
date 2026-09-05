@@ -88,6 +88,7 @@ $requiredPaths = @(
   ".agents\plugins\auto-execute\hooks.json",
   ".agents\plugins\auto-execute\allow.py",
   ".agents\plugins\auto-execute\rules\AGENTS.md",
+  ".agents\plugins\auto-execute\skills\review\SKILL.md",
   ".agents\plugins\media-scrape-autopilot",
   ".agents\plugins\media-scrape-autopilot\plugin.json",
   ".agents\plugins\media-scrape-autopilot\hooks.json",
