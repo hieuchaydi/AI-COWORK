@@ -39,6 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from browser_ws_bridge import BrowserWebSocketBridge, validate_extension_origin, verify_pairing_token
+from browser_bridge.ingest import IngestRPC
 
 
 # Our banners and Vietnamese hints use non-cp1252 characters (⇒, ✓, ─). A Windows
@@ -148,6 +149,7 @@ def _outputs_root() -> Path:
 # is only meaningful while both the helper and Chrome are up, and a stale job replayed
 # after a restart would scrape something nobody asked for.
 _INGEST_JOBS: list[dict] = []
+_INGEST_INFLIGHT: dict[str, dict] = {}
 _INGEST_JOBS_LOCK = threading.Lock()
 _INGEST_JOB_EVENT = threading.Event()
 # job id → what /ingest received for it, so the agent can block on completion instead of
@@ -248,7 +250,7 @@ _load_persisted_tools()
 
 def _queue_ingest_job(url: str, kind: str) -> dict:
     job = {
-        "id": f"job-{int(time.time() * 1000)}",
+        "id": f"job-{secrets.token_hex(12)}",
         "url": url,
         "kind": kind,
         "queued_at": time.strftime("%H:%M:%S"),
@@ -318,14 +320,14 @@ def _ack_ingest_job(job_id: str) -> None:
     with _INGEST_JOBS_LOCK:
         for i, j in enumerate(_INGEST_JOBS):
             if j.get("id") == job_id:
-                _INGEST_JOBS.pop(i)
+                _INGEST_INFLIGHT[job_id] = _INGEST_JOBS.pop(i)
                 break
 
 
 def _on_browser_ws_connect() -> None:
     """Replay unclaimed jobs after first connect or a reconnect."""
     with _INGEST_JOBS_LOCK:
-        pending = list(_INGEST_JOBS)
+        pending = list(_INGEST_JOBS) + list(_INGEST_INFLIGHT.values())
     for job in pending:
         if not _BROWSER_WS.send({"type": "ingest.job", "job": job}):
             break
@@ -333,15 +335,123 @@ def _on_browser_ws_connect() -> None:
 
 def _on_browser_ws_message(message: dict) -> None:
     kind = message.get("type")
-    if kind in ("ingest.ack", "accepted"):
+    if kind == "ingest.rpc":
+        _INGEST_RPC.submit(message)
+    elif kind in ("ingest.ack", "accepted"):
         job_id = str(message.get("jobId") or message.get("id") or "")
         _ack_ingest_job(job_id)
     elif kind in ("bridge.ping", "ping"):
         _BROWSER_WS.send({"type": "bridge.pong", "at": time.time()})
 
 
+_INGEST_RPC = IngestRPC(
+    send=lambda message: _BROWSER_WS.send(message),
+    store=lambda body: _store_ingest_payload(body),
+    progress=lambda job_id, patch: _update_ingest_progress(job_id, patch),
+)
+
+
 _BROWSER_WS.on_connect = _on_browser_ws_connect
 _BROWSER_WS.on_message = _on_browser_ws_message
+
+
+def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
+    """Persist a result shared by WebSocket ingestion and legacy HTTP clients."""
+    job_id = (body.get("job") if isinstance(body, dict) else None) or ""
+    # A job that failed in the browser reports here too — otherwise the agent
+    # would poll /ingest/result forever waiting for a run that already died.
+    if isinstance(body, dict) and body.get("error"):
+        if job_id:
+            result = {"ok": False, "error": str(body["error"])[:500]}
+            _INGEST_RESULTS[job_id] = result
+            with _INGEST_JOBS_LOCK:
+                _INGEST_INFLIGHT.pop(job_id, None)
+            _update_ingest_progress(
+                job_id,
+                {
+                    "status": "error",
+                    "stage": "failed",
+                    "message": result["error"],
+                    "error": result["error"],
+                    "percent": 100,
+                },
+            )
+        return 200, {"ok": True, "recorded": "error"}
+    rows = body.get("rows") if isinstance(body, dict) else body
+    if not isinstance(rows, list):
+        return 400, {"ok": False, "error": "expected {rows: [...]} or a JSON array"}
+    raw = (name_hint or (body.get("name") if isinstance(body, dict) else "") or "")
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(raw)).strip("_")
+    if not name:
+        name = "ingest_" + time.strftime("%Y%m%d_%H%M%S")
+    if not name.endswith(".json"):
+        name += ".json"
+    source = (body.get("source") if isinstance(body, dict) else None)
+    source_text = str(source or "")
+    media_dir = None
+    if name.lower().startswith("shopee_") or "shopee.vn" in source_text.lower():
+        if job_id:
+            _update_ingest_progress(
+                job_id,
+                {
+                    "status": "saving",
+                    "stage": "organize",
+                    "message": f"Đang sắp xếp {len(rows)} review và chuẩn bị tải media",
+                    "rows": len(rows),
+                    "percent": 98,
+                },
+            )
+        rows, media_dir = _prepare_shopee_review_rows(name, rows, job_id)
+    inbox = _outputs_root() / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    target = inbox / name
+    payload = {
+        "received_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source": source,
+        "count": len(rows),
+        "media_dir": f"outputs/{media_dir}" if media_dir else None,
+        "rows": rows,
+    }
+    try:
+        target.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+    except OSError as exc:
+        return 500, {"ok": False, "error": f"write failed: {exc}"}
+    # Write the CSV here too, rather than leaving it to the agent. The whole
+    # point of this path is that it works when the model can't help: the
+    # workspace is elsewhere so read_file can't reach outputs/, and web_fetch
+    # truncates at 100k chars — a few hundred reviews would arrive cut in half.
+    # One click now produces the deliverable; the agent is only for summarising.
+    csv_rel = _write_ingest_csv(name, rows)
+    print(f"[ingest] {len(rows)} rows → {target}", file=sys.stderr)
+    result = {
+        "ok": True,
+        "count": len(rows),
+        "path": f"outputs/inbox/{name}",
+        "url": f"/outputs/inbox/{name}",
+        "csv": csv_rel,
+        "media_dir": f"outputs/{media_dir}" if media_dir else None,
+    }
+    if job_id:
+        _INGEST_RESULTS[job_id] = result
+        with _INGEST_JOBS_LOCK:
+            _INGEST_INFLIGHT.pop(job_id, None)
+        _update_ingest_progress(
+            job_id,
+            {
+                "status": "done",
+                "stage": "saved",
+                "message": f"Đã lưu {len(rows)} dòng",
+                "rows": len(rows),
+                "count": len(rows),
+                "path": result["path"],
+                "csv": csv_rel,
+                "media_dir": result.get("media_dir"),
+                "percent": 100,
+            },
+        )
+    return 200, result
 
 
 def _write_ingest_csv(json_name: str, rows: list) -> str | None:
@@ -1206,13 +1316,15 @@ class _HelperHandler(BaseHTTPRequestHandler):
                 200,
                 {
                     "ok": True,
-                    "transport": "extension-websocket" if _BROWSER_WS.connected else "http-long-poll",
+                    "transport": "extension-websocket",
+                    "state": _BROWSER_WS.transport.get_state(),
                     "connected": _BROWSER_WS.connected,
                     "protocolVersion": "1.0",
                     "wsPort": HELPER_WS_PORT,
                     "httpPort": HELPER_PORT,
                     "wsUrl": f"ws://127.0.0.1:{HELPER_PORT}/browser/v1/ws",
                     "pendingJobs": len(_INGEST_JOBS),
+                    "inFlightJobs": len(_INGEST_INFLIGHT),
                 },
             )
             return
@@ -1781,101 +1893,9 @@ class _HelperHandler(BaseHTTPRequestHandler):
         # `artifact:` chips pick it up with no extra wiring.
         if path_only == "/ingest":
             body = _read_json()
-            job_id = (body.get("job") if isinstance(body, dict) else None) or ""
-            # A job that failed in the browser reports here too — otherwise the agent
-            # would poll /ingest/result forever waiting for a run that already died.
-            if isinstance(body, dict) and body.get("error"):
-                if job_id:
-                    result = {"ok": False, "error": str(body["error"])[:500]}
-                    _INGEST_RESULTS[job_id] = result
-                    _update_ingest_progress(
-                        job_id,
-                        {
-                            "status": "error",
-                            "stage": "failed",
-                            "message": result["error"],
-                            "error": result["error"],
-                            "percent": 100,
-                        },
-                    )
-                _reply(200, {"ok": True, "recorded": "error"})
-                return
-            rows = body.get("rows") if isinstance(body, dict) else body
-            if not isinstance(rows, list):
-                _reply(400, {"ok": False, "error": "expected {rows: [...]} or a JSON array"})
-                return
             qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
-            raw = (qs.get("name", [""])[0] or (body.get("name") if isinstance(body, dict) else "") or "")
-            name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(raw)).strip("_")
-            if not name:
-                name = "ingest_" + time.strftime("%Y%m%d_%H%M%S")
-            if not name.endswith(".json"):
-                name += ".json"
-            source = (body.get("source") if isinstance(body, dict) else None)
-            source_text = str(source or "")
-            media_dir = None
-            if name.lower().startswith("shopee_") or "shopee.vn" in source_text.lower():
-                if job_id:
-                    _update_ingest_progress(
-                        job_id,
-                        {
-                            "status": "saving",
-                            "stage": "organize",
-                            "message": f"Đang sắp xếp {len(rows)} review và chuẩn bị tải media",
-                            "rows": len(rows),
-                            "percent": 98,
-                        },
-                    )
-                rows, media_dir = _prepare_shopee_review_rows(name, rows, job_id)
-            inbox = _outputs_root() / "inbox"
-            inbox.mkdir(parents=True, exist_ok=True)
-            target = inbox / name
-            payload = {
-                "received_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "source": source,
-                "count": len(rows),
-                "media_dir": f"outputs/{media_dir}" if media_dir else None,
-                "rows": rows,
-            }
-            try:
-                target.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
-                )
-            except OSError as exc:
-                _reply(500, {"ok": False, "error": f"write failed: {exc}"})
-                return
-            # Write the CSV here too, rather than leaving it to the agent. The whole
-            # point of this path is that it works when the model can't help: the
-            # workspace is elsewhere so read_file can't reach outputs/, and web_fetch
-            # truncates at 100k chars — a few hundred reviews would arrive cut in half.
-            # One click now produces the deliverable; the agent is only for summarising.
-            csv_rel = _write_ingest_csv(name, rows)
-            print(f"[ingest] {len(rows)} rows → {target}", file=sys.stderr)
-            result = {
-                "ok": True,
-                "count": len(rows),
-                "path": f"outputs/inbox/{name}",
-                "url": f"/outputs/inbox/{name}",
-                "csv": csv_rel,
-                "media_dir": f"outputs/{media_dir}" if media_dir else None,
-            }
-            if job_id:
-                _INGEST_RESULTS[job_id] = result
-                _update_ingest_progress(
-                    job_id,
-                    {
-                        "status": "done",
-                        "stage": "saved",
-                        "message": f"Đã lưu {len(rows)} dòng",
-                        "rows": len(rows),
-                        "count": len(rows),
-                        "path": result["path"],
-                        "csv": csv_rel,
-                        "media_dir": result.get("media_dir"),
-                        "percent": 100,
-                    },
-                )
-            _reply(200, result)
+            status, result = _store_ingest_payload(body, qs.get("name", [""])[0])
+            _reply(status, result)
             return
 
         if path_only == "/ingest/progress":
@@ -2143,7 +2163,7 @@ def _start_helper() -> ThreadingHTTPServer | None:
         print(f"[launch] Browser extension WebSocket on ws://127.0.0.1:{ws_port}/browser-extension")
     except OSError as exc:
         print(
-            f"[launch] browser WebSocket :{HELPER_WS_PORT} not started ({exc}); using HTTP long-poll",
+            f"[launch] browser WebSocket :{HELPER_WS_PORT} not started ({exc}); extension will retry WebSocket",
             file=sys.stderr,
         )
     try:

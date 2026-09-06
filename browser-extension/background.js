@@ -9,7 +9,7 @@
 // 3. Same-origin fetch enforcement in tab context.
 // 4. Verification & Captcha detection with graceful workflow pause/resume.
 // 5. Exponential backoff reconnect with random jitter and 20s keepalive heartbeats.
-// 6. Backward-compatible Shopee reviews extraction and HTTP long-poll fallback.
+// 6. Backward-compatible Shopee reviews extraction and acknowledged WebSocket result uploads.
 
 const HELPER = "http://127.0.0.1:8766";
 const PAGE_SIZE = 50;
@@ -55,23 +55,45 @@ function updateState(newState, details = null) {
 }
 
 // ── Ingest & Progress Helpers ────────────────────────────────────────────────
-async function reportProgress(job, progress) {
-  if (!job || !job.id) return;
-  try {
-    await fetch(`${HELPER}/ingest/progress`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job: job.id, progress }),
-    });
-  } catch (e) {
-    console.warn("[bridge] progress report failed:", e.message);
-  }
+const pendingIngestRequests = new Map();
+const knownJobs = new Set();
+
+function sendIngestRequest(params) {
+  const id = crypto.randomUUID();
+  const message = { v: 1, type: "ingest.rpc", id, params };
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const retry = () => {
+      if (Date.now() - started > 300000) {
+        clearInterval(timer);
+        pendingIngestRequests.delete(id);
+        reject(new Error("WebSocket ingest acknowledgement timed out"));
+        return;
+      }
+      bridgeSend(message);
+    };
+    const timer = setInterval(retry, 5000);
+    pendingIngestRequests.set(id, { resolve, reject, timer, message });
+    retry();
+  });
 }
 
-function startKeepalive() {
-  return setInterval(() => {
-    fetch(`${HELPER}/ping`).catch(() => {});
-  }, 20_000);
+async function reportProgress(job, progress) {
+  if (job && job.id) await sendIngestRequest({ operation: "progress", job: job.id, progress });
+}
+
+async function uploadIngestResult(body) {
+  const uploadId = crypto.randomUUID();
+  const payload = JSON.stringify(body);
+  // Every frame stays below the gateway's 8 MiB limit, even after JSON escaping.
+  for (let offset = 0, index = 0; offset < payload.length; index++) {
+    let end = Math.min(offset + 65536, payload.length);
+    const lastCode = payload.charCodeAt(end - 1);
+    if (end < payload.length && lastCode >= 0xD800 && lastCode <= 0xDBFF) end--;
+    await sendIngestRequest({ operation: "chunk", uploadId, index, chunk: payload.slice(offset, end) });
+    offset = end;
+  }
+  return sendIngestRequest({ operation: "complete", uploadId });
 }
 
 function mediaUrl(value, kind = "image") {
@@ -202,7 +224,6 @@ async function runJob(job) {
   console.log("[bridge] ▶ start job", job.id, job.kind, job.url);
   activeJobs.set(job.id, job);
   updateState("busy");
-  const keepalive = startKeepalive();
 
   const progress = (patch) => reportProgress(job, patch);
   try {
@@ -212,11 +233,7 @@ async function runJob(job) {
       rows = await extractShopeeReviews(job, progress);
     }
     await progress({ status: "saving", stage: "upload", message: `Đang lưu ${rows.length} dòng`, rows: rows.length, percent: 95 });
-    await fetch(`${HELPER}/ingest?name=${encodeURIComponent("shopee_" + job.id)}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job: job.id, source: job.url, rows }),
-    });
+    await uploadIngestResult({ job: job.id, name: "shopee_" + job.id, source: job.url, rows });
     console.log("[bridge] ✔ job", job.id, "finished:", rows.length, "rows");
   } catch (e) {
     console.error("[bridge] ✘ job", job.id, "failed:", e.message);
@@ -224,13 +241,8 @@ async function runJob(job) {
       triggerVerificationRequired({ job_id: job.id, url: job.url, reason: e.message });
     }
     await progress({ status: "error", stage: "failed", message: String(e.message || e), percent: 100 });
-    await fetch(`${HELPER}/ingest`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job: job.id, error: String(e.message || e) }),
-    });
+    await uploadIngestResult({ job: job.id, error: String(e.message || e) });
   } finally {
-    clearInterval(keepalive);
     activeJobs.delete(job.id);
     updateState(verificationInfo ? "awaiting_user_verification" : (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN ? "connected" : "disconnected"));
   }
@@ -711,6 +723,17 @@ async function getActiveTabId() {
 async function dispatchEnvelope(envelope) {
   if (!envelope || typeof envelope !== "object") return;
 
+  if (envelope.type === "ingest.reply") {
+    const pending = pendingIngestRequests.get(envelope.id);
+    if (pending) {
+      clearInterval(pending.timer);
+      pendingIngestRequests.delete(envelope.id);
+      if (envelope.ok) pending.resolve(envelope.result);
+      else pending.reject(new Error(envelope.error || "Ingest failed"));
+    }
+    return;
+  }
+
   // Handle command envelopes
   if (envelope.type === "command") {
     const cmdId = envelope.id;
@@ -935,6 +958,7 @@ async function connectBridge() {
       socket.onopen = () => {
         console.log("[bridge] WebSocket connected to", wsUrl);
         reconnectAttempts = 0;
+        for (const pending of pendingIngestRequests.values()) bridgeSend(pending.message);
         updateState("connected");
 
         // Authenticate envelope
@@ -974,13 +998,11 @@ async function connectBridge() {
       socket.onclose = () => {
         console.log("[bridge] WebSocket disconnected");
         if (bridgeSocket === socket) closeBridgeSocket();
-        fallbackHttpLoop();
         scheduleBridgeReconnect();
       };
     } catch (error) {
-      console.warn("[bridge] WebSocket unavailable, falling back to HTTP:", error.message);
+      console.warn("[bridge] WebSocket unavailable, reconnecting:", error.message);
       closeBridgeSocket();
-      fallbackHttpLoop();
       scheduleBridgeReconnect();
     }
   })().finally(() => {
@@ -990,40 +1012,17 @@ async function connectBridge() {
   return bridgeConnecting;
 }
 
-// ── HTTP Long-Poll Fallback ──────────────────────────────────────────────────
-let looping = false;
-function enqueueLegacyJob(job, transport) {
+// ── WebSocket Job Delivery ─────────────────────────────────────────────────
+function enqueueLegacyJob(job) {
   if (!job || !job.id) return;
-  if (transport === "websocket") {
-    bridgeSend({
-      v: 1,
-      type: "accepted",
-      id: job.id,
-      jobId: job.id,
-      params: { kind: "legacy.ingest.job", jobId: job.id },
+  bridgeSend({ v: 1, type: "accepted", id: job.id, jobId: job.id });
+  if (knownJobs.has(job.id)) return;
+  knownJobs.add(job.id);
+  jobChain = jobChain.then(() => runJob(job)).catch((err) => console.error("[bridge] Job failed:", err))
+    .finally(() => {
+      // Bound completed-job deduplication without evicting queued jobs.
+      if (knownJobs.size > 1000) knownJobs.delete(job.id);
     });
-  }
-  jobChain = jobChain.then(() => runJob(job)).catch((err) => console.error("[bridge] Job failed:", err));
-}
-
-async function fallbackHttpLoop() {
-  if (looping) return;
-  looping = true;
-  try {
-    while (!bridgeSocket || bridgeSocket.readyState !== WebSocket.OPEN) {
-      let jobs = [];
-      try {
-        const r = await fetch(`${HELPER}/ingest/jobs?wait=25`);
-        jobs = (await r.json()).jobs || [];
-      } catch {
-        await new Promise((s) => setTimeout(s, 5000));
-        return;
-      }
-      for (const job of jobs) enqueueLegacyJob(job, "http");
-    }
-  } finally {
-    looping = false;
-  }
 }
 
 // ── Top-Level Listeners (MV3 Requirement) ───────────────────────────────────

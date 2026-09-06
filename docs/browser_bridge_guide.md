@@ -18,7 +18,7 @@ Hệ thống điều khiển trình duyệt của `AI-COWORK` trước đây d�
 
 ```
 Codex / MCP Client / Local Engine
-    ↕ Python Typed Transport (WebSocketTransport / HttpPollingTransport)
+    ↕ Python Typed Transport hoặc HTTP API của launcher
 Browser Gateway (:8766 / :8767) (127.0.0.1 only)
     ↕ RFC 6455 WebSocket (Envelope v1 Protocol)
 Chrome Extension MV3 (Chrome Profile thật)
@@ -164,47 +164,31 @@ Lúc này Gateway sẽ tự động lắng nghe:
 
 ---
 
-## 7. Migration Guide: Từ HTTP Polling sang WebSocket
+## 7. Extension dùng WebSocket cho toàn bộ luồng công việc
 
-Nếu bạn đang có code sử dụng cơ chế queue HTTP cũ (`/ingest/job`, `/ingest/jobs`, `/ingest/result`), việc chuyển đổi sang WebSocket cực kỳ đơn giản:
+Sau khi ghép nối, extension chỉ dùng socket cho lệnh, job, tiến độ, kết quả,
+báo lỗi, heartbeat và xác minh. Không còn HTTP polling `/ingest/jobs`, POST
+`/ingest/progress`, POST `/ingest`, hay HTTP `/ping` trong extension.
+HTTP `/browser/pair` chỉ bootstrap token trước WebSocket handshake; HTTP fetch
+đến website để lấy dữ liệu vẫn là giao thức của chính website đó.
 
-### Code cũ (HTTP Polling)
-```python
-# Xếp job
-r = urllib.request.urlopen("http://127.0.0.1:8766/ingest/job?url=https://shopee.vn/product/1/2")
-job_id = json.loads(r.read())["job"]["id"]
+- Gateway → extension: `command`, `ingest.job`, `cancel`, `verification.resolved`.
+- Extension → gateway: `accepted`, `result`, `error`, `ping`, sự kiện xác minh.
+- Upload ingest: `ingest.rpc` chứa `params.operation` là `progress`, `chunk`
+  hoặc `complete`; gateway trả `ingest.reply` với cùng `id`, `ok`, `result/error`.
+- Kết quả lớn được chia thành chunk theo thứ tự, tối đa tổng 64 MiB/upload.
+  Gói chưa được xác nhận được gửi lại cùng ID, tối đa 5 phút. Gateway nhớ
+  request đã xử lý trong cache giới hạn 512 mục/10 phút để tránh lưu trùng.
+- Công việc lưu file và tải media chạy ngoài vòng đọc socket, giữ heartbeat
+  và lệnh điều khiển hoạt động trong lúc lưu kết quả.
+- Mất kết nối: extension reconnect bằng backoff; gateway giữ job đang chạy
+  để gửi lại khi kết nối phục hồi. Extension đang sống nhận diện job trùng.
+  Nếu worker đã khởi động lại, job chưa hoàn tất có thể chạy lại từ đầu.
+  Queue/upload chưa hoàn tất nằm trong RAM, không sống qua restart gateway.
 
-# Chờ kết quả bằng vòng lặp poll
-while True:
-    time.sleep(2)
-    res = json.loads(urllib.request.urlopen(f"http://127.0.0.1:8766/ingest/result?id={job_id}").read())
-    if res["ok"]:
-        data = res["result"]
-        break
-```
-
-### Code mới (TransportManager với Tự động Fallback)
-```python
-from browser_bridge.transport import TransportManager, WebSocketTransport, HttpPollingTransport
-from browser_ws_bridge import BrowserWebSocketBridge
-
-# Khởi tạo hoặc lấy instance bridge hiện có
-# TransportManager ưu tiên WebSocket. HTTP fallback chỉ dành cho job ingest tương thích; không dùng để thay thế typed action DOM.
-transport_mgr = TransportManager(ws_transport=bridge.transport, http_transport=HttpPollingTransport(base_url="http://127.0.0.1:8766"))
-
-# Thực thi lệnh trực tiếp với typed params và correlation ID
-ok, result, error = transport_mgr.execute(
-    action="page.navigate",
-    params={"url": "https://shopee.vn/product/1/2", "waitUntil": "networkidle"},
-    deadline_ms=15000,
-)
-
-if ok:
-    print("Dữ liệu trả về tức thì:", result)
-else:
-    print("Lỗi thực thi:", error.message)
-```
-
+API HTTP `/ingest/job`, `/ingest/result` của launcher vẫn dành cho client cũ:
+client xếp job và đọc kết quả qua HTTP, nhưng gateway trao đổi với extension
+qua WebSocket. Reload extension tại `chrome://extensions` sau khi cập nhật.
 
 ## 8. Gọi typed action từ client bên ngoài launcher
 

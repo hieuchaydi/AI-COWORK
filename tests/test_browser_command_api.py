@@ -66,3 +66,22 @@ def test_command_rejects_invalid_envelopes(command_api, body):
     status, _ = request_command(url, body)
     assert status == 400
     transport.execute_command.assert_not_called()
+
+
+def test_acknowledged_ingest_job_replays_until_result_saved(monkeypatch, tmp_path):
+    job = {"id": "replay-job", "url": "https://example.com", "kind": "example"}
+    monkeypatch.setattr(launch, "_INGEST_JOBS", [job])
+    monkeypatch.setattr(launch, "_INGEST_INFLIGHT", {})
+    bridge = Mock()
+    monkeypatch.setattr(launch, "_BROWSER_WS", bridge)
+    monkeypatch.setenv("COWORKER_OUTPUT_DIR", str(tmp_path))
+    launch._ack_ingest_job(job["id"])
+    assert launch._INGEST_JOBS == []
+    launch._on_browser_ws_connect()
+    bridge.send.assert_called_once_with({"type": "ingest.job", "job": job})
+    status, result = launch._store_ingest_payload({"job": job["id"], "rows": [{"text": "done"}]})
+    assert status == 200 and result["ok"]
+    assert launch._INGEST_INFLIGHT == {}
+    bridge.reset_mock()
+    launch._on_browser_ws_connect()
+    bridge.send.assert_not_called()

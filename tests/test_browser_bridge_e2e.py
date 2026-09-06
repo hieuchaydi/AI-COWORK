@@ -519,3 +519,44 @@ def test_e2e_control_frame_payload_limit(gateway_server):
         client.close()
 
 
+
+
+def test_e2e_ingest_progress_chunks_and_result_over_websocket(gateway_server, monkeypatch, tmp_path):
+    import launch
+    from browser_bridge.ingest import IngestRPC
+
+    server, port, token = gateway_server
+    monkeypatch.setenv("COWORKER_OUTPUT_DIR", str(tmp_path))
+    stores = []
+
+    def store(body):
+        stores.append(body)
+        return launch._store_ingest_payload(body)
+
+    rpc = IngestRPC(server.broadcast_or_send, store, launch._update_ingest_progress)
+    server.on_message = lambda message: rpc.submit(message) if message.get("type") == "ingest.rpc" else None
+    client = SimpleWebSocketTestClient("127.0.0.1", port)
+    try:
+        assert client.connect(token=token) == 101
+        assert client.recv_json()["type"] == "hello"
+
+        def call(request_id, **params):
+            client.send_json({"v": 1, "type": "ingest.rpc", "id": request_id, "params": params})
+            reply = client.recv_json(timeout=3)
+            assert reply["type"] == "ingest.reply" and reply["id"] == request_id
+            return reply
+
+        assert call("progress-1", operation="progress", job="ws-job", progress={"percent": 50})["ok"]
+        assert launch._INGEST_PROGRESS["ws-job"]["percent"] == 50
+        payload = json.dumps({"job": "ws-job", "name": "ws-result", "rows": [{"text": "Tiếng Việt"}]}, ensure_ascii=False)
+        for index, chunk in enumerate([payload[:20], payload[20:]]):
+            assert call(f"chunk-{index}", operation="chunk", uploadId="upload-1", index=index, chunk=chunk)["ok"]
+        reply = call("complete-1", operation="complete", uploadId="upload-1")
+        assert reply["ok"] and reply["result"]["count"] == 1
+        assert (tmp_path / "csv" / "ws-result.csv").read_bytes().startswith(b"\xef\xbb\xbf")
+        assert call("complete-1", operation="complete", uploadId="upload-1") == reply
+        assert len(stores) == 1  # A lost acknowledgement must not save/download twice.
+        assert not call("bad-chunk", operation="chunk", uploadId="bad", index=3, chunk="x")["ok"]
+    finally:
+        client.close()
+        rpc.executor.shutdown(wait=True)
