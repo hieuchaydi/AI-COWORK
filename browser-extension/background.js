@@ -89,6 +89,24 @@ async function reportProgress(job, progress) {
   if (job && job.id) await sendIngestRequest({ operation: "progress", job: job.id, progress });
 }
 
+async function traceJob(job, progress, event, details = {}) {
+  const entry = {
+    at: new Date().toISOString(),
+    jobId: job?.id || null,
+    event,
+    ...details,
+  };
+  // Keep this structured and omit review text, cookies, and media URLs.
+  console.log("[bridge][job-trace]", JSON.stringify(entry));
+  if (progress && job?.id) {
+    try {
+      await progress({ stage: "trace", message: `[${event}]`, debug: entry });
+    } catch (error) {
+      console.warn("[bridge][job-trace] progress upload failed:", error?.message || error);
+    }
+  }
+}
+
 async function uploadIngestResult(body) {
   const uploadId = crypto.randomUUID();
   const payload = JSON.stringify(body);
@@ -434,16 +452,28 @@ async function extractShopeeReviews(job, progress) {
   const tab = await findOrOpenShopeeTab(job.url, itemid);
   if (!tab || !tab.id) throw new Error("Không tìm thấy hoặc không mở được tab Shopee trên trình duyệt");
   job._targetTabId = tab.id;
+  await traceJob(job, progress, "tab-ready", { tabId: tab.id, tabUrl: tab.url || "" });
 
   if (!shopid) shopid = await resolveShopId(itemid, job.url, tab, progress);
   if (!shopid) throw new Error(`Không tìm thấy shopid cho item ${itemid}`);
+  await traceJob(job, progress, "shop-resolved", { itemid, shopid });
 
   let all = [];
   let offset = 0;
   let total = null;
 
   while (all.length < MAX_REVIEWS) {
+    const requestStarted = Date.now();
+    await traceJob(job, progress, "ratings-request", {
+      itemid, shopid, offset, limit: PAGE_SIZE, tabId: tab.id,
+    });
     const fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, tab.url || job.url);
+    await traceJob(job, progress, "ratings-response", {
+      itemid, shopid, offset, limit: PAGE_SIZE, status: fetchRes.status ?? null,
+      ok: Boolean(fetchRes.ok), elapsedMs: Date.now() - requestStarted,
+      responseUrl: fetchRes.url || null, pageUrl: fetchRes.pageUrl || tab.url || null,
+      responseBytes: String(fetchRes.textSample || "").length,
+    });
     if (!fetchRes.ok) {
       throw new Error(fetchRes.error ? `Shopee API request failed: ${fetchRes.error}` : formatShopeeFailure(fetchRes));
     }
@@ -480,6 +510,7 @@ async function runJob(job) {
 
   const progress = (patch) => reportProgress(job, patch);
   try {
+    await traceJob(job, progress, "job-start", { kind: job.kind, sourceUrl: job.url });
     await progress({ status: "running", stage: "init", message: "Bắt đầu cào", percent: 5 });
     let rows = [];
     if (job.kind === "shopee-reviews" || job.url.includes("shopee.vn")) {
@@ -488,11 +519,14 @@ async function runJob(job) {
     const parsed = idsFrom(job.url);
     const itemid = parsed.itemid || job.itemid;
     const outputName = itemid ? "shopee_" + itemid + "_reviews" : (job.name || "shopee_" + job.id);
+    await traceJob(job, progress, "upload-start", { rows: rows.length, outputName });
     await progress({ status: "saving", stage: "upload", message: `Đang lưu ${rows.length} dòng`, rows: rows.length, percent: 95 });
     await uploadIngestResult({ job: job.id, name: outputName, source: job.url, rows });
+    await traceJob(job, progress, "upload-complete", { rows: rows.length, outputName });
     console.log("[bridge] ✔ job", job.id, "finished:", rows.length, "rows");
   } catch (e) {
     console.error("[bridge] ✘ job", job.id, "failed:", e.message);
+    await traceJob(job, progress, "job-failed", { error: String(e.message || e).slice(0, 500) });
     const message = String(e.message || e);
     const isVerification = message.includes("verification required") ||
                            message.includes("/verify/traffic");
