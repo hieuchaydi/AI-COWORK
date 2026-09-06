@@ -67,6 +67,13 @@ test('duplicate pushed jobs are acknowledged but execute only once', async () =>
   assert.equal(frames.filter(frame => frame.type === 'accepted').length, 2);
 });
 
+test('active job replays still receive an accepted ACK without starting twice', async () => {
+  const { context, frames } = await worker();
+  vm.runInContext('activeJobs.set("active-job", {id: "active-job"}); enqueueLegacyJob({id: "active-job"});', context);
+  assert.equal(frames.filter(frame => frame.type === 'accepted' && frame.id === 'active-job').length, 1);
+  assert.equal(context.activeJobs.size, 1);
+});
+
 test('unacknowledged requests are replayed with the same correlation id', async () => {
   const { context, frames, timers } = await worker();
   vm.runInContext('bridgeSocket.readyState = 3', context);

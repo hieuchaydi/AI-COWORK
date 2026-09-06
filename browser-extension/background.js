@@ -67,6 +67,12 @@ function updateState(newState, details = null) {
   });
 }
 
+function stateForVerification(details) {
+  if (details?.kind === "login") return "login_required";
+  if (details?.kind === "api_blocked") return "api_blocked";
+  return "awaiting_user_verification";
+}
+
 // ── Ingest & Progress Helpers ────────────────────────────────────────────────
 const pendingIngestRequests = new Map();
 const knownJobs = new Set();
@@ -841,7 +847,6 @@ async function runJob(job) {
         url: job.url,
         tab_id: job._targetTabId || null,
         reason: message,
-        kind: isLoginRequired ? "login" : "verification",
         kind: "verification",
       });
       await progress({
@@ -929,7 +934,7 @@ const notifiedVerificationJobIds = new Set();
 
 function triggerVerificationRequired(details) {
   console.warn("[bridge] ⚠️ Verification required:", details);
-  updateState("awaiting_user_verification", details);
+  updateState(stateForVerification(details), details);
   const jid = details?.job_id;
   if (jid && notifiedVerificationJobIds.has(jid)) {
     return; // Đảm bảo gửi một thông báo duy nhất cho người dùng
@@ -971,9 +976,6 @@ function resumeVerification(jobId) {
     }
     knownJobs.delete(jobToResume.id);
     enqueueLegacyJob(jobToResume);
-    if (!activeJobs.has(jobToResume.id)) {
-      enqueueLegacyJob(jobToResume);
-    }
   }
 }
 
@@ -1584,7 +1586,6 @@ async function dispatchEnvelope(envelope) {
 
   // Backward-compatible ingest.job message
   if (envelope.type === "ingest.job") {
-    enqueueLegacyJob(envelope.job, "websocket");
     const job = envelope.job ? { ...envelope.job } : {};
     if (envelope.retry || envelope.job?.retry) job.retry = true;
     if (!job.id && envelope.id) job.id = envelope.id;
@@ -1606,7 +1607,7 @@ function clearReconnect() {
   bridgeReconnectTimeout = null;
 }
 
-function closeBridgeSocket() {
+function closeBridgeSocket({ preserveDetails = false } = {}) {
   if (bridgeHandshakeTimeout) clearTimeout(bridgeHandshakeTimeout);
   bridgeHandshakeTimeout = null;
   if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
@@ -1619,7 +1620,17 @@ function closeBridgeSocket() {
     }
   }
   bridgeSocket = null;
-  updateState("disconnected");
+  if (preserveDetails && verificationInfo) {
+    extensionState = "disconnected";
+    setBadge("");
+    chrome.storage.local.set({
+      extensionState,
+      verificationInfo,
+      currentJob: activeJobs.size > 0 ? Array.from(activeJobs.values())[0] : null,
+    });
+  } else {
+    updateState("disconnected");
+  }
 }
 
 function connectionError(message) {
@@ -1691,7 +1702,7 @@ async function connectBridge() {
       const fail = message => {
         if (!ownsSocket()) return;
         connectionError(message);
-        closeBridgeSocket();
+        closeBridgeSocket({ preserveDetails: true });
         scheduleBridgeReconnect();
       };
       bridgeHandshakeTimeout = setTimeout(() => fail("Gateway không hoàn tất kết nối trong 10 giây"), 10000);
@@ -1703,7 +1714,10 @@ async function connectBridge() {
         reconnectAttempts = 0;
         lastBridgeMessageAt = Date.now();
         connectionError("");
-        updateState(verificationInfo ? "awaiting_user_verification" : activeJobs.size ? "busy" : "connected", verificationInfo);
+        const restoredState = verificationInfo
+          ? stateForVerification(verificationInfo)
+          : (activeJobs.size ? "busy" : "connected");
+        updateState(restoredState, verificationInfo);
         for (const pending of pendingIngestRequests.values()) bridgeSend(pending.message);
         if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
         bridgeHeartbeat = setInterval(() => {
@@ -1727,7 +1741,7 @@ async function connectBridge() {
     } catch (error) {
       if (!current()) return;
       connectionError(error.name === 'AbortError' ? "Gateway không phản hồi ghép nối trong 8 giây" : `Không kết nối được gateway: ${error.message}`);
-      closeBridgeSocket();
+      closeBridgeSocket({ preserveDetails: true });
       scheduleBridgeReconnect();
     }
   })();
@@ -1760,19 +1774,18 @@ async function configureConnection(message) {
 // ── WebSocket Job Delivery ─────────────────────────────────────────────────
 function enqueueLegacyJob(job) {
   if (!job || !job.id) return;
+  bridgeSend({ v: 1, type: "accepted", id: job.id, jobId: job.id });
+  traceJob(job, null, "job-accepted", { sourceUrl: job.url });
+
+  // ACK every delivery, including a duplicate replay, so the server can release
+  // its queue entry. Only the first non-active delivery is allowed to execute.
   if (activeJobs.has(job.id)) {
     console.log("[bridge] Job already active, skipping duplicate enqueue:", job.id);
     return;
   }
-  bridgeSend({ v: 1, type: "accepted", id: job.id, jobId: job.id });
-  traceJob(job, null, "job-accepted", { sourceUrl: job.url });
   if (job.retry) {
     knownJobs.delete(job.id);
     notifiedVerificationJobIds.delete(job.id);
-  }
-  if (activeJobs.has(job.id)) {
-    console.log("[bridge] Job already active, skipping duplicate enqueue:", job.id);
-    return;
   }
   if (knownJobs.has(job.id)) return;
   knownJobs.add(job.id);
