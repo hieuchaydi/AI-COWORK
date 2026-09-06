@@ -106,6 +106,19 @@ def setup_shopee_environment(gateway_server, monkeypatch, tmp_path):
     yield server, port, token, rpc, tmp_path
 
 
+def recv_reply_matching(client: SimpleWebSocketTestClient, req_id: str, timeout: float = 5.0) -> Dict[str, Any]:
+    """Waits for an ingest.reply matching req_id, ignoring unhandled push envelopes."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining = max(0.1, deadline - time.monotonic())
+        msg = client.recv_json(timeout=remaining)
+        if not msg:
+            continue
+        if msg.get("type") == "ingest.reply" and msg.get("id") == req_id:
+            return msg
+    raise TimeoutError(f"Timed out waiting for ingest.reply with id={req_id}")
+
+
 # ─── 1-7. Full Workflow: Connect -> Dispatch -> Accepted -> 200 -> Pagination -> Upload -> Outputs ───
 
 def test_shopee_full_workflow_from_queue_to_results(setup_shopee_environment):
@@ -119,6 +132,7 @@ def test_shopee_full_workflow_from_queue_to_results(setup_shopee_environment):
         greeting = client.recv_json(timeout=2.0)
         assert greeting["type"] == "hello"
         assert server.connected is True
+        time.sleep(0.1)
 
         # 2. Job được dispatch
         test_url = "https://shopee.vn/product/123456/25018847315"
@@ -192,7 +206,7 @@ def test_shopee_full_workflow_from_queue_to_results(setup_shopee_environment):
                 "progress": {"status": "running", "stage": "uploading", "percent": 75, "message": "Đang tải dữ liệu"},
             },
         })
-        prog_reply = client.recv_json(timeout=3.0)
+        prog_reply = recv_reply_matching(client, req_id_prog, timeout=5.0)
         assert prog_reply["type"] == "ingest.reply"
         assert prog_reply["id"] == req_id_prog
         assert prog_reply["ok"] is True
@@ -232,7 +246,7 @@ def test_shopee_full_workflow_from_queue_to_results(setup_shopee_environment):
                 "chunk": chunk_str,
             },
         })
-        chunk_reply = client.recv_json(timeout=4.0)
+        chunk_reply = recv_reply_matching(client, req_id_chunk, timeout=5.0)
         assert chunk_reply["type"] == "ingest.reply"
         assert chunk_reply["id"] == req_id_chunk
         assert chunk_reply["ok"] is True
@@ -248,7 +262,7 @@ def test_shopee_full_workflow_from_queue_to_results(setup_shopee_environment):
                 "uploadId": upload_id,
             },
         })
-        comp_reply = client.recv_json(timeout=5.0)
+        comp_reply = recv_reply_matching(client, req_id_complete, timeout=5.0)
         assert comp_reply["type"] == "ingest.reply"
         assert comp_reply["id"] == req_id_complete
         assert comp_reply["ok"] is True
