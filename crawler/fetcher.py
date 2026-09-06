@@ -118,12 +118,14 @@ class BrowserFetcher(Fetcher):
     handles navigation, waitUntil semantics, and HTML extraction.
     """
 
-    def __init__(self, transport: Any = None):
+    def __init__(self, transport: Any = None, default_target_id: Optional[str] = None):
         """
         :param transport: An IBrowserTransport-compatible object (optional).
                          Pass None to keep as a soft stub — fetch() will raise.
+        :param default_target_id: Default BCP targetId to reuse across requests.
         """
         self._transport = transport
+        self._default_target_id = default_target_id
 
     async def fetch(self, task: Task, source: Source) -> FetchResult:
         if self._transport is None:
@@ -135,9 +137,26 @@ class BrowserFetcher(Fetcher):
         url = task.url or ""
         start = time.monotonic()
         try:
-            # Use BCP Page API
-            await self._transport.call("page.navigate", {"url": url, "waitUntil": "load"}, 60000)
-            result = await self._transport.call("page.content", {}, 10000)
+            # Ensure targetId per BCP wire protocol schema (§4.1, §4.3)
+            task_params = task.params or {}
+            target_id = task_params.get("targetId") or self._default_target_id
+            created_target = False
+            if not target_id:
+                create_res = await self._transport.call("target.create", {"url": "about:blank"})
+                target_id = create_res.get("targetId")
+                created_target = True
+
+            # Use BCP Page API with valid targetId
+            await self._transport.call(
+                "page.navigate",
+                {"targetId": target_id, "url": url, "waitUntil": "load"},
+                60000,
+            )
+            result = await self._transport.call(
+                "page.content",
+                {"targetId": target_id},
+                10000,
+            )
             html = result.get("content", "")
             duration_ms = int((time.monotonic() - start) * 1000)
 
@@ -145,12 +164,22 @@ class BrowserFetcher(Fetcher):
             try:
                 loc_result = await self._transport.call(
                     "runtime.evaluate",
-                    {"expression": "window.location.href", "returnByValue": True},
+                    {
+                        "targetId": target_id,
+                        "expression": "window.location.href",
+                        "returnByValue": True,
+                    },
                     5000,
                 )
                 final_url = loc_result.get("result", url)
             except Exception:
                 final_url = url
+
+            if created_target:
+                try:
+                    await self._transport.call("target.close", {"targetId": target_id}, 5000)
+                except Exception:
+                    pass
 
             return FetchResult(
                 task_id=task.task_id,

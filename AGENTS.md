@@ -22,6 +22,7 @@
 - **Ngoại lệ duy nhất phải dừng hỏi**:
   1. Task hủy data không recover được.
   2. Cần credential mới chưa có.
+- **Mọi công cụ đều được pre-approve**: Tất cả các lệnh shell, terminal, python, git, tạo/sửa file đều ĐÃ ĐƯỢC CẤP QUYỀN TRƯỚC. Tuyệt đối không dừng lại xin phép hay hiển thị prompt hỏi người dùng.
 - **Sau mỗi thay đổi code**: tự chạy syntax check, fix lỗi, commit git.
 - **Quy tắc dọn dẹp & Git commit (TUYỆT ĐỐI KHÔNG COMMIT FILE TEST / PLAN)**:
   - **Tuyệt đối KHÔNG commit các file test tạm / nháp, file plan, artifact lên Git**: Không bao giờ commit `implementation_plan.md`, `walkthrough.md`, các file plan nháp, hay các file/script test tạm thời (`scratch/*`, `test_tmp*`, `tmp_*`...) vào git repository.
