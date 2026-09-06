@@ -43,7 +43,7 @@ class SimpleWebSocketTestClient:
         self,
         path: str = "/browser/v1/ws",
         token: Optional[str] = None,
-        origin: str = "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+        origin: Optional[str] = "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
     ) -> int:
         self.sock.connect((self.host, self.port))
         query = f"?token={token}" if token else ""
@@ -56,8 +56,10 @@ class SimpleWebSocketTestClient:
             "Connection: Upgrade\r\n"
             f"Sec-WebSocket-Key: {sec_key}\r\n"
             "Sec-WebSocket-Version: 13\r\n"
-            f"Origin: {origin}\r\n\r\n"
         )
+        if origin is not None:
+            req += f"Origin: {origin}\r\n"
+        req += "\r\n"
         self.sock.sendall(req.encode("ascii"))
 
         resp = bytearray()
@@ -190,6 +192,17 @@ def test_e2e_rejection_on_web_origin(gateway_server):
     try:
         status = client.connect(token=token, origin="https://malicious-website.com")
         assert status == 403
+    finally:
+        client.close()
+
+
+def test_e2e_allows_originless_extension_websocket_with_valid_token(gateway_server):
+    _, port, token = gateway_server
+    client = SimpleWebSocketTestClient("127.0.0.1", port)
+    try:
+        status = client.connect(token=token, origin=None)
+        assert status == 101
+        assert client.recv_json()["type"] == "hello"
     finally:
         client.close()
 
@@ -573,12 +586,16 @@ def test_helper_http_websocket_upgrade_and_reconnect(monkeypatch):
     thread = threading.Thread(target=helper.serve_forever, daemon=True)
     thread.start()
     try:
-        request = urllib.request.Request(
-            f"http://127.0.0.1:{helper.server_port}/browser/pair",
-            headers={"Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"},
-        )
+        request = urllib.request.Request(f"http://127.0.0.1:{helper.server_port}/browser/pair")
         with urllib.request.urlopen(request, timeout=3) as response:
             pairing = json.load(response)
+        hinted_request = urllib.request.Request(
+            f"http://127.0.0.1:{helper.server_port}/browser/pair",
+            headers={"X-Bridge-Client": launch.BRIDGE_CLIENT_HEADER},
+        )
+        with urllib.request.urlopen(hinted_request, timeout=3) as response:
+            hinted_pairing = json.load(response)
+        assert hinted_pairing["token"] == pairing["token"]
         for _ in range(3):
             client = SimpleWebSocketTestClient("127.0.0.1", helper.server_port)
             try:

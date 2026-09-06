@@ -53,6 +53,7 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 ROOT = Path(__file__).resolve().parent
+BRIDGE_CLIENT_HEADER = "ai-cowork-bridge"
 
 
 def _find_venv() -> Path:
@@ -1142,7 +1143,7 @@ class _HelperHandler(BaseHTTPRequestHandler):
     def _cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Bridge-Client, X-Bridge-Token, Authorization")
         # Private Network Access: a page on a public origin (shopee.vn) POSTing to
         # http://127.0.0.1 gets a preflight that Chrome fails WITHOUT this header —
         # the /ingest bookmarklet dies silently otherwise.
@@ -1286,10 +1287,13 @@ class _HelperHandler(BaseHTTPRequestHandler):
         # /browser/pair — one-time bootstrap for the MV3 extension's loopback
         # WebSocket. Never expose the token to a normal web origin: otherwise any
         # visited page could turn localhost into a confused-deputy browser controller.
+        # Some MV3 extension contexts omit Origin on localhost fetches, so originless
+        # loopback requests are accepted; browser pages still send their web Origin
+        # and are rejected here.
         if self.path.split("?", 1)[0] == "/browser/pair":
             origin = self.headers.get("Origin", "")
             valid, ext_id = validate_extension_origin(origin, _BROWSER_WS.allowlisted_extension_ids)
-            if not valid:
+            if origin and not valid:
                 self._json(403, {"ok": False, "error": "Unauthorized extension origin"})
                 return
             body = json.dumps(
@@ -1306,7 +1310,7 @@ class _HelperHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
-            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Origin", origin or "*")
             self.end_headers()
             self.wfile.write(body)
             return

@@ -356,13 +356,14 @@ class BrowserGatewayServer:
         origin = headers.get("origin", "")
 
         valid_origin, ext_id = validate_extension_origin(origin, self.allowlisted_extension_ids)
-        if not valid_origin:
+        token_valid = verify_pairing_token(supplied_token, self.token)
+        if not valid_origin and (origin or not token_valid):
             logger.warning("Rejected WebSocket connection with unauthorized origin: %s", origin)
             self.audit.record("auth.rejected", details={"reason": "origin_forbidden", "origin": origin})
             self._reject(sock, 403, "Forbidden: Invalid Extension Origin")
             return
 
-        if not verify_pairing_token(supplied_token, self.token):
+        if not token_valid:
             logger.warning("Rejected WebSocket connection with invalid token: %s", mask_token(supplied_token))
             self.audit.record("auth.rejected", details={"reason": "token_mismatch", "ext_id": ext_id})
             self._reject(sock, 401, "Unauthorized: Invalid Pairing Token")
@@ -469,14 +470,15 @@ class BrowserGatewayServer:
 
             # Origin check
             valid_origin, ext_id = validate_extension_origin(origin, self.allowlisted_extension_ids)
-            if not valid_origin:
+            token_valid = verify_pairing_token(supplied_token, self.token)
+            if not valid_origin and (origin or not token_valid):
                 logger.warning("Rejected WebSocket connection with unauthorized origin: %s", origin)
                 self.audit.record("auth.rejected", details={"reason": "origin_forbidden", "origin": origin})
                 self._reject(sock, 403, "Forbidden: Invalid Extension Origin")
                 return
 
             # Token check
-            if not verify_pairing_token(supplied_token, self.token):
+            if not token_valid:
                 logger.warning("Rejected WebSocket connection with invalid token: %s", mask_token(supplied_token))
                 self.audit.record("auth.rejected", details={"reason": "token_mismatch", "ext_id": ext_id})
                 self._reject(sock, 401, "Unauthorized: Invalid Pairing Token")

@@ -963,7 +963,11 @@ async function connectBridge() {
       pairingController = controller;
       const timeout = setTimeout(() => controller.abort(), 8000);
       try {
-        const response = await fetch(pairUrl.toString(), { cache: "no-store", signal: controller.signal });
+        const response = await fetch(pairUrl.toString(), {
+          cache: "no-store",
+          headers: { "X-Bridge-Client": "ai-cowork-bridge" },
+          signal: controller.signal,
+        });
         if (!response.ok) throw new Error(`Ghép nối bị từ chối (HTTP ${response.status})`);
         const pair = await response.json();
         if (typeof pair.token !== 'string' || !pair.token) throw new Error("Gateway không trả pairing token");

@@ -29,9 +29,10 @@ async function worker(options = {}) {
     clearTimeout: id => timeouts.delete(id),
     setInterval: fn => { timers.set(++nextTimer, fn); return nextTimer; },
     clearInterval: id => timers.delete(id),
-    fetch: async url => {
+    fetch: async (url, options = {}) => {
       fetches.push(url);
       assert.match(url, /\/browser\/pair$/);
+      assert.equal(options.headers['X-Bridge-Client'], 'ai-cowork-bridge');
       return { ok: true, json: async () => ({ token: 'new-token', wsUrl: 'ws://127.0.0.1:8766/browser/v1/ws' }) };
     },
     chrome: {
