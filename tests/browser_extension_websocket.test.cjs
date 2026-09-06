@@ -133,3 +133,24 @@ test('disconnect during pairing invalidates the asynchronous attempt', async () 
   await connecting;
   assert.equal(sockets.length, 1);
 });
+
+test('classifies Shopee API 403 separately from login and traffic verification', async () => {
+  const { context } = await worker();
+  assert.equal(vm.runInContext(`classifyShopeeFailure({
+    status: 403,
+    url: 'https://shopee.vn/api/v2/item/get_ratings',
+    pageUrl: 'https://shopee.vn/product/373956695/25018847315',
+    textSample: '{"error":"access denied"}'
+  })`, context), 'api_blocked');
+  assert.equal(vm.runInContext(`classifyShopeeFailure({
+    status: 403,
+    url: 'https://shopee.vn/verify/traffic',
+    textSample: 'challenge'
+  })`, context), 'verification');
+  assert.equal(vm.runInContext(`classifyShopeeFailure({
+    status: 403,
+    url: 'https://shopee.vn/api/v2/item/get_ratings',
+    json: { error: 90309999, is_login: false },
+    textSample: '{"error":90309999,"is_login":false}'
+  })`, context), 'login');
+});

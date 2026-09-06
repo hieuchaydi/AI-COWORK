@@ -381,6 +381,7 @@ async function fetchRatingsFromTab(tabId, itemid, shopid, offset, limit, referer
           ok: resp.ok,
           status: resp.status,
           url: resp.url,
+          pageUrl: location.href,
           json,
           textSample: text.slice(0, 300),
         };
@@ -391,6 +392,36 @@ async function fetchRatingsFromTab(tabId, itemid, shopid, offset, limit, referer
     args: [itemid, shopid, offset, limit, referer],
   });
   return res[0]?.result || { ok: false, error: "executeScript returned no result" };
+}
+
+function classifyShopeeFailure(fetchRes) {
+  const json = fetchRes?.json || {};
+  const data = json?.data || {};
+  const url = String(fetchRes?.url || "").toLowerCase();
+  const sample = String(fetchRes?.textSample || "").toLowerCase();
+  const isLogin = json?.error === 90309999 || json?.is_login === false || data?.is_login === false ||
+                  url.includes("/login") || sample.includes("is_login") || sample.includes("90309999");
+  if (isLogin) return "login";
+
+  const isChallenge = url.includes("/verify/traffic") || sample.includes("captcha") ||
+                      sample.includes("challenge") || sample.includes("verify/traffic");
+  if (isChallenge) return "verification";
+  return "api_blocked";
+}
+
+function formatShopeeFailure(fetchRes) {
+  const kind = classifyShopeeFailure(fetchRes);
+  const status = fetchRes?.status ?? "unknown";
+  const endpoint = fetchRes?.url || "unknown endpoint";
+  const page = fetchRes?.pageUrl || "unknown tab";
+  const sample = String(fetchRes?.textSample || "").replace(/\s+/g, " ").slice(0, 240);
+  if (kind === "login") {
+    return `Shopee login required (HTTP ${status}, error=${fetchRes?.json?.error ?? "unknown"}, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome`;
+  }
+  if (kind === "verification") {
+    return `Shopee verification required (HTTP ${status}) — response=${endpoint}`;
+  }
+  return `Shopee reviews API access denied (HTTP ${status}) — không thấy CAPTCHA trên tab; endpoint=${endpoint}; tab=${page}; response=${sample || "empty"}`;
 }
 
 async function extractShopeeReviews(job, progress) {
@@ -412,12 +443,9 @@ async function extractShopeeReviews(job, progress) {
   let total = null;
 
   while (all.length < MAX_REVIEWS) {
-    const fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, job.url);
+    const fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, tab.url || job.url);
     if (!fetchRes.ok) {
-      if (fetchRes.status === 403 || (fetchRes.url && fetchRes.url.includes("/verify/traffic"))) {
-        throw new Error(`Shopee verification required (HTTP ${fetchRes.status})`);
-      }
-      throw new Error(`Shopee API error HTTP ${fetchRes.status}: ${fetchRes.error || fetchRes.textSample || ""}`);
+      throw new Error(fetchRes.error ? `Shopee API request failed: ${fetchRes.error}` : formatShopeeFailure(fetchRes));
     }
 
     const json = fetchRes.json;
@@ -1375,6 +1403,8 @@ if (typeof module !== "undefined" && module.exports) {
     normaliseRating,
     ratingTotal,
     crawlPercent,
+    classifyShopeeFailure,
+    formatShopeeFailure,
     runJob,
     resumeVerification,
     triggerVerificationRequired,
