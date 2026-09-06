@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import atexit
 import csv
+import hashlib
 import io
 import json
 import os
@@ -151,6 +152,7 @@ def _outputs_root() -> Path:
 # after a restart would scrape something nobody asked for.
 _INGEST_JOBS: list[dict] = []
 _INGEST_INFLIGHT: dict[str, dict] = {}
+_INGEST_ALL_JOBS: dict[str, dict] = {}
 _INGEST_JOBS_LOCK = threading.Lock()
 _INGEST_JOB_EVENT = threading.Event()
 # job id → what /ingest received for it, so the agent can block on completion instead of
@@ -158,6 +160,38 @@ _INGEST_JOB_EVENT = threading.Event()
 _INGEST_RESULTS: dict[str, dict] = {}
 _INGEST_PROGRESS: dict[str, dict] = {}
 _INGEST_PROGRESS_LOCK = threading.Lock()
+
+
+def _persist_ingest_state() -> None:
+    try:
+        f = _outputs_root() / ".ingest_jobs_state.json"
+        data = {
+            "all_jobs": _INGEST_ALL_JOBS,
+            "progress": _INGEST_PROGRESS,
+            "results": _INGEST_RESULTS,
+        }
+        f.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_ingest_state() -> None:
+    try:
+        f = _outputs_root() / ".ingest_jobs_state.json"
+        if f.is_file():
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                with _INGEST_JOBS_LOCK:
+                    _INGEST_ALL_JOBS.update(data.get("all_jobs") or {})
+                    _INGEST_RESULTS.update(data.get("results") or {})
+                with _INGEST_PROGRESS_LOCK:
+                    _INGEST_PROGRESS.update(data.get("progress") or {})
+    except Exception:
+        pass
+
+
+_load_ingest_state()
+
 
 # Chrome extension control channel. The token is process-local and is disclosed only
 # to a chrome-extension:// origin by /browser/pair. This prevents an arbitrary website
@@ -249,13 +283,103 @@ def _run_tool_in_sandbox(code: str, args: dict, timeout: int = 30) -> dict:
 _load_persisted_tools()
 
 
+def _extract_shopee_itemid(value: object) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    # /product/<shopid>/<itemid>
+    m = re.search(r"/product/\d+/(\d{6,})", text)
+    if m:
+        return m.group(1)
+    # i.<shopid>.<itemid>
+    m = re.search(r"i\.\d+\.(\d{6,})", text)
+    if m:
+        return m.group(1)
+    # vanity /<shopname>/<itemid> e.g. /depnhaphuong/25018847315
+    m = re.search(r"/[a-zA-Z0-9_.-]+/(\d{6,})(?:[?&#/]|$)", text)
+    if m:
+        return m.group(1)
+    # query parameter itemid=...
+    m = re.search(r"[?&]item_?id=(\d{6,})", text)
+    if m:
+        return m.group(1)
+    # shopee_<itemid>
+    m = re.search(r"shopee_(\d{6,})", text)
+    if m:
+        return m.group(1)
+    # Any trailing 6+ digit id
+    m = re.search(r"[./-](\d{6,})(?:[?&#/]|$)", text)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _generate_shopee_report(
+    stem: str,
+    rows: list,
+    source: str = "",
+    csv_rel: str = "",
+    zip_rel: str = "",
+    manifest_rel: str = "",
+) -> str:
+    text_dir = _outputs_root() / "text"
+    text_dir.mkdir(parents=True, exist_ok=True)
+    report_file = text_dir / f"{stem}_report.md"
+
+    star_counts = {5: 0, 4: 0, 3: 0, 2: 0, 1: 0}
+    media_count = 0
+    for r in rows:
+        try:
+            s = int(r.get("sao") or 0)
+            if s in star_counts:
+                star_counts[s] += 1
+        except (ValueError, TypeError):
+            pass
+        if r.get("anh") or r.get("so_anh") or r.get("video") or r.get("so_video"):
+            media_count += 1
+
+    lines = [
+        f"# Báo cáo đánh giá Shopee: {stem}",
+        "",
+        f"- **Nguồn**: {source or 'N/A'}",
+        f"- **Tổng số đánh giá**: {len(rows)}",
+        f"- **Đánh giá có ảnh/video**: {media_count}",
+        f"- **Thời gian xử lý**: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        "## Phân bố số sao",
+        f"- ⭐⭐⭐⭐⭐ (5 sao): {star_counts[5]}",
+        f"- ⭐⭐⭐⭐ (4 sao): {star_counts[4]}",
+        f"- ⭐⭐⭐ (3 sao): {star_counts[3]}",
+        f"- ⭐⭐ (2 sao): {star_counts[2]}",
+        f"- ⭐ (1 sao): {star_counts[1]}",
+        "",
+        "## Tệp kết quả",
+    ]
+    if csv_rel:
+        lines.append(f"- [Tải file CSV](http://localhost:8766/{csv_rel})")
+    if zip_rel:
+        lines.append(f"- [Tải trọn bộ ảnh/video .ZIP](http://localhost:8766/{zip_rel})")
+    if manifest_rel:
+        lines.append(f"- [Xem manifest JSON](http://localhost:8766/{manifest_rel})")
+
+    lines.append("")
+    report_file.write_text("\n".join(lines), encoding="utf-8")
+    return f"outputs/text/{report_file.name}"
+
+
 def _queue_ingest_job(url: str, kind: str) -> dict:
+    itemid = _extract_shopee_itemid(url)
     job = {
         "id": f"job-{secrets.token_hex(12)}",
         "url": url,
         "kind": kind,
         "queued_at": time.strftime("%H:%M:%S"),
     }
+    if itemid:
+        job["itemid"] = itemid
+        job["name"] = f"shopee_{itemid}"
+        job["name"] = f"shopee_{itemid}_reviews"
+    _INGEST_ALL_JOBS[job["id"]] = job
     with _INGEST_JOBS_LOCK:
         _INGEST_JOBS.append(job)
     _update_ingest_progress(
@@ -270,6 +394,7 @@ def _queue_ingest_job(url: str, kind: str) -> dict:
             "url": url,
         },
     )
+    _persist_ingest_state()
     _INGEST_JOB_EVENT.set()
     if _BROWSER_WS.connected:
         try:
@@ -290,6 +415,7 @@ def _update_ingest_progress(job_id: str, patch: dict) -> dict | None:
         current["job"] = job_id
         current["updated_at"] = now
         _INGEST_PROGRESS[job_id] = current
+        _persist_ingest_state()
         return dict(current)
 
 
@@ -343,6 +469,27 @@ def _on_browser_ws_message(message: dict) -> None:
         _ack_ingest_job(job_id)
     elif kind in ("bridge.ping", "ping"):
         _BROWSER_WS.send({"type": "bridge.pong", "at": time.time()})
+    elif kind == "verification.required":
+        params = message.get("params") or {}
+        job_id = str(params.get("job_id") or params.get("jobId") or "")
+        reason = str(params.get("reason") or "Yêu cầu xác minh danh tính / CAPTCHA Shopee")
+        _BROWSER_WS.transport.require_verification(params.get("url") or "")
+        if job_id:
+            _update_ingest_progress(
+                job_id,
+                {
+                    "status": "awaiting_user_verification",
+                    "stage": "verification_required",
+                    "verification_required": True,
+                    "message": reason,
+                    "error": reason,
+                    "url": params.get("url"),
+                    "percent": 100,
+                },
+            )
+            _persist_ingest_state()
+    elif kind == "verification.resolved":
+        _BROWSER_WS.transport.resume_verification()
 
 
 _INGEST_RPC = IngestRPC(
@@ -359,36 +506,87 @@ _BROWSER_WS.on_message = _on_browser_ws_message
 def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
     """Persist a result shared by WebSocket ingestion and legacy HTTP clients."""
     job_id = (body.get("job") if isinstance(body, dict) else None) or ""
+    job_obj = _INGEST_ALL_JOBS.get(job_id) if job_id else None
+    source = (body.get("source") if isinstance(body, dict) else None) or (job_obj.get("url") if job_obj else None)
+    source_text = str(source or "")
+
     # A job that failed in the browser reports here too — otherwise the agent
     # would poll /ingest/result forever waiting for a run that already died.
-    if isinstance(body, dict) and body.get("error"):
+    if isinstance(body, dict) and (body.get("error") or body.get("verification_required")):
+        err_msg = str(body.get("error") or "Yêu cầu xác minh danh tính Shopee")[:500]
+        is_verification = bool(
+            body.get("verification_required")
+            or "verification required" in err_msg.lower()
+            or "is_login=false" in err_msg.lower()
+            or "90309999" in err_msg
+            or "/verify/traffic" in err_msg
+            or "challenge" in err_msg.lower()
+        )
         if job_id:
-            result = {"ok": False, "error": str(body["error"])[:500]}
+            result = {
+                "ok": False,
+                "error": err_msg,
+                "verification_required": is_verification,
+            }
             _INGEST_RESULTS[job_id] = result
             with _INGEST_JOBS_LOCK:
                 _INGEST_INFLIGHT.pop(job_id, None)
             _update_ingest_progress(
                 job_id,
                 {
-                    "status": "error",
-                    "stage": "failed",
-                    "message": result["error"],
-                    "error": result["error"],
+                    "status": "awaiting_user_verification" if is_verification else "error",
+                    "stage": "verification_required" if is_verification else "failed",
+                    "verification_required": is_verification,
+                    "message": err_msg,
+                    "error": err_msg,
                     "percent": 100,
                 },
             )
-        return 200, {"ok": True, "recorded": "error"}
+            _persist_ingest_state()
+        return 200, {"ok": False, "error": err_msg, "verification_required": is_verification}
+
     rows = body.get("rows") if isinstance(body, dict) else body
     if not isinstance(rows, list):
         return 400, {"ok": False, "error": "expected {rows: [...]} or a JSON array"}
-    raw = (name_hint or (body.get("name") if isinstance(body, dict) else "") or "")
-    name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(raw)).strip("_")
-    if not name:
-        name = "ingest_" + time.strftime("%Y%m%d_%H%M%S")
-    if not name.endswith(".json"):
-        name += ".json"
-    source = (body.get("source") if isinstance(body, dict) else None)
-    source_text = str(source or "")
+
+    if len(rows) == 0:
+        err_msg = "Không có đánh giá nào được tìm thấy hoặc quyền truy cập bị hạn chế"
+        if job_id:
+            _INGEST_RESULTS[job_id] = {"ok": False, "error": err_msg, "count": 0}
+            with _INGEST_JOBS_LOCK:
+                _INGEST_INFLIGHT.pop(job_id, None)
+            _update_ingest_progress(
+                job_id,
+                {
+                    "status": "error",
+                    "stage": "empty",
+                    "message": err_msg,
+                    "error": err_msg,
+                    "percent": 100,
+                    "rows": 0,
+                    "count": 0,
+                },
+            )
+            _persist_ingest_state()
+        return 200, {"ok": False, "error": err_msg, "count": 0}
+
+    raw = (name_hint or (body.get("name") if isinstance(body, dict) else "") or (job_obj.get("name") if job_obj else "") or "")
+    # Check if we should resolve name according to itemid (Requirement 3)
+    # Check if we should resolve name according to itemid (Requirement 8)
+    itemid = _extract_shopee_itemid(raw) or _extract_shopee_itemid(source_text)
+    if itemid:
+        name = f"shopee_{itemid}.json"
+        stem = f"shopee_{itemid}"
+        name = f"shopee_{itemid}_reviews.json"
+        stem = f"shopee_{itemid}_reviews"
+    else:
+        name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(raw)).strip("_")
+        if not name or name.startswith("job-") or name.startswith("shopee_job-"):
+            name = "ingest_" + time.strftime("%Y%m%d_%H%M%S")
+        stem = name[:-5] if name.endswith(".json") else name
+        if not name.endswith(".json"):
+            name += ".json"
+
     media_dir = None
     zip_rel = None
     if name.lower().startswith("shopee_") or "shopee.vn" in source_text.lower():
@@ -404,6 +602,7 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
                 },
             )
         rows, media_dir, zip_rel = _prepare_shopee_review_rows(name, rows, job_id)
+
     inbox = _outputs_root() / "inbox"
     inbox.mkdir(parents=True, exist_ok=True)
     target = inbox / name
@@ -421,12 +620,19 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
         )
     except OSError as exc:
         return 500, {"ok": False, "error": f"write failed: {exc}"}
-    # Write the CSV here too, rather than leaving it to the agent. The whole
-    # point of this path is that it works when the model can't help: the
-    # workspace is elsewhere so read_file can't reach outputs/, and web_fetch
-    # truncates at 100k chars — a few hundred reviews would arrive cut in half.
-    # One click now produces the deliverable; the agent is only for summarising.
+
     csv_rel = _write_ingest_csv(name, rows)
+
+    manifest_rel = f"outputs/{media_dir}/manifest.json" if media_dir else None
+    report_rel = _generate_shopee_report(
+        stem=stem,
+        rows=rows,
+        source=source_text,
+        csv_rel=csv_rel or "",
+        zip_rel=zip_rel or "",
+        manifest_rel=manifest_rel or "",
+    ) if (name.lower().startswith("shopee_") or "shopee.vn" in source_text.lower()) else None
+
     print(f"[ingest] {len(rows)} rows → {target}", file=sys.stderr)
     result = {
         "ok": True,
@@ -435,8 +641,11 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
         "url": f"/outputs/inbox/{name}",
         "csv": csv_rel,
         "media_dir": f"outputs/{media_dir}" if media_dir else None,
+        "manifest": manifest_rel,
         "zip": zip_rel,
         "zip_url": f"/{zip_rel}" if zip_rel else None,
+        "report": report_rel,
+        "report_url": f"/{report_rel}" if report_rel else None,
     }
     if job_id:
         _INGEST_RESULTS[job_id] = result
@@ -453,11 +662,15 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
                 "path": result["path"],
                 "csv": csv_rel,
                 "media_dir": result.get("media_dir"),
+                "manifest": manifest_rel,
                 "zip": zip_rel,
                 "zip_url": result.get("zip_url"),
+                "report": report_rel,
+                "report_url": result.get("report_url"),
                 "percent": 100,
             },
         )
+        _persist_ingest_state()
     return 200, result
 
 
@@ -636,9 +849,26 @@ def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tupl
     if not stem:
         stem = "shopee_reviews"
     media_root = _outputs_root() / "shopee_reviews" / stem / "media"
+    media_root = _outputs_root() / "media" / stem
+    media_root.mkdir(parents=True, exist_ok=True)
+
+    # 1. Deduplicate reviews with identical (user, thoi_gian, noi_dung)
+    seen_reviews: set[tuple[str, str, str]] = set()
+    deduped_rows: list[dict] = []
+    for r in rows:
+        key = (
+            str(r.get("user") or "").strip(),
+            str(r.get("thoi_gian") or r.get("time") or "").strip(),
+            str(r.get("noi_dung") or r.get("comment") or "").strip(),
+        )
+        if key != ("", "", ""):
+            if key in seen_reviews:
+                continue
+            seen_reviews.add(key)
+        deduped_rows.append(r)
 
     sorted_rows = sorted(
-        (dict(r) for r in rows),
+        (dict(r) for r in deduped_rows),
         key=lambda r: (
             _review_sort_time(r),
             _safe_int(r.get("huu_ich")),
@@ -656,6 +886,13 @@ def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tupl
     media_saved = 0
     media_dir_rel = None
 
+    seen_hashes: dict[tuple[str, str], dict] = {}  # (kind, sha256) -> info
+    url_to_entry: dict[str, dict] = {}
+    manifest_entries: list[dict] = []
+    unique_count = 0
+    duplicate_count = 0
+    failed_count = 0
+
     for idx, row in enumerate(sorted_rows, start=1):
         image_files: list[str] = []
         image_names: list[str] = []
@@ -667,16 +904,90 @@ def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tupl
             ("video", _split_ingest_urls(row.get("video_urls")), video_files, video_names),
         ):
             for media_idx, url in enumerate(urls, start=1):
-                media_root.mkdir(parents=True, exist_ok=True)
+                if url in url_to_entry:
+                    prev = url_to_entry[url]
+                    if prev.get("filename"):
+                        bucket_names.append(prev["filename"])
+                    if prev.get("local_path"):
+                        bucket_files.append(prev["local_path"])
+                    continue
+
                 base = media_root / f"review_{idx:05d}_{kind}_{media_idx:02d}"
                 try:
                     rel = _download_ingest_media(url, base)
-                    bucket_files.append(rel)
-                    bucket_names.append(Path(rel).name)
-                    media_saved += 1
-                    media_dir_rel = media_root.relative_to(_outputs_root()).as_posix()
+                    # Resolve real file on disk to compute hash and size
+                    target_file = (_outputs_root() / Path(rel).relative_to("outputs")) if rel.startswith("outputs/") else Path(rel)
+                    file_bytes = target_file.read_bytes() if target_file.is_file() else b""
+                    file_hash = hashlib.sha256(file_bytes).hexdigest() if file_bytes else ""
+                    file_size = len(file_bytes)
+
+                    hash_key = (kind, file_hash)
+                    # Check if another file of the same kind had identical content hash
+                    if file_hash and hash_key in seen_hashes:
+                        primary = seen_hashes[hash_key]
+                        duplicate_count += 1
+                        # Remove duplicate file from disk so media_root has only unique files
+                        target_file.unlink(missing_ok=True)
+                        entry = {
+                            "url": url,
+                            "type": kind,
+                            "loai_media": kind,
+                            "filename": primary["filename"],
+                            "local_path": primary["local_path"],
+                            "hash": file_hash,
+                            "sha256": file_hash,
+                            "size": file_size,
+                            "duplicate_of": primary["filename"],
+                            "error": None,
+                            "loi_tai": None,
+                        }
+                        manifest_entries.append(entry)
+                        url_to_entry[url] = entry
+                        bucket_files.append(primary["local_path"])
+                        bucket_names.append(primary["filename"])
+                    else:
+                        unique_count += 1
+                        media_saved += 1
+                        media_dir_rel = media_root.relative_to(_outputs_root()).as_posix()
+                        bucket_files.append(rel)
+                        bucket_names.append(target_file.name)
+                        entry = {
+                            "url": url,
+                            "type": kind,
+                            "loai_media": kind,
+                            "filename": target_file.name,
+                            "local_path": rel,
+                            "hash": file_hash,
+                            "sha256": file_hash,
+                            "size": file_size,
+                            "duplicate_of": None,
+                            "error": None,
+                            "loi_tai": None,
+                        }
+                        manifest_entries.append(entry)
+                        url_to_entry[url] = entry
+                        if file_hash:
+                            seen_hashes[hash_key] = {"filename": target_file.name, "local_path": rel}
                 except Exception as exc:  # noqa: BLE001
-                    errors.append(f"{kind}:{url}:{exc}")
+                    failed_count += 1
+                    err_str = str(exc)
+                    errors.append(f"{kind}:{url}:{err_str}")
+                    entry = {
+                        "url": url,
+                        "type": kind,
+                        "loai_media": kind,
+                        "filename": None,
+                        "local_path": None,
+                        "hash": None,
+                        "sha256": None,
+                        "size": 0,
+                        "duplicate_of": None,
+                        "error": err_str,
+                        "loi_tai": err_str,
+                    }
+                    manifest_entries.append(entry)
+                    url_to_entry[url] = entry
+
                 if job_id:
                     _update_ingest_progress(
                         job_id,
@@ -704,8 +1015,36 @@ def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tupl
         if errors:
             row["media_errors"] = " || ".join(errors[:10])
 
+    # 2. Write manifest.json
+    manifest_data = {
+        "job_name": stem,
+        "target": stem,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "total_urls": media_total,
+        "downloaded_count": media_saved,
+        "unique_count": unique_count,
+        "duplicate_count": duplicate_count,
+        "failed_count": failed_count,
+        "files": manifest_entries,
+        "items": manifest_entries,
+    }
+    if manifest_entries:
+        manifest_text = json.dumps(manifest_data, ensure_ascii=False, indent=2)
+        (media_root / "manifest.json").write_text(manifest_text, encoding="utf-8")
+        (media_root.parent / "manifest.json").write_text(manifest_text, encoding="utf-8")
+
+        # Also copy to outputs/media/<stem> for media-scrape contract compatibility
+        alt_media_dir = _outputs_root() / "media" / stem
+        alt_media_dir.mkdir(parents=True, exist_ok=True)
+        for f in media_root.iterdir():
+            if f.is_file():
+                try:
+                    shutil.copy2(f, alt_media_dir / f.name)
+                except Exception:
+                    pass
+
     zip_rel = None
-    if media_saved > 0:
+    if media_saved > 0 or manifest_entries:
         if job_id:
             _update_ingest_progress(
                 job_id,
@@ -1366,12 +1705,26 @@ class _HelperHandler(BaseHTTPRequestHandler):
             return
 
         if self.path.split("?", 1)[0] == "/browser/status":
+            transport_state = _BROWSER_WS.transport.get_state()
+            verif_job = None
+            with _INGEST_PROGRESS_LOCK:
+                for jid, p in reversed(list(_INGEST_PROGRESS.items())):
+                    if p.get("status") == "awaiting_user_verification" or p.get("verification_required"):
+                        verif_job = {
+                            "job_id": jid,
+                            "url": p.get("url"),
+                            "reason": p.get("message") or p.get("error"),
+                        }
+                        break
+            state = "awaiting_user_verification" if (verif_job or transport_state == "awaiting_user_verification") else transport_state
             self._json(
                 200,
                 {
                     "ok": True,
                     "transport": "extension-websocket",
-                    "state": _BROWSER_WS.transport.get_state(),
+                    "state": state,
+                    "verification_required": bool(verif_job or state == "awaiting_user_verification"),
+                    "pending_verification": verif_job,
                     "connected": _BROWSER_WS.connected,
                     "protocolVersion": "1.0",
                     "wsPort": HELPER_WS_PORT,
@@ -1393,24 +1746,96 @@ class _HelperHandler(BaseHTTPRequestHandler):
             origin = self.headers.get("Origin", "")
             valid_origin, _ = validate_extension_origin(origin, _BROWSER_WS.allowlisted_extension_ids)
 
-            # Require valid pairing token, API token, or request from authorized extension origin
+            # Require valid pairing token, API token, or request from authorized extension origin / loopback
             token_valid = req_token and (
                 verify_pairing_token(req_token, _BROWSER_WS.token)
                 or verify_pairing_token(req_token, API_TOKEN)
             )
-            if not token_valid and not valid_origin:
+            client_ip = self.client_address[0]
+            is_loopback = client_ip in ("127.0.0.1", "::1", "localhost")
+            if not token_valid and not valid_origin and not (is_loopback and not origin):
                 self._json(401, {"ok": False, "error": "Unauthorized: Valid token or extension origin required"})
                 return
 
             job_id = (qs.get("id", [""])[0] or qs.get("jobId", [""])[0] or "").strip()
+            if not job_id:
+                with _INGEST_PROGRESS_LOCK:
+                    for jid, p in reversed(list(_INGEST_PROGRESS.items())):
+                        if p.get("status") == "awaiting_user_verification" or p.get("verification_required"):
+                            job_id = jid
+                            break
+
             msg = {
                 "v": 1,
                 "type": "verification.resolved",
-                "params": {"jobId": job_id} if job_id else {},
+                "params": {"jobId": job_id, "retry": True} if job_id else {"retry": True},
             }
             sent = _BROWSER_WS.send(msg)
             _BROWSER_WS.transport.resume_verification()
-            self._json(200, {"ok": True, "resumed": True, "sent": sent, "jobId": job_id})
+
+            retried_job = None
+            if job_id:
+                _INGEST_RESULTS.pop(job_id, None)
+                _update_ingest_progress(
+                    job_id,
+                    {
+                        "status": "queued",
+                        "stage": "resumed",
+                        "verification_required": False,
+                        "message": "Đã giải quyết xác minh, đang tiếp tục cào",
+                        "percent": 5,
+                        "error": None,
+                    },
+                )
+                job = _INGEST_ALL_JOBS.get(job_id)
+                if job:
+                    retried_job = job
+                    with _INGEST_JOBS_LOCK:
+                        if job_id not in [j.get("id") for j in _INGEST_JOBS]:
+                            _INGEST_JOBS.append(job)
+                            _INGEST_JOB_EVENT.set()
+                    if _BROWSER_WS.connected:
+                        _BROWSER_WS.send({"type": "ingest.job", "job": job, "retry": True})
+                _persist_ingest_state()
+
+            self._json(200, {
+                "ok": True,
+                "resumed": True,
+                "sent": sent,
+                "jobId": job_id,
+                "retried": bool(retried_job),
+            })
+            return
+
+        if self.path.split("?", 1)[0] == "/ingest/retry":
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            job_id = (qs.get("id", [""])[0] or qs.get("jobId", [""])[0] or "").strip()
+            if not job_id:
+                self._json(400, {"ok": False, "error": "job id is required"})
+                return
+            job = _INGEST_ALL_JOBS.get(job_id)
+            if not job:
+                self._json(404, {"ok": False, "error": f"Job {job_id} not found in history"})
+                return
+            _INGEST_RESULTS.pop(job_id, None)
+            _update_ingest_progress(
+                job_id,
+                {
+                    "status": "queued",
+                    "stage": "retry",
+                    "message": "Đang thử lại job",
+                    "percent": 0,
+                    "error": None,
+                },
+            )
+            with _INGEST_JOBS_LOCK:
+                if job_id not in [j.get("id") for j in _INGEST_JOBS]:
+                    _INGEST_JOBS.append(job)
+                    _INGEST_JOB_EVENT.set()
+            sent = False
+            if _BROWSER_WS.connected:
+                sent = _BROWSER_WS.send({"type": "ingest.job", "job": job, "retry": True})
+            self._json(200, {"ok": True, "retried": job_id, "sent": sent, "job": job})
             return
 
         # ── Dynamic Tools ─────────────────────────────────────────────────────
@@ -1961,6 +2386,108 @@ class _HelperHandler(BaseHTTPRequestHandler):
             patch = body.get("progress") if isinstance(body.get("progress"), dict) else body
             progress = _update_ingest_progress(job_id, patch)
             _reply(200, {"ok": True, "progress": progress})
+            return
+
+        if path_only == "/browser/resume":
+            body = _read_json()
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            auth_header = self.headers.get("Authorization", "")
+            req_token = body.get("token", "") or qs.get("token", [""])[0] or self.headers.get("X-Bridge-Token", "")
+            if not req_token and auth_header.startswith("Bearer "):
+                req_token = auth_header[7:].strip()
+            origin = self.headers.get("Origin", "")
+            valid_origin, _ = validate_extension_origin(origin, _BROWSER_WS.allowlisted_extension_ids)
+            token_valid = req_token and (
+                verify_pairing_token(req_token, _BROWSER_WS.token)
+                or verify_pairing_token(req_token, API_TOKEN)
+            )
+            client_ip = self.client_address[0]
+            is_loopback = client_ip in ("127.0.0.1", "::1", "localhost")
+            if not token_valid and not valid_origin and not (is_loopback and not origin):
+                _reply(401, {"ok": False, "error": "Unauthorized: Valid token or extension origin required"})
+                return
+
+            job_id = (body.get("id") or body.get("jobId") or qs.get("id", [""])[0] or qs.get("jobId", [""])[0] or "").strip()
+            if not job_id:
+                with _INGEST_PROGRESS_LOCK:
+                    for jid, p in reversed(list(_INGEST_PROGRESS.items())):
+                        if p.get("status") == "awaiting_user_verification" or p.get("verification_required"):
+                            job_id = jid
+                            break
+
+            msg = {
+                "v": 1,
+                "type": "verification.resolved",
+                "params": {"jobId": job_id, "retry": True} if job_id else {"retry": True},
+            }
+            sent = _BROWSER_WS.send(msg)
+            _BROWSER_WS.transport.resume_verification()
+
+            retried_job = None
+            if job_id:
+                _INGEST_RESULTS.pop(job_id, None)
+                _update_ingest_progress(
+                    job_id,
+                    {
+                        "status": "queued",
+                        "stage": "resumed",
+                        "verification_required": False,
+                        "message": "Đã giải quyết xác minh, đang tiếp tục cào",
+                        "percent": 5,
+                        "error": None,
+                    },
+                )
+                job = _INGEST_ALL_JOBS.get(job_id)
+                if job:
+                    retried_job = job
+                    with _INGEST_JOBS_LOCK:
+                        if job_id not in [j.get("id") for j in _INGEST_JOBS]:
+                            _INGEST_JOBS.append(job)
+                            _INGEST_JOB_EVENT.set()
+                    if _BROWSER_WS.connected:
+                        _BROWSER_WS.send({"type": "ingest.job", "job": job, "retry": True})
+                _persist_ingest_state()
+
+            _reply(200, {
+                "ok": True,
+                "resumed": True,
+                "sent": sent,
+                "jobId": job_id,
+                "retried": bool(retried_job),
+            })
+            return
+
+        if path_only == "/ingest/retry":
+            body = _read_json()
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            job_id = (body.get("id") or body.get("jobId") or qs.get("id", [""])[0] or qs.get("jobId", [""])[0] or "").strip()
+            if not job_id:
+                _reply(400, {"ok": False, "error": "job id is required"})
+                return
+            job = _INGEST_ALL_JOBS.get(job_id)
+            if not job:
+                _reply(404, {"ok": False, "error": f"Job {job_id} not found in history"})
+                return
+            _INGEST_RESULTS.pop(job_id, None)
+            _update_ingest_progress(
+                job_id,
+                {
+                    "status": "queued",
+                    "stage": "retry",
+                    "message": "Đang thử lại job",
+                    "percent": 0,
+                    "error": None,
+                },
+            )
+            with _INGEST_JOBS_LOCK:
+                if job_id not in [j.get("id") for j in _INGEST_JOBS]:
+                    _INGEST_JOBS.append(job)
+                    _INGEST_JOB_EVENT.set()
+            sent = False
+            if _BROWSER_WS.connected:
+                sent = _BROWSER_WS.send({"type": "ingest.job", "job": job, "retry": True})
+            _persist_ingest_state()
+            _reply(200, {"ok": True, "retried": job_id, "sent": sent, "job": job})
             return
 
         if path_only == "/google/refresh":

@@ -8,9 +8,14 @@ const btnConnect = document.getElementById("btnConnect");
 const btnDisconnect = document.getElementById("btnDisconnect");
 const jobStatusText = document.getElementById("jobStatusText");
 const verificationBox = document.getElementById("verificationBox");
+const verificationReason = document.getElementById("verificationReason");
 const verificationMsg = document.getElementById("verificationMsg");
+const verificationTargetUrl = document.getElementById("verificationTargetUrl");
+const btnOpenVerificationTab = document.getElementById("btnOpenVerificationTab");
 const btnResumeVerification = document.getElementById("btnResumeVerification");
 const tabList = document.getElementById("tabList");
+
+let currentVerification = null;
 
 function renderStatus(state, details) {
   statusBadge.className = "badge " + (state || "disconnected");
@@ -26,9 +31,21 @@ function renderStatus(state, details) {
   }
 
   if (details && details.verification) {
+    currentVerification = details.verification;
     verificationBox.style.display = "block";
     verificationMsg.textContent = `Yêu cầu xác minh tại: ${details.verification.url || details.verification.hostname || "tab hiện tại"}`;
+    if (verificationReason) {
+      verificationReason.textContent = details.verification.reason || "Lý do: Shopee yêu cầu giải CAPTCHA hoặc xác minh danh tính tài khoản";
+    }
+    const targetUrl = details.verification.url || details.verification.hostname || "";
+    if (verificationTargetUrl) {
+      verificationTargetUrl.textContent = targetUrl ? `URL cần mở: ${targetUrl}` : "";
+    }
+    if (btnOpenVerificationTab) {
+      btnOpenVerificationTab.style.display = (targetUrl || details.verification.tab_id) ? "block" : "none";
+    }
   } else {
+    currentVerification = null;
     verificationBox.style.display = "none";
   }
 
@@ -96,9 +113,30 @@ btnAutoPair.addEventListener("click", () => changeConnection("connect"));
 btnConnect.addEventListener("click", () => changeConnection("connect"));
 btnDisconnect.addEventListener("click", () => changeConnection("disconnect"));
 
+if (btnOpenVerificationTab) {
+  btnOpenVerificationTab.addEventListener("click", async () => {
+    if (!currentVerification) return;
+    const tabId = currentVerification.tab_id;
+    const url = currentVerification.url;
+    if (tabId) {
+      try {
+        await chrome.tabs.update(tabId, { active: true });
+        return;
+      } catch {}
+    }
+    if (url) {
+      chrome.tabs.create({ url, active: true });
+    }
+  });
+}
+
 btnResumeVerification.addEventListener("click", () => {
-  chrome.runtime.sendMessage({ action: "resumeVerification" });
+  const jobId = currentVerification?.job_id;
+  chrome.runtime.sendMessage({ action: "resumeVerification", jobId });
   verificationBox.style.display = "none";
+  if (jobStatusText) {
+    jobStatusText.textContent = "Đã xác nhận xác minh, đang tiếp tục cào...";
+  }
 });
 
 // Periodic refresh

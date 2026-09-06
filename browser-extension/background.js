@@ -32,6 +32,8 @@ let extensionState = "disconnected";
 let activeJobs = new Map();
 let inFlightCommands = new Map();
 let verificationInfo = null;
+let pendingVerificationJobs = new Map();
+let lastVerificationJob = null;
 
 function setBadge(text, color = "#1a73e8") {
   chrome.action.setBadgeText({ text: String(text || "") });
@@ -153,28 +155,44 @@ function crawlPercent(rows, total, base, span) {
   return Math.min(95, base + Math.floor((rows / MAX_REVIEWS) * span));
 }
 
+function extractShopName(url) {
+  try {
+    const u = new URL(url, "https://shopee.vn");
+    const reserved = new Set([
+      "product", "cart", "user", "buyer", "search", "flash_sale",
+      "daily_discover", "m", "portal", "verify", "api", "order",
+      "checkout", "help", "seller", "affiliate"
+    ]);
+    const parts = u.pathname.split("/").filter(Boolean);
+    if (parts.length >= 2 && !reserved.has(parts[0].toLowerCase())) {
+      return parts[0];
+    }
+  } catch {}
+  return null;
+}
+
 function idsFrom(url) {
-  const u = new URL(url);
-  const q = u.searchParams;
-  const qItem = q.get("itemid") || q.get("item_id");
-  if (qItem) return { shopid: q.get("shopid") || q.get("shop_id") || null, itemid: qItem };
-  let m = u.pathname.match(/^\/product\/(\d+)\/(\d+)/) || u.href.match(/i\.(\d+)\.(\d+)/);
-  if (m) return { shopid: m[1], itemid: m[2] };
-  const tail = u.pathname.match(/\/(\d{6,})\/?$/);
-  if (tail) return { shopid: null, itemid: tail[1] };
-  const any = u.href.match(/[.\-/](\d{8,})(?:[?&#/]|$)/);
-  return any ? { shopid: null, itemid: any[1] } : {};
+  try {
+    const u = new URL(url, "https://shopee.vn");
+    const q = u.searchParams;
+    const qItem = q.get("itemid") || q.get("item_id");
+    if (qItem) return { shopid: q.get("shopid") || q.get("shop_id") || null, itemid: qItem, shopname: extractShopName(url) };
+    let m = u.pathname.match(/^\/product\/(\d+)\/(\d+)/) || u.href.match(/i\.(\d+)\.(\d+)/);
+    if (m) return { shopid: m[1], itemid: m[2], shopname: null };
+    const tail = u.pathname.match(/\/(\d{6,})\/?$/);
+    if (tail) return { shopid: null, itemid: tail[1], shopname: extractShopName(url) };
+    const any = u.href.match(/[.\-/](\d{8,})(?:[?&#/]|$)/);
+    return any ? { shopid: null, itemid: any[1], shopname: extractShopName(url) } : {};
+  } catch {
+    return {};
+  }
 }
 
 async function findOrOpenShopeeTab(targetUrl, itemid) {
   const tabs = await chrome.tabs.query({});
   // 1. Prefer a tab already displaying this item
   let tab = tabs.find((t) => t.url && itemid && t.url.includes(itemid));
-  // 2. Or any tab on shopee.vn
-  if (!tab) {
-    tab = tabs.find((t) => t.url && t.url.includes("shopee.vn"));
-  }
-  // 3. Or create a new tab if none exists
+  // 2. Or create a new tab if none exists with this item
   if (!tab) {
     tab = await chrome.tabs.create({ url: targetUrl, active: false });
     await new Promise((resolve) => {
@@ -195,54 +213,144 @@ async function findOrOpenShopeeTab(targetUrl, itemid) {
         resolve();
       }, 15000);
     });
+    try {
+      const updated = await chrome.tabs.get(tab.id);
+      if (updated) tab = updated;
+    } catch {}
   }
   return tab;
 }
 
 async function resolveShopId(itemid, originalUrl, tab, progress) {
+  // Support both (itemid, originalUrl, tab, progress) and (itemid, originalUrl, progress)
+  if (typeof tab === "function" && progress === undefined) {
+    progress = tab;
+    tab = null;
+  }
   if (progress) await progress({ stage: "resolve-shop", message: "Đang tìm shopid", itemid, percent: 10 });
+
+  const shopname = extractShopName(originalUrl);
+
   function scrape(text) {
-    const m = text.match(/"shopid"\s*:\s*"?(\d+)/) || text.match(/"shop_id"\s*:\s*"?(\d+)/);
+    if (!text || typeof text !== "string") return null;
+    const m = text.match(/"shopid"\s*:\s*"?(\d+)/i) ||
+              text.match(/"shop_id"\s*:\s*"?(\d+)/i) ||
+              text.match(/"shopId"\s*:\s*"?(\d+)/);
     return m ? m[1] : null;
   }
 
-  // 1. Try URL regex from original URL
+  function extractShopIdFromUrl(urlStr) {
+    if (!urlStr || typeof urlStr !== "string") return null;
+    try {
+      const u = new URL(urlStr, "https://shopee.vn");
+      const q = u.searchParams.get("shopid") || u.searchParams.get("shop_id");
+      if (q) return q;
+      const m = u.pathname.match(/^\/product\/(\d+)\//) || u.href.match(/i\.(\d+)\./);
+      if (m) return m[1];
+    } catch {}
+    return null;
+  }
+
+  // 1. Try URL regex from current tab URL (might have redirected to /product/<shopid>/<itemid>)
+  if (tab && tab.url) {
+    const sid = extractShopIdFromUrl(tab.url);
+    if (sid) return sid;
+  }
+
+  // 2. Scrape from DOM / canonical / same-origin in tab context (highest fidelity with user session)
+  if (tab && tab.id) {
+    try {
+      const res = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: async (sname, iid) => {
+          // 2a. Check current location URL
+          const fromLoc = location.pathname.match(/^\/product\/(\d+)\//) || location.href.match(/i\.(\d+)\./);
+          if (fromLoc) return fromLoc[1];
+
+          // 2b. Check canonical or og:url meta tags
+          const canonical = document.querySelector('link[rel="canonical"]')?.href || "";
+          const ogUrl = document.querySelector('meta[property="og:url"]')?.content || "";
+          for (const u of [canonical, ogUrl]) {
+            const m = u.match(/\/product\/(\d+)\//) || u.match(/i\.(\d+)\./);
+            if (m) return m[1];
+          }
+
+          // 2c. Scrape from DOM in tab context
+          const html = document.documentElement.innerHTML;
+          const s = html.match(/"shopid"\s*:\s*"?(\d+)/i) ||
+                    html.match(/"shop_id"\s*:\s*"?(\d+)/i) ||
+                    html.match(/"shopId"\s*:\s*"?(\d+)/);
+          if (s) return s[1];
+
+          // 2d. For vanity URL /<shopname>/<itemid>, resolve shopid via same-origin tab fetch
+          if (sname) {
+            try {
+              const resp = await fetch(`/api/v4/shop/get_shop_detail?username=${encodeURIComponent(sname)}`, {
+                credentials: "include",
+                headers: { "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" },
+              });
+              if (resp.ok) {
+                const j = await resp.json();
+                const sid = j?.data?.shopid || j?.data?.shop_id;
+                if (sid) return String(sid);
+              }
+            } catch {}
+          }
+
+          // 2e. Try PDP API from tab
+          if (iid) {
+            try {
+              const resp = await fetch(`/api/v4/pdp/get_pc?item_id=${iid}`, {
+                credentials: "include",
+                headers: { "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" },
+              });
+              if (resp.ok) {
+                const j = await resp.json();
+                const sid = j?.data?.item?.shopid || j?.data?.item?.shop_id || j?.data?.shop_id;
+                if (sid) return String(sid);
+              }
+            } catch {}
+          }
+
+          return null;
+        },
+        args: [shopname, itemid],
+      });
+      const sid = res[0]?.result;
+      if (sid) return sid;
+    } catch {}
+  }
+
+  // 3. Fallback: Try URL regex from original URL
+  const fromOrig = extractShopIdFromUrl(originalUrl);
+  if (fromOrig) return fromOrig;
+
+  // 4. Fallback: Background fetch original URL
   try {
     const r = await fetch(originalUrl, {
       credentials: "include",
       headers: { "User-Agent": navigator.userAgent },
     });
-    const s = scrape(await r.text());
-    if (s) return s;
-    const u = new URL(originalUrl);
-    const m = u.pathname.match(/^\/product\/(\d+)\//) || u.href.match(/i\.(\d+)\./);
-    if (m) return m[1];
+    if (r.ok) {
+      const s = scrape(await r.text());
+      if (s) return s;
+      const fromRedir = extractShopIdFromUrl(r.url);
+      if (fromRedir) return fromRedir;
+    }
   } catch {}
 
-  // 2. Try current tab URL (might have redirected to /product/<shopid>/<itemid>)
-  if (tab && tab.url) {
+  // 5. Fallback: Background fetch shop detail by vanity shopname
+  if (shopname) {
     try {
-      const u = new URL(tab.url);
-      const m = u.pathname.match(/^\/product\/(\d+)\//) || u.href.match(/i\.(\d+)\./);
-      if (m) return m[1];
-    } catch {}
-  }
-
-  // 3. Scrape from DOM in tab context
-  if (tab && tab.id) {
-    try {
-      const res = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        func: () => {
-          const m = location.pathname.match(/^\/product\/(\d+)\//) || location.href.match(/i\.(\d+)\./);
-          if (m) return m[1];
-          const html = document.documentElement.innerHTML;
-          const s = html.match(/"shopid"\s*:\s*"?(\d+)/) || html.match(/"shop_id"\s*:\s*"?(\d+)/);
-          return s ? s[1] : null;
-        },
+      const r = await fetch(`https://shopee.vn/api/v4/shop/get_shop_detail?username=${encodeURIComponent(shopname)}`, {
+        credentials: "include",
+        headers: { "User-Agent": navigator.userAgent, "Accept": "application/json" },
       });
-      const sid = res[0]?.result;
-      if (sid) return sid;
+      if (r.ok) {
+        const j = await r.json();
+        const sid = j?.data?.shopid || j?.data?.shop_id;
+        if (sid) return String(sid);
+      }
     } catch {}
   }
 
@@ -290,11 +398,11 @@ async function extractShopeeReviews(job, progress) {
   let itemid = parsed.itemid;
   let shopid = parsed.shopid;
   if (!itemid) throw new Error(`Không đọc được itemid từ URL: ${job.url}`);
-  if (!shopid) shopid = await resolveShopId(itemid, job.url, progress);
 
-  // Find or attach to a Shopee tab in the user's browser
+  // Find or attach to a Shopee tab in the user's browser FIRST to leverage the real user session
   const tab = await findOrOpenShopeeTab(job.url, itemid);
   if (!tab || !tab.id) throw new Error("Không tìm thấy hoặc không mở được tab Shopee trên trình duyệt");
+  job._targetTabId = tab.id;
 
   if (!shopid) shopid = await resolveShopId(itemid, job.url, tab, progress);
   if (!shopid) throw new Error(`Không tìm thấy shopid cho item ${itemid}`);
@@ -349,16 +457,38 @@ async function runJob(job) {
     if (job.kind === "shopee-reviews" || job.url.includes("shopee.vn")) {
       rows = await extractShopeeReviews(job, progress);
     }
+    const parsed = idsFrom(job.url);
+    const itemid = parsed.itemid || job.itemid;
+    const outputName = itemid ? "shopee_" + itemid + "_reviews" : (job.name || "shopee_" + job.id);
     await progress({ status: "saving", stage: "upload", message: `Đang lưu ${rows.length} dòng`, rows: rows.length, percent: 95 });
-    await uploadIngestResult({ job: job.id, name: "shopee_" + job.id, source: job.url, rows });
+    await uploadIngestResult({ job: job.id, name: outputName, source: job.url, rows });
     console.log("[bridge] ✔ job", job.id, "finished:", rows.length, "rows");
   } catch (e) {
     console.error("[bridge] ✘ job", job.id, "failed:", e.message);
-    if (e.message.includes("verification required") || e.message.includes("is_login=false")) {
-      triggerVerificationRequired({ job_id: job.id, url: job.url, reason: e.message });
+    const isVerification = e.message.includes("verification required") ||
+                           e.message.includes("is_login=false") ||
+                           e.message.includes("90309999");
+    if (isVerification) {
+      lastVerificationJob = job;
+      pendingVerificationJobs.set(job.id, job);
+      triggerVerificationRequired({
+        job_id: job.id,
+        url: job.url,
+        tab_id: job._targetTabId || null,
+        reason: e.message,
+      });
     }
-    await progress({ status: "error", stage: "failed", message: String(e.message || e), percent: 100 });
-    await uploadIngestResult({ job: job.id, error: String(e.message || e) });
+    await progress({
+      status: isVerification ? "awaiting_user_verification" : "error",
+      stage: isVerification ? "verification_required" : "failed",
+      message: String(e.message || e),
+      percent: 100
+    });
+    await uploadIngestResult({
+      job: job.id,
+      error: String(e.message || e),
+      verification_required: isVerification
+    });
   } finally {
     activeJobs.delete(job.id);
     updateState(verificationInfo ? "awaiting_user_verification" : (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN ? "connected" : "disconnected"));
@@ -366,9 +496,17 @@ async function runJob(job) {
 }
 
 // ── Verification Challenge Trigger ──────────────────────────────────────────
+const notifiedVerificationJobIds = new Set();
+
 function triggerVerificationRequired(details) {
   console.warn("[bridge] ⚠️ Verification required:", details);
   updateState("awaiting_user_verification", details);
+  const jid = details?.job_id;
+  if (jid && notifiedVerificationJobIds.has(jid)) {
+    return; // Đảm bảo gửi một thông báo duy nhất cho người dùng
+  }
+  if (jid) notifiedVerificationJobIds.add(jid);
+
   if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
     bridgeSend({
       v: 1,
@@ -379,16 +517,29 @@ function triggerVerificationRequired(details) {
   }
 }
 
-function resumeVerification() {
-  console.log("[bridge] Resuming verification");
+function resumeVerification(jobId) {
+  console.log("[bridge] Resuming verification, jobId:", jobId);
+  if (jobId) notifiedVerificationJobIds.delete(jobId);
   updateState("connected");
   if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
     bridgeSend({
       v: 1,
       type: "verification.resolved",
       id: "resumed-" + Date.now(),
-      params: { status: "resumed", message: "User confirmed verification in tab" },
+      params: { status: "resumed", message: "User confirmed verification in tab", jobId },
     });
+  }
+  const jobToResume = (jobId && pendingVerificationJobs.get(jobId)) || lastVerificationJob;
+  if (jobToResume) {
+    console.log("[bridge] Retrying job after verification:", jobToResume.id);
+    pendingVerificationJobs.delete(jobToResume.id);
+    if (lastVerificationJob && lastVerificationJob.id === jobToResume.id) {
+      lastVerificationJob = null;
+    }
+    knownJobs.delete(jobToResume.id);
+    if (!activeJobs.has(jobToResume.id)) {
+      enqueueLegacyJob(jobToResume);
+    }
   }
 }
 
@@ -982,7 +1133,7 @@ async function dispatchEnvelope(envelope) {
 
   // Handle verification resume/resolved
   if (envelope.type === "verification.resolved" || envelope.type === "verification.resume") {
-    resumeVerification();
+    resumeVerification(envelope.params && (envelope.params.jobId || envelope.params.id));
     return;
   }
 
@@ -1167,7 +1318,15 @@ async function configureConnection(message) {
 // ── WebSocket Job Delivery ─────────────────────────────────────────────────
 function enqueueLegacyJob(job) {
   if (!job || !job.id) return;
+  if (activeJobs.has(job.id)) {
+    console.log("[bridge] Job already active, skipping duplicate enqueue:", job.id);
+    return;
+  }
   bridgeSend({ v: 1, type: "accepted", id: job.id, jobId: job.id });
+  if (job.retry) {
+    knownJobs.delete(job.id);
+    notifiedVerificationJobIds.delete(job.id);
+  }
   if (knownJobs.has(job.id)) return;
   knownJobs.add(job.id);
   jobChain = jobChain.then(() => runJob(job)).catch((err) => console.error("[bridge] Job failed:", err))
@@ -1192,7 +1351,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
   if (msg.action === "resumeVerification") {
-    resumeVerification();
+    resumeVerification(msg.jobId);
     sendResponse({ ok: true });
   }
   return false;
@@ -1201,3 +1360,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // Recreate the watchdog alarm when an MV3 worker starts after browser restart.
 chrome.alarms.create("bridge_heartbeat_alarm", { periodInMinutes: 1 });
 connectBridge();
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    idsFrom,
+    extractShopName,
+    resolveShopId,
+    normaliseRating,
+    ratingTotal,
+    crawlPercent,
+    runJob,
+    resumeVerification,
+    triggerVerificationRequired,
+    enqueueLegacyJob,
+    knownJobs,
+    pendingVerificationJobs,
+    notifiedVerificationJobIds,
+  };
+}

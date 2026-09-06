@@ -97,13 +97,13 @@ def test_shopee_ingest_adds_local_media_paths(tmp_path, monkeypatch):
         ],
     )
 
-    assert media_dir == "shopee_reviews/shopee_123/media"
+    assert media_dir == "media/shopee_123"
     assert rows[0]["image_files"].endswith("review_00001_image_01.jpg")
     assert rows[0]["image_names"] == "review_00001_image_01.jpg"
     assert rows[0]["video_files"].endswith("review_00001_video_01.mp4")
     assert rows[0]["video_names"] == "review_00001_video_01.mp4"
     assert rows[0]["media_names"] == "review_00001_image_01.jpg|review_00001_video_01.mp4"
-    assert rows[0]["media_dir"] == "outputs/shopee_reviews/shopee_123/media"
+    assert rows[0]["media_dir"] == "outputs/media/shopee_123"
     assert zip_rel == "outputs/zips/shopee_123_media.zip"
     assert (tmp_path / "zips" / "shopee_123_media.zip").is_file()
 
@@ -240,18 +240,19 @@ def test_job_round_trip_agent_queues_extension_delivers(server):
 
     done = _get(base, f"/ingest/result?id={job_id}")
     assert done["ok"] and done["result"]["count"] == 1
-    assert done["result"]["csv"] == "outputs/csv/shopee_27429880257.csv"
+    assert done["result"]["csv"] == "outputs/csv/shopee_27429880257_reviews.csv"
     assert done["progress"]["status"] == "done"
     assert done["progress"]["stage"] == "saved"
     assert done["progress"]["rows"] == 1
-    assert (outputs / "csv" / "shopee_27429880257.csv").is_file()
-    csv_text = (outputs / "csv" / "shopee_27429880257.csv").read_bytes().decode("utf-8-sig")
+    assert (outputs / "csv" / "shopee_27429880257_reviews.csv").is_file()
+    csv_text = (outputs / "csv" / "shopee_27429880257_reviews.csv").read_bytes().decode("utf-8-sig")
     assert csv_text.splitlines()[0].endswith(",anh")
     assert csv_text.splitlines()[1].endswith(",1")
 
 
 def test_failed_job_is_recorded_so_the_agent_stops_waiting(server):
     base, _ = server
+    # 1. Challenge/Login required switches to awaiting_user_verification
     job_id = _get(base, "/ingest/job?url=https://shopee.vn/product/1/2")["job"]["id"]
     _get(base, "/ingest/jobs?wait=1")
     _post(base, "/ingest", {"job": job_id, "error": "Shopee error 90309999 (is_login=false)"})
@@ -259,8 +260,19 @@ def test_failed_job_is_recorded_so_the_agent_stops_waiting(server):
     done = _get(base, f"/ingest/result?id={job_id}")
     assert done["ok"] and done["result"]["ok"] is False
     assert "90309999" in done["result"]["error"]
-    assert done["progress"]["status"] == "error"
-    assert done["progress"]["stage"] == "failed"
+    assert done["result"]["verification_required"] is True
+    assert done["progress"]["status"] == "awaiting_user_verification"
+    assert done["progress"]["stage"] == "verification_required"
+
+    # 2. General non-verification failure records error
+    job_id2 = _get(base, "/ingest/job?url=https://shopee.vn/product/3/4")["job"]["id"]
+    _get(base, "/ingest/jobs?wait=1")
+    _post(base, "/ingest", {"job": job_id2, "error": "Connection timed out"})
+    done2 = _get(base, f"/ingest/result?id={job_id2}")
+    assert done2["ok"] and done2["result"]["ok"] is False
+    assert done2["result"]["verification_required"] is False
+    assert done2["progress"]["status"] == "error"
+    assert done2["progress"]["stage"] == "failed"
 
 
 def test_job_endpoint_rejects_a_non_http_url(server):
@@ -340,3 +352,205 @@ def test_shopee_ingest_e2e_zip_and_csv(server, monkeypatch):
     csv_text = (outputs / "csv" / "shopee_22.csv").read_bytes().decode("utf-8-sig")
     assert "image_names" in csv_text
     assert "review_00001_image_01.jpg" in csv_text
+
+
+def test_vanity_url_extracts_itemid_and_names_outputs(server):
+    """URL vanity https://shopee.vn/depnhaphuong/25018847315 must output as shopee_25018847315, not job.id."""
+    """URL vanity https://shopee.vn/depnhaphuong/25018847315 must output as shopee_25018847315_reviews."""
+    base, outputs = server
+
+    queued = _get(base, "/ingest/job?url=https://shopee.vn/depnhaphuong/25018847315")
+    assert queued["ok"]
+    job = queued["job"]
+    assert job["itemid"] == "25018847315"
+    assert job["name"] == "shopee_25018847315_reviews"
+    job_id = job["id"]
+
+    _get(base, "/ingest/jobs?wait=1")
+    status, out = _post(
+        base,
+        "/ingest",
+        {
+            "job": job_id,
+            "source": "https://shopee.vn/depnhaphuong/25018847315",
+            "rows": [
+                {"user": "u1", "sao": 5, "noi_dung": "dép đẹp", "thoi_gian": "2026-09-01 12:00:00"}
+            ],
+        },
+    )
+    assert status == 200 and out["ok"]
+    assert out["path"] == "outputs/inbox/shopee_25018847315_reviews.json"
+    assert out["csv"] == "outputs/csv/shopee_25018847315_reviews.csv"
+    assert (outputs / "csv" / "shopee_25018847315_reviews.csv").is_file()
+    assert (outputs / "inbox" / "shopee_25018847315_reviews.json").is_file()
+    assert (outputs / "text" / "shopee_25018847315_reviews_report.md").is_file()
+
+
+def test_shopee_manifest_and_zip_dedup(server, monkeypatch):
+    """Manifest.json tracks url, kind, hash, size, and duplicate_of; ZIP contains unique media + manifest."""
+    base, outputs = server
+    import hashlib
+    import zipfile
+    import launch
+
+    content_a = b"binary_image_content_A_12345"
+    content_b = b"binary_image_content_B_67890"
+    sha_a = hashlib.sha256(content_a).hexdigest()
+    sha_b = hashlib.sha256(content_b).hexdigest()
+
+    def fake_download_with_dedup(url: str, target_without_ext: Path) -> str:
+        target = target_without_ext.with_suffix(".jpg")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if "dup" in url or "pic1" in url:
+            target.write_bytes(content_a)
+        else:
+            target.write_bytes(content_b)
+        return f"outputs/{target.relative_to(outputs).as_posix()}"
+
+    monkeypatch.setattr(launch, "_download_ingest_media", fake_download_with_dedup)
+
+    job_id = _get(base, "/ingest/job?url=https://shopee.vn/depnhaphuong/25018847315")["job"]["id"]
+    _get(base, "/ingest/jobs?wait=1")
+
+    status, out = _post(
+        base,
+        "/ingest",
+        {
+            "job": job_id,
+            "source": "https://shopee.vn/depnhaphuong/25018847315",
+            "rows": [
+                {
+                    "user": "tester1",
+                    "sao": 5,
+                    "noi_dung": "ảnh 1",
+                    "anh_urls": "https://down-vn.img.susercontent.com/file/pic1",
+                    "thoi_gian": "2026-09-01 10:00:00",
+                },
+                {
+                    "user": "tester2",
+                    "sao": 5,
+                    "noi_dung": "ảnh duplicate content",
+                    "anh_urls": "https://down-vn.img.susercontent.com/file/pic_dup",
+                    "thoi_gian": "2026-09-02 10:00:00",
+                },
+                {
+                    "user": "tester3",
+                    "sao": 4,
+                    "noi_dung": "ảnh độc nhất",
+                    "anh_urls": "https://down-vn.img.susercontent.com/file/pic_unique",
+                    "thoi_gian": "2026-09-03 10:00:00",
+                },
+            ],
+        },
+    )
+
+    assert status == 200 and out["ok"]
+    media_dir = outputs / "shopee_reviews" / "shopee_25018847315" / "media"
+    media_dir = outputs / "media" / "shopee_25018847315_reviews"
+    assert media_dir.is_dir()
+
+    manifest_file = media_dir / "manifest.json"
+    assert manifest_file.is_file()
+    manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+
+    assert manifest["total_urls"] == 3
+    assert manifest["unique_count"] == 2
+    assert manifest["duplicate_count"] == 1
+    assert manifest["failed_count"] == 0
+
+    files = manifest["files"]
+    # Reviews are sorted newest-first, so the unique third row is written first.
+    assert files[0]["sha256"] == sha_b
+    assert files[0]["duplicate_of"] is None
+    primary_name = files[0]["filename"]
+
+    assert files[1]["sha256"] == sha_a
+    assert files[1]["duplicate_of"] is None
+    primary_name = files[1]["filename"]
+
+    assert files[2]["sha256"] == sha_a
+    assert files[2]["duplicate_of"] == primary_name
+
+    # Duplicate file must have been deleted from disk so media_root has only unique files
+    assert (media_dir / primary_name).is_file()
+    assert (media_dir / files[2]["filename"]).is_file()
+    # 2 unique media files + manifest.json = 3 files on disk
+    disk_files = {p.name for p in media_dir.iterdir() if p.is_file()}
+    assert len(disk_files) == 3
+    assert "manifest.json" in disk_files
+
+    # Check ZIP archive contents
+    zip_path = outputs / "zips" / "shopee_25018847315_media.zip"
+    zip_path = outputs / "zips" / "shopee_25018847315_reviews_media.zip"
+    assert zip_path.is_file()
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zip_names = zf.namelist()
+        assert "manifest.json" in zip_names
+        assert primary_name in zip_names
+        assert files[2]["filename"] in zip_names
+        assert len(zip_names) == 3
+
+
+def test_verification_failure_no_fake_success_and_retry(server):
+    """Verification failure must report ok=False, and /browser/resume or /ingest/retry must re-enqueue the job."""
+    base, _ = server
+    base, outputs = server
+
+    queued = _get(base, "/ingest/job?url=https://shopee.vn/depnhaphuong/25018847315")
+    job_id = queued["job"]["id"]
+    _get(base, "/ingest/jobs?wait=1")
+
+    # Extension reports verification challenge
+    _post(base, "/ingest", {"job": job_id, "error": "Shopee challenge / verification required"})
+
+    done = _get(base, f"/ingest/result?id={job_id}")
+    assert done["ok"] is True
+    assert done["result"]["ok"] is False  # Never fake success!
+    assert done["result"]["verification_required"] is True
+    assert done["progress"]["status"] == "awaiting_user_verification"
+    assert done["progress"]["stage"] == "verification_required"
+
+    # /browser/status reflects awaiting_user_verification
+    st = _get(base, "/browser/status")
+    assert st["ok"] is True
+    assert st["state"] == "awaiting_user_verification"
+    assert st["verification_required"] is True
+    assert st["pending_verification"]["job_id"] == job_id
+
+    # No empty CSV or ZIP generated
+    assert not (outputs / "csv" / "shopee_25018847315_reviews.csv").exists()
+    assert not (outputs / "zips" / "shopee_25018847315_reviews_media.zip").exists()
+
+    # Empty rows test (Requirement 9): must not fake success count: 0
+    status_empty, out_empty = _post(base, "/ingest", {"job": job_id, "rows": []})
+    assert status_empty == 200
+    assert out_empty["ok"] is False
+    assert out_empty["count"] == 0
+    assert not (outputs / "csv" / "shopee_25018847315_reviews.csv").exists()
+
+    # Persistence test (Requirement 5): state saved to disk
+    state_file = outputs / ".ingest_jobs_state.json"
+    assert state_file.is_file()
+    saved = json.loads(state_file.read_text(encoding="utf-8"))
+    assert job_id in saved["all_jobs"]
+
+    # Agent calls /browser/resume
+    resumed = _get(base, f"/browser/resume?id={job_id}")
+    assert resumed["ok"] is True
+    assert resumed["resumed"] is True
+    assert resumed["retried"] is True
+
+    # Progress should be reset to queued/resumed without error
+    progress = _get(base, f"/ingest/progress?id={job_id}")["progress"]
+    assert progress["status"] == "queued"
+    assert progress["stage"] == "resumed"
+
+    # Job is re-claimed by extension
+    claimed = _get(base, "/ingest/jobs?wait=1")["jobs"]
+    assert len(claimed) == 1
+    assert claimed[0]["id"] == job_id
+
+    # Also test explicit retry via /ingest/retry
+    retried = _get(base, f"/ingest/retry?id={job_id}")
+    assert retried["ok"] is True
+    assert retried["retried"] == job_id
