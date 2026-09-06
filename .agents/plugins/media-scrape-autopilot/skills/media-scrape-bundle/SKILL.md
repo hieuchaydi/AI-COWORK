@@ -48,6 +48,17 @@ Use this skill whenever the user asks to crawl, scrape, collect, export, or anal
    zip_folder(folder_path="outputs/media/<job_name>", zip_filename="<job_name>_media.zip")
    ```
 
+7. If the user provides an existing CSV file and asks to download images/videos from its columns:
+
+   ```text
+   download_media_from_csv(
+     csv_path="<path_or_filename>",
+     url_columns=<optional_list_of_columns>,
+     job_name="<job_name>",
+     zip_filename="<job_name>_media.zip"
+   )
+   ```
+
 ## Media URL Handling & Hash Deduplication
 
 - Deduplicate URLs while preserving order.

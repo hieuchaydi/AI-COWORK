@@ -42,6 +42,7 @@ _CRAWL_TOOL_NAMES = {
     "download_file",
     "zip_folder",
     "download_media_and_zip",
+    "download_media_from_csv",
     "crawl_and_export_bundle",
     "commerce_monitor_track",
     "commerce_monitor_check",

@@ -80,14 +80,12 @@ def test_shopee_ingest_adds_local_media_paths(tmp_path, monkeypatch):
 
     def fake_download(url: str, target_without_ext: Path) -> str:
         suffix = ".mp4" if url.endswith(".mp4") else ".jpg"
-        return f"outputs/{target_without_ext.with_suffix(suffix).relative_to(tmp_path).as_posix()}"
         target = target_without_ext.with_suffix(suffix)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(b"fake_content")
         return f"outputs/{target.relative_to(tmp_path).as_posix()}"
 
     monkeypatch.setattr(launch, "_download_ingest_media", fake_download)
-    rows, media_dir = launch._prepare_shopee_review_rows(
     rows, media_dir, zip_rel = launch._prepare_shopee_review_rows(
         "shopee_123.json",
         [

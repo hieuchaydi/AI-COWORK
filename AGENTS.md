@@ -73,7 +73,7 @@
        - `Lưu ra Desktop (Desktop/crawled_data/)`
   2. **Xử lý lựa chọn**:
      - Nếu người dùng bấm **Bỏ qua (Skip)** hoặc chọn Mặc định: Hệ thống tự động dùng thư mục mặc định `outputs/` của dự án và chạy tiếp ngay một mạch từ A -> Z.
-     - Nếu người dùng nhập đường dẫn cụ thể (ví dụ `D:/Data/Crawl`): Hệ thống truyền `output_dir` vào các tool `save_csv`, `download_media_and_zip`, `crawl_and_export_bundle` để lưu toàn bộ dữ liệu vào đúng vị trí đó. Phản hồi báo rõ đường dẫn local đã lưu; nếu nằm ngoài thư mục outputs/ thì báo đường dẫn local trên máy.
+     - Nếu người dùng nhập đường dẫn cụ thể (ví dụ `D:/Data/Crawl`): Hệ thống truyền `output_dir` vào các tool `save_csv`, `download_media_and_zip`, `download_media_from_csv`, `crawl_and_export_bundle` để lưu toàn bộ dữ liệu vào đúng vị trí đó. Phản hồi báo rõ đường dẫn local đã lưu; nếu nằm ngoài thư mục outputs/ thì báo đường dẫn local trên máy.
 
 ## Cào web — site chặn bot (Shopee, Lazada, TikTok Shop…)
 

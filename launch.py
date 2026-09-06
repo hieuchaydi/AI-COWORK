@@ -403,7 +403,6 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
                     "percent": 98,
                 },
             )
-        rows, media_dir = _prepare_shopee_review_rows(name, rows, job_id)
         rows, media_dir, zip_rel = _prepare_shopee_review_rows(name, rows, job_id)
     inbox = _outputs_root() / "inbox"
     inbox.mkdir(parents=True, exist_ok=True)
@@ -448,7 +447,6 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
             {
                 "status": "done",
                 "stage": "saved",
-                "message": f"Đã lưu {len(rows)} dòng",
                 "message": f"Đã lưu {len(rows)} dòng" + (f", đóng gói {zip_rel}" if zip_rel else ""),
                 "rows": len(rows),
                 "count": len(rows),
@@ -610,7 +608,6 @@ def _download_ingest_media(url: str, target_without_ext: Path) -> str:
     return f"outputs/{target.relative_to(_outputs_root()).as_posix()}"
 
 
-def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tuple[list, str | None]:
 def _zip_shopee_media(media_root: Path, stem: str) -> str | None:
     if not media_root.exists():
         return None
@@ -633,7 +630,6 @@ def _zip_shopee_media(media_root: Path, stem: str) -> str | None:
 
 def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tuple[list, str | None, str | None]:
     if not rows or not all(isinstance(r, dict) for r in rows):
-        return rows, None
         return rows, None, None
 
     stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", name[:-5] if name.endswith(".json") else name).strip("._")
@@ -666,9 +662,6 @@ def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tupl
         video_files: list[str] = []
         video_names: list[str] = []
         errors: list[str] = []
-        for kind, urls, bucket in (
-            ("image", _split_ingest_urls(row.get("anh_urls") or row.get("image_urls")), image_files),
-            ("video", _split_ingest_urls(row.get("video_urls")), video_files),
         for kind, urls, bucket_files, bucket_names in (
             ("image", _split_ingest_urls(row.get("anh_urls") or row.get("image_urls")), image_files, image_names),
             ("video", _split_ingest_urls(row.get("video_urls")), video_files, video_names),
@@ -678,7 +671,6 @@ def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tupl
                 base = media_root / f"review_{idx:05d}_{kind}_{media_idx:02d}"
                 try:
                     rel = _download_ingest_media(url, base)
-                    bucket.append(rel)
                     bucket_files.append(rel)
                     bucket_names.append(Path(rel).name)
                     media_saved += 1
@@ -712,7 +704,6 @@ def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tupl
         if errors:
             row["media_errors"] = " || ".join(errors[:10])
 
-    return [_ordered_shopee_review_row(r) for r in sorted_rows], media_dir_rel
     zip_rel = None
     if media_saved > 0:
         if job_id:
