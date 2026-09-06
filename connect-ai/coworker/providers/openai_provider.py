@@ -168,6 +168,12 @@ def _tool_rank(schema: dict[str, Any], query: str = "") -> float:
         if "telegram" in name_lower or "telegram" in server:
             score += 60.0
 
+    if any(sp_kw in query for sp_kw in ("shopee", "shopee.vn", "đánh giá shopee", "review shopee")):
+        if name_lower.startswith("browser_"):
+            score = -100.0  # CDP browser tools blocked on Shopee
+        elif "shopee" in name_lower or name_lower in ("crawl_and_export_bundle", "download_media_from_csv"):
+            score += 80.0
+
     return score
 
 
