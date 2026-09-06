@@ -413,14 +413,19 @@ def _generate_shopee_report(
     source: str = "",
     csv_rel: str = "",
     zip_rel: str = "",
+    zip_parts: list[str] | None = None,
     manifest_rel: str = "",
+    manifest_data: dict | None = None,
 ) -> str:
     text_dir = _outputs_root() / "text"
     text_dir.mkdir(parents=True, exist_ok=True)
     report_file = text_dir / f"{stem}_report.md"
 
     star_counts = {5: 0, 4: 0, 3: 0, 2: 0, 1: 0}
-    media_count = 0
+    reviews_with_media = 0
+    total_images_in_rows = 0
+    total_videos_in_rows = 0
+
     for r in rows:
         try:
             s = int(r.get("sao") or 0)
@@ -428,16 +433,38 @@ def _generate_shopee_report(
                 star_counts[s] += 1
         except (ValueError, TypeError):
             pass
-        if r.get("anh") or r.get("so_anh") or r.get("video") or r.get("so_video"):
-            media_count += 1
+        so_anh = _safe_int(r.get("so_anh")) or len(_split_ingest_urls(r.get("anh_urls") or r.get("image_urls")))
+        so_video = _safe_int(r.get("so_video")) or len(_split_ingest_urls(r.get("video_urls")))
+        total_images_in_rows += so_anh
+        total_videos_in_rows += so_video
+        if so_anh > 0 or so_video > 0 or r.get("anh") or r.get("video"):
+            reviews_with_media += 1
+
+    total_reviews = len(rows)
+    reviews_without_media = total_reviews - reviews_with_media
+
+    if not manifest_data and manifest_rel:
+        man_path = _outputs_root() / Path(manifest_rel).relative_to("outputs")
+        if man_path.is_file():
+            try:
+                manifest_data = json.loads(man_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+    total_urls = manifest_data.get("total_urls", total_images_in_rows + total_videos_in_rows) if manifest_data else (total_images_in_rows + total_videos_in_rows)
+    downloaded_count = manifest_data.get("downloaded_count", 0) if manifest_data else 0
+    unique_count = manifest_data.get("unique_count", 0) if manifest_data else 0
+    duplicate_count = manifest_data.get("duplicate_count", 0) if manifest_data else 0
+    failed_count = manifest_data.get("failed_count", 0) if manifest_data else 0
 
     lines = [
         f"# Báo cáo đánh giá Shopee: {stem}",
         "",
         f"- **Nguồn**: {source or 'N/A'}",
-        f"- **Tổng số đánh giá**: {len(rows)}",
-        f"- **Đánh giá có ảnh/video**: {media_count}",
         f"- **Thời gian xử lý**: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- **Tổng số đánh giá**: {total_reviews}",
+        f"- **Đánh giá có ảnh/video**: {reviews_with_media}",
+        f"- **Đánh giá không có media**: {reviews_without_media}",
         "",
         "## Phân bố số sao",
         f"- ⭐⭐⭐⭐⭐ (5 sao): {star_counts[5]}",
@@ -446,18 +473,38 @@ def _generate_shopee_report(
         f"- ⭐⭐ (2 sao): {star_counts[2]}",
         f"- ⭐ (1 sao): {star_counts[1]}",
         "",
+        "## Thống kê Media & Deduplication",
+        f"- **Tổng số ảnh**: {total_images_in_rows}",
+        f"- **Tổng số video**: {total_videos_in_rows}",
+        f"- **Tổng số URL media**: {total_urls}",
+        f"- **Số file tải thành công**: {downloaded_count}",
+        f"- **Số file duy nhất (unique)**: {unique_count}",
+        f"- **Số file trùng lặp (SHA-256 deduplicated)**: {duplicate_count}",
+        f"- **Số file lỗi tải**: {failed_count}",
+        "",
         "## Tệp kết quả",
     ]
     if csv_rel:
         lines.append(f"- [Tải file CSV](http://localhost:8766/{csv_rel})")
-    if zip_rel:
-        lines.append(f"- [Tải trọn bộ ảnh/video .ZIP](http://localhost:8766/{zip_rel})")
+
+    parts = zip_parts if zip_parts else (getattr(zip_rel, "parts", None) or ([zip_rel] if zip_rel else []))
+    if len(parts) > 1:
+        for idx, part in enumerate(parts, start=1):
+            lines.append(f"- [Tải trọn bộ ảnh/video .ZIP (Part {idx})](http://localhost:8766/{part})")
+    elif len(parts) == 1:
+        lines.append(f"- [Tải trọn bộ ảnh/video .ZIP](http://localhost:8766/{parts[0]})")
+    else:
+        lines.append("- *Không có media nào được tải (chỉ xuất file CSV)*")
+
     if manifest_rel:
         lines.append(f"- [Xem manifest JSON](http://localhost:8766/{manifest_rel})")
 
+    report_rel = f"outputs/text/{report_file.name}"
+    lines.append(f"- [Xem báo cáo Markdown](http://localhost:8766/{report_rel})")
     lines.append("")
+
     report_file.write_text("\n".join(lines), encoding="utf-8")
-    return f"outputs/text/{report_file.name}"
+    return report_rel
 
 
 def _queue_ingest_job(url: str, kind: str) -> dict:
@@ -470,6 +517,7 @@ def _queue_ingest_job(url: str, kind: str) -> dict:
     }
     if itemid:
         job["itemid"] = itemid
+        job["name"] = f"shopee_{itemid}"
         job["name"] = f"shopee_{itemid}_reviews"
     _INGEST_ALL_JOBS[job["id"]] = job
     with _INGEST_JOBS_LOCK:
@@ -721,15 +769,7 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
                 },
             )
             _persist_ingest_state()
-            return 200, {
-                "ok": False,
-                "error": err_msg,
-                "status": status,
-                "stage": stage,
-                "verification_required": is_verification,
-                "login_required": is_login,
-                "api_blocked": is_api_blocked,
-            }
+            return 200, result
         return 200, {
             "ok": False,
             "error": err_msg,
@@ -770,8 +810,6 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
     # Check if we should resolve name according to itemid (Requirement 8)
     itemid = _extract_shopee_itemid(raw) or _extract_shopee_itemid(source_text)
     if itemid:
-        name = f"shopee_{itemid}.json"
-        stem = f"shopee_{itemid}"
         name = f"shopee_{itemid}_reviews.json"
         stem = f"shopee_{itemid}_reviews"
     else:
@@ -781,6 +819,12 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
         stem = name[:-5] if name.endswith(".json") else name
         if not name.endswith(".json"):
             name += ".json"
+
+    max_zip_mb = _safe_int(
+        (body.get("max_zip_mb") if isinstance(body, dict) else None)
+        or (job_obj.get("max_zip_mb") if job_obj else None)
+        or os.environ.get("MAX_ZIP_MB", 0)
+    )
 
     media_dir = None
     zip_rel = None
@@ -796,7 +840,7 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
                     "percent": 98,
                 },
             )
-        rows, media_dir, zip_rel = _prepare_shopee_review_rows(name, rows, job_id)
+        rows, media_dir, zip_rel = _prepare_shopee_review_rows(name, rows, job_id, max_zip_mb=max_zip_mb)
 
     inbox = _outputs_root() / "inbox"
     inbox.mkdir(parents=True, exist_ok=True)
@@ -817,7 +861,21 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
         return 500, {"ok": False, "error": f"write failed: {exc}"}
 
     csv_rel = _write_ingest_csv(name, rows)
+    csv_file = (_outputs_root() / Path(csv_rel).relative_to("outputs")) if csv_rel else None
 
+    # Ensure CSV is included in the ZIP archive (or first part if multipart)
+    if zip_rel and csv_file and csv_file.is_file():
+        zip_full = _outputs_root() / Path(zip_rel).relative_to("outputs")
+        if zip_full.is_file():
+            try:
+                import zipfile
+                with zipfile.ZipFile(zip_full, "a") as zf:
+                    if csv_file.name not in zf.namelist():
+                        zf.write(csv_file, arcname=csv_file.name)
+            except Exception as exc:
+                print(f"[ingest] failed adding csv to zip: {exc}", file=sys.stderr)
+
+    zip_parts = list(getattr(zip_rel, "parts", None) or ([zip_rel] if zip_rel else []))
     manifest_rel = f"outputs/{media_dir}/manifest.json" if media_dir else None
     report_rel = _generate_shopee_report(
         stem=stem,
@@ -825,6 +883,7 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
         source=source_text,
         csv_rel=csv_rel or "",
         zip_rel=zip_rel or "",
+        zip_parts=zip_parts,
         manifest_rel=manifest_rel or "",
     ) if (name.lower().startswith("shopee_") or "shopee.vn" in source_text.lower()) else None
 
@@ -839,6 +898,8 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
         "manifest": manifest_rel,
         "zip": zip_rel,
         "zip_url": f"/{zip_rel}" if zip_rel else None,
+        "zip_parts": zip_parts,
+        "zip_urls": [f"/{zp}" for zp in zip_parts] if zip_parts else ([f"/{zip_rel}"] if zip_rel else []),
         "report": report_rel,
         "report_url": f"/{report_rel}" if report_rel else None,
     }
@@ -860,6 +921,8 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
                 "manifest": manifest_rel,
                 "zip": zip_rel,
                 "zip_url": result.get("zip_url"),
+                "zip_parts": zip_parts,
+                "zip_urls": result.get("zip_urls"),
                 "report": report_rel,
                 "report_url": result.get("report_url"),
                 "percent": 100,
@@ -896,7 +959,7 @@ def _write_ingest_csv(json_name: str, rows: list) -> str | None:
     stem = json_name[:-5] if json_name.endswith(".json") else json_name
     target = out_dir / f"{stem}.csv"
     try:
-        target.write_text("﻿" + buf.getvalue(), encoding="utf-8", newline="")
+        target.write_bytes(b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8"))
     except OSError:
         return None
     return f"outputs/csv/{target.name}"
@@ -1016,27 +1079,101 @@ def _download_ingest_media(url: str, target_without_ext: Path) -> str:
     return f"outputs/{target.relative_to(_outputs_root()).as_posix()}"
 
 
-def _zip_shopee_media(media_root: Path, stem: str) -> str | None:
+class ZipPath(str):
+    parts: list[str] = []
+
+
+def _zip_shopee_media(
+    media_root: Path,
+    stem: str,
+    csv_path: Path | None = None,
+    max_zip_mb: int | float = 0,
+) -> ZipPath | None:
     if not media_root.exists():
         return None
-    files = [p for p in media_root.iterdir() if p.is_file()]
-    if not files:
+    media_files = [p for p in media_root.iterdir() if p.is_file() and p.name != "manifest.json"]
+    manifest_file = media_root / "manifest.json"
+
+    if csv_path is None:
+        cand = _outputs_root() / "csv" / f"{stem}.csv"
+        if cand.is_file():
+            csv_path = cand
+
+    if not media_files and not manifest_file.exists() and (not csv_path or not csv_path.is_file()):
         return None
+
     zips_dir = _outputs_root() / "zips"
     zips_dir.mkdir(parents=True, exist_ok=True)
+
+    max_bytes = int(float(max_zip_mb or 0) * 1024 * 1024)
+    total_uncompressed = sum(p.stat().st_size for p in media_files)
+    if csv_path and csv_path.is_file():
+        total_uncompressed += csv_path.stat().st_size
+    if manifest_file.exists():
+        total_uncompressed += manifest_file.stat().st_size
+
+    should_split = bool(max_bytes > 0 and total_uncompressed > max_bytes and len(media_files) > 1)
+    import zipfile
+
+    if should_split:
+        parts: list[list[Path]] = []
+        current_part: list[Path] = []
+        current_bytes = 0
+
+        for f_path in sorted(media_files, key=lambda x: str(x)):
+            f_size = f_path.stat().st_size
+            if current_part and (current_bytes + f_size > max_bytes):
+                parts.append(current_part)
+                current_part = [f_path]
+                current_bytes = f_size
+            else:
+                current_part.append(f_path)
+                current_bytes += f_size
+        if current_part:
+            parts.append(current_part)
+
+        zip_rels: list[str] = []
+        for part_idx, part_files in enumerate(parts, start=1):
+            part_name = f"{stem}_media_part{part_idx:02d}.zip"
+            part_zip = zips_dir / part_name
+            with zipfile.ZipFile(part_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                if part_idx == 1 and csv_path and csv_path.is_file():
+                    zf.write(csv_path, arcname=csv_path.name)
+                if manifest_file.exists():
+                    zf.write(manifest_file, arcname="manifest.json")
+                for f in part_files:
+                    zf.write(f, arcname=f.name)
+            zip_rels.append(f"outputs/zips/{part_name}")
+
+        primary = ZipPath(zip_rels[0])
+        primary.parts = zip_rels
+        return primary
+
+    # Single archive
     zip_path = zips_dir / f"{stem}_media.zip"
     try:
-        import zipfile
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for f in sorted(files):
+            if csv_path and csv_path.is_file():
+                zf.write(csv_path, arcname=csv_path.name)
+            if manifest_file.exists():
+                zf.write(manifest_file, arcname="manifest.json")
+            for f in sorted(media_files, key=lambda x: str(x)):
                 zf.write(f, arcname=f.name)
-        return f"outputs/zips/{zip_path.name}"
+        rel = f"outputs/zips/{zip_path.name}"
+        res = ZipPath(rel)
+        res.parts = [rel]
+        return res
     except Exception as exc:
         print(f"[ingest] failed to zip media {media_root}: {exc}", file=sys.stderr)
         return None
 
 
-def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tuple[list, str | None, str | None]:
+def _prepare_shopee_review_rows(
+    name: str,
+    rows: list,
+    job_id: str = "",
+    max_zip_mb: int | float = 0,
+) -> tuple[list, str | None, str | None]:
     if not rows or not all(isinstance(r, dict) for r in rows):
         return rows, None, None
 
@@ -1126,6 +1263,7 @@ def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tupl
                             "url": url,
                             "type": kind,
                             "loai_media": kind,
+                            "local_file": primary["filename"],
                             "filename": primary["filename"],
                             "local_path": primary["local_path"],
                             "hash": file_hash,
@@ -1149,6 +1287,7 @@ def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tupl
                             "url": url,
                             "type": kind,
                             "loai_media": kind,
+                            "local_file": target_file.name,
                             "filename": target_file.name,
                             "local_path": rel,
                             "hash": file_hash,
@@ -1170,6 +1309,7 @@ def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tupl
                         "url": url,
                         "type": kind,
                         "loai_media": kind,
+                        "local_file": None,
                         "filename": None,
                         "local_path": None,
                         "hash": None,
@@ -1194,20 +1334,47 @@ def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tupl
                             "percent": 99 if media_total else 98,
                         },
                     )
-        if image_files:
-            row["image_files"] = "|".join(image_files)
-            row["image_names"] = "|".join(image_names)
-        if video_files:
-            row["video_files"] = "|".join(video_files)
-            row["video_names"] = "|".join(video_names)
-        media_files = image_files + video_files
-        media_names = image_names + video_names
-        if media_files:
-            row["media_files"] = "|".join(media_files)
-            row["media_names"] = "|".join(media_names)
-            row["media_dir"] = f"outputs/{media_dir_rel}" if media_dir_rel else ""
-        if errors:
-            row["media_errors"] = " || ".join(errors[:10])
+
+        has_media_intent = bool(
+            image_files
+            or video_files
+            or errors
+            or row.get("anh_urls")
+            or row.get("image_urls")
+            or row.get("video_urls")
+        )
+        if has_media_intent:
+            if image_files:
+                row["image_files"] = "|".join(image_files)
+                row["image_names"] = "|".join(image_names)
+                row["so_anh"] = len(image_files)
+                row["anh"] = True
+            else:
+                row.setdefault("image_files", "")
+                row.setdefault("image_names", "")
+                row.setdefault("so_anh", 0)
+
+            if video_files:
+                row["video_files"] = "|".join(video_files)
+                row["video_names"] = "|".join(video_names)
+                row["so_video"] = len(video_files)
+                row["video"] = True
+            else:
+                row.setdefault("video_files", "")
+                row.setdefault("video_names", "")
+                row.setdefault("so_video", 0)
+
+            media_files = image_files + video_files
+            media_names = image_names + video_names
+            media_urls_all = _split_ingest_urls(row.get("anh_urls") or row.get("image_urls")) + _split_ingest_urls(row.get("video_urls"))
+            if media_urls_all:
+                row["media_urls"] = "|".join(media_urls_all)
+            if media_files:
+                row["media_files"] = "|".join(media_files)
+                row["media_names"] = "|".join(media_names)
+                row["media_dir"] = f"outputs/{media_dir_rel}" if media_dir_rel else ""
+            if errors:
+                row["media_errors"] = " || ".join(errors[:10])
 
     # 2. Write manifest.json
     manifest_data = {
@@ -1249,7 +1416,8 @@ def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tupl
                     "percent": 99,
                 },
             )
-        zip_rel = _zip_shopee_media(media_root, stem)
+        csv_cand = _outputs_root() / "csv" / f"{stem}.csv"
+        zip_rel = _zip_shopee_media(media_root, stem, csv_path=csv_cand if csv_cand.is_file() else None, max_zip_mb=max_zip_mb)
 
     return [_ordered_shopee_review_row(r) for r in sorted_rows], media_dir_rel, zip_rel
 

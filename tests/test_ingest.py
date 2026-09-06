@@ -575,7 +575,8 @@ def test_shopee_manifest_and_zip_dedup(server, monkeypatch):
         assert "manifest.json" in zip_names
         assert primary_name in zip_names
         assert files[2]["filename"] in zip_names
-        assert len(zip_names) == 3
+        assert "shopee_25018847315_reviews.csv" in zip_names
+        assert len(zip_names) == 4
 
 
 def test_verification_failure_no_fake_success_and_retry(server):
