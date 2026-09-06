@@ -252,7 +252,7 @@ def test_job_round_trip_agent_queues_extension_delivers(server):
 
 def test_failed_job_is_recorded_so_the_agent_stops_waiting(server):
     base, _ = server
-    # 1. Challenge/Login required switches to awaiting_user_verification
+    # 1. Login required switches to status="login_required", stage="login_required"
     job_id = _get(base, "/ingest/job?url=https://shopee.vn/product/1/2")["job"]["id"]
     _get(base, "/ingest/jobs?wait=1")
     _post(base, "/ingest", {"job": job_id, "error": "Shopee error 90309999 (is_login=false)"})
@@ -260,11 +260,17 @@ def test_failed_job_is_recorded_so_the_agent_stops_waiting(server):
     done = _get(base, f"/ingest/result?id={job_id}")
     assert done["ok"] and done["result"]["ok"] is False
     assert "90309999" in done["result"]["error"]
-    assert done["progress"]["status"] == "awaiting_user_verification"
-    assert done["progress"]["status"] == "awaiting_user_verification"
+    assert done["progress"]["status"] == "login_required"
     assert done["progress"]["stage"] == "login_required"
     assert done["result"]["verification_required"] is False
     assert done["result"]["login_required"] is True
+
+    # Calling resume on a login_required job is rejected with HTTP 400
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(base, f"/browser/resume?id={job_id}")
+    assert exc.value.code == 400
+    err_body = json.loads(exc.value.read().decode())
+    assert err_body["login_required"] is True
 
     # 2. General non-verification failure records error
     job_id2 = _get(base, "/ingest/job?url=https://shopee.vn/product/3/4")["job"]["id"]
@@ -275,6 +281,85 @@ def test_failed_job_is_recorded_so_the_agent_stops_waiting(server):
     assert done2["result"]["verification_required"] is False
     assert done2["progress"]["status"] == "error"
     assert done2["progress"]["stage"] == "failed"
+
+
+def test_shopee_classification_api_blocked_vs_login_vs_captcha(server):
+    """Test distinct handling for:
+    1. login_required (90309999 / is_login=false) -> status='login_required', stage='login_required', resume rejected.
+    2. verification_required (/verify/traffic / captcha) -> status='awaiting_user_verification', stage='verification_required', resume accepted.
+    3. api_blocked (HTTP 403 without captcha or login) -> status='error', stage='api_blocked', resume rejected.
+    4. general failure (timeout) -> status='error', stage='failed'.
+    """
+    base, _ = server
+
+    # 1. Login required
+    job_1 = _get(base, "/ingest/job?url=https://shopee.vn/product/10/20")["job"]["id"]
+    _get(base, "/ingest/jobs?wait=1")
+    _post(base, "/ingest", {"job": job_1, "error": "Shopee error 90309999, is_login=false"})
+    res1 = _get(base, f"/ingest/result?id={job_1}")
+    assert res1["ok"] is True
+    assert res1["result"]["ok"] is False
+    assert res1["result"]["login_required"] is True
+    assert res1["result"]["verification_required"] is False
+    assert res1["result"]["api_blocked"] is False
+    assert res1["progress"]["status"] == "login_required"
+    assert res1["progress"]["stage"] == "login_required"
+    # Resume rejected
+    with pytest.raises(urllib.error.HTTPError) as exc1:
+        _get(base, f"/browser/resume?id={job_1}")
+    assert exc1.value.code == 400
+    assert json.loads(exc1.value.read().decode())["login_required"] is True
+
+    # 2. Verification / CAPTCHA challenge
+    job_2 = _get(base, "/ingest/job?url=https://shopee.vn/product/30/40")["job"]["id"]
+    _get(base, "/ingest/jobs?wait=1")
+    _post(base, "/ingest", {"job": job_2, "error": "Shopee challenge at https://shopee.vn/verify/traffic"})
+    res2 = _get(base, f"/ingest/result?id={job_2}")
+    assert res2["ok"] is True
+    assert res2["result"]["ok"] is False
+    assert res2["result"]["login_required"] is False
+    assert res2["result"]["verification_required"] is True
+    assert res2["result"]["api_blocked"] is False
+    assert res2["progress"]["status"] == "awaiting_user_verification"
+    assert res2["progress"]["stage"] == "verification_required"
+    # Resume accepted
+    resumed2 = _get(base, f"/browser/resume?id={job_2}")
+    assert resumed2["ok"] is True
+    assert resumed2["resumed"] is True
+
+    # 3. API Blocked (HTTP 403 Access Denied)
+    job_3 = _get(base, "/ingest/job?url=https://shopee.vn/product/50/60")["job"]["id"]
+    _get(base, "/ingest/jobs?wait=1")
+    _post(base, "/ingest", {
+        "job": job_3,
+        "error": "Shopee reviews API access denied (HTTP 403) — không thấy CAPTCHA trên tab; endpoint=https://shopee.vn/api/v2/item/get_ratings; response={\"error\":\"access denied\"}",
+    })
+    res3 = _get(base, f"/ingest/result?id={job_3}")
+    assert res3["ok"] is True
+    assert res3["result"]["ok"] is False
+    assert res3["result"]["login_required"] is False
+    assert res3["result"]["verification_required"] is False
+    assert res3["result"]["api_blocked"] is True
+    assert res3["progress"]["status"] == "error"
+    assert res3["progress"]["stage"] == "api_blocked"
+    # Resume rejected
+    with pytest.raises(urllib.error.HTTPError) as exc3:
+        _get(base, f"/browser/resume?id={job_3}")
+    assert exc3.value.code == 400
+    assert json.loads(exc3.value.read().decode())["api_blocked"] is True
+
+    # 4. General failure
+    job_4 = _get(base, "/ingest/job?url=https://shopee.vn/product/70/80")["job"]["id"]
+    _get(base, "/ingest/jobs?wait=1")
+    _post(base, "/ingest", {"job": job_4, "error": "WebSocket connection lost"})
+    res4 = _get(base, f"/ingest/result?id={job_4}")
+    assert res4["ok"] is True
+    assert res4["result"]["ok"] is False
+    assert res4["result"]["login_required"] is False
+    assert res4["result"]["verification_required"] is False
+    assert res4["result"]["api_blocked"] is False
+    assert res4["progress"]["status"] == "error"
+    assert res4["progress"]["stage"] == "failed"
 
 
 def test_job_endpoint_rejects_a_non_http_url(server):

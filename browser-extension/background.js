@@ -45,6 +45,12 @@ function updateState(newState, details = null) {
   if (newState === "awaiting_user_verification") {
     verificationInfo = details;
     setBadge("PAUS", "#f9ab00");
+  } else if (newState === "login_required") {
+    verificationInfo = details;
+    setBadge("LOGN", "#ea8600");
+  } else if (newState === "api_blocked") {
+    verificationInfo = details;
+    setBadge("BLCK", "#d93025");
   } else if (newState === "connected") {
     verificationInfo = null;
     setBadge("OK", "#137333");
@@ -416,7 +422,7 @@ function classifyShopeeFailure(fetchRes) {
   const json = fetchRes?.json || {};
   const data = json?.data || {};
   const url = String(fetchRes?.url || "").toLowerCase();
-  const sample = String(fetchRes?.textSample || "").toLowerCase();
+  const sample = String(fetchRes?.textSample || fetchRes?.error || "").toLowerCase();
   const isLogin = json?.error === 90309999 || json?.is_login === false || data?.is_login === false ||
                   url.includes("/login") || sample.includes("is_login") || sample.includes("90309999");
   if (isLogin) return "login";
@@ -424,7 +430,11 @@ function classifyShopeeFailure(fetchRes) {
   const isChallenge = url.includes("/verify/traffic") || sample.includes("captcha") ||
                       sample.includes("challenge") || sample.includes("verify/traffic");
   if (isChallenge) return "verification";
-  return "api_blocked";
+
+  if (fetchRes?.status === 403 || sample.includes("403") || sample.includes("access denied") || sample.includes("api_blocked")) {
+    return "api_blocked";
+  }
+  return "other";
 }
 
 function formatShopeeFailure(fetchRes) {
@@ -471,21 +481,44 @@ async function extractShopeeReviews(job, progress) {
     await traceJob(job, progress, "ratings-response", {
       itemid, shopid, offset, limit: PAGE_SIZE, status: fetchRes.status ?? null,
       ok: Boolean(fetchRes.ok), elapsedMs: Date.now() - requestStarted,
+    ok: Boolean(fetchRes.ok), elapsedMs: Date.now() - requestStarted,
       responseUrl: fetchRes.url || null, pageUrl: fetchRes.pageUrl || tab.url || null,
       responseBytes: String(fetchRes.textSample || "").length,
     });
     if (!fetchRes.ok) {
       throw new Error(fetchRes.error ? `Shopee API request failed: ${fetchRes.error}` : formatShopeeFailure(fetchRes));
+      const err = new Error(fetchRes.error ? `Shopee API request failed: ${fetchRes.error}` : formatShopeeFailure(fetchRes));
+      err.failureKind = classifyShopeeFailure(fetchRes);
+      err.fetchRes = fetchRes;
+      throw err;
     }
 
     const json = fetchRes.json;
     if (json && (json.error === 90309999 || json.is_login === false || (json.data && json.data.is_login === false))) {
       throw new Error("Shopee login required (error 90309999, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome");
+      const err = new Error("Shopee login required (error 90309999, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome");
+      err.failureKind = "login";
+      err.fetchRes = fetchRes;
+      throw err;
     }
 
     const ratings = (json && json.data && json.data.ratings) || [];
     if (!ratings.length) break;
+    const batch = (json && (json.data?.ratings || json.ratings || json.items)) || [];
+    if (!Array.isArray(batch) || batch.length === 0) break;
+
+    const normalised = batch.map(normaliseRating);
+    all.push(...normalised);
     if (total === null) total = ratingTotal(json);
+    const pct = crawlPercent(all.length, total, 10, 80);
+    await traceJob(job, progress, "ratings-batch", {
+      batch: batch.length, totalCollected: all.length, targetTotal: total, percent: pct,
+    });
+    await progress({
+      status: "running", stage: "fetch",
+      message: `Đã cào ${all.length}${total ? "/" + total : ""} đánh giá`,
+      rows: all.length, percent: pct,
+    });
 
     for (const r of ratings) all.push(normaliseRating(r));
     if (progress) {
@@ -528,12 +561,37 @@ async function runJob(job) {
     console.error("[bridge] ✘ job", job.id, "failed:", e.message);
     await traceJob(job, progress, "job-failed", { error: String(e.message || e).slice(0, 500) });
     const message = String(e.message || e);
-    const isVerification = message.includes("verification required") ||
-                           message.includes("/verify/traffic");
-    const isLoginRequired = message.includes("login required") ||
-                            message.includes("is_login=false") ||
-                            message.includes("90309999");
-    if (isVerification || isLoginRequired) {
+    const failureKind = e.failureKind || classifyShopeeFailure({ error: message, textSample: message });
+
+    if (failureKind === "login") {
+      // 1. login_required: Dừng đúng lỗi, không bypass, tuyệt đối không gọi resume verification
+      updateState("login_required", {
+        job_id: job.id,
+        url: job.url,
+        tab_id: job._targetTabId || null,
+        reason: message,
+        kind: "login",
+      });
+      await progress({
+        status: "login_required",
+        stage: "login_required",
+        message: "Shopee yêu cầu đăng nhập tài khoản (is_login=false, error=90309999). Vui lòng đăng nhập trên tab Chrome.",
+        error: message,
+        login_required: true,
+        verification_required: false,
+        api_blocked: false,
+        percent: 100,
+      });
+      await uploadIngestResult({
+        job: job.id,
+        error: message,
+        login_required: true,
+        verification_required: false,
+        api_blocked: false,
+        stage: "login_required",
+      });
+    } else if (failureKind === "verification") {
+      // 2. traffic_verification / CAPTCHA: Hỗ trợ pause/resume verification
       lastVerificationJob = job;
       pendingVerificationJobs.set(job.id, job);
       triggerVerificationRequired({
@@ -542,23 +600,85 @@ async function runJob(job) {
         tab_id: job._targetTabId || null,
         reason: message,
         kind: isLoginRequired ? "login" : "verification",
+        kind: "verification",
+      });
+      await progress({
+        status: "awaiting_user_verification",
+        stage: "verification_required",
+        message: "Shopee yêu cầu xác minh danh tính / giải CAPTCHA. Vui lòng thao tác trên tab Chrome.",
+        error: message,
+        verification_required: true,
+        login_required: false,
+        api_blocked: false,
+        percent: 100,
+      });
+      await uploadIngestResult({
+        job: job.id,
+        error: message,
+        verification_required: true,
+        login_required: false,
+        api_blocked: false,
+        stage: "verification_required",
+      });
+    } else if (failureKind === "api_blocked") {
+      // 3. api_blocked: Shopee chặn API (HTTP 403) nhưng KHÔNG PHẢI CAPTCHA và KHÔNG PHẢI login
+      updateState("api_blocked", {
+        job_id: job.id,
+        url: job.url,
+        tab_id: job._targetTabId || null,
+        reason: message,
+        kind: "api_blocked",
+      });
+      await progress({
+        status: "error",
+        stage: "api_blocked",
+        message: "Shopee chặn API đánh giá (HTTP 403 / API Blocked). Không có CAPTCHA hoặc yêu cầu đăng nhập.",
+        error: message,
+        api_blocked: true,
+        verification_required: false,
+        login_required: false,
+        percent: 100,
+      });
+      await uploadIngestResult({
+        job: job.id,
+        error: message,
+        api_blocked: true,
+        verification_required: false,
+        login_required: false,
+        stage: "api_blocked",
+      });
+    } else {
+      // 4. Lỗi WebSocket / extension / network khác
+      updateState("error", {
+        job_id: job.id,
+        url: job.url,
+        reason: message,
+        kind: "extension_error",
+      });
+      await progress({
+        status: "error",
+        stage: "failed",
+        message,
+        error: message,
+        percent: 100,
+        verification_required: false,
+        login_required: false,
+        api_blocked: false,
+      });
+      await uploadIngestResult({
+        job: job.id,
+        error: message,
+        verification_required: false,
+        login_required: false,
+        api_blocked: false,
       });
     }
-    await progress({
-      status: (isVerification || isLoginRequired) ? "awaiting_user_verification" : "error",
-      stage: isLoginRequired ? "login_required" : (isVerification ? "verification_required" : "failed"),
-      message,
-      percent: 100
-    });
-    await uploadIngestResult({
-      job: job.id,
-      error: message,
-      verification_required: isVerification,
-      login_required: isLoginRequired,
-    });
   } finally {
     activeJobs.delete(job.id);
-    updateState(verificationInfo ? "awaiting_user_verification" : (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN ? "connected" : "disconnected"));
+    const fallbackState = verificationInfo
+      ? (verificationInfo.kind === "login" ? "login_required" : (verificationInfo.kind === "api_blocked" ? "api_blocked" : "awaiting_user_verification"))
+      : (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN ? "connected" : "disconnected");
+    updateState(fallbackState, verificationInfo);
   }
 }
 
@@ -585,6 +705,10 @@ function triggerVerificationRequired(details) {
 }
 
 function resumeVerification(jobId) {
+  if (verificationInfo && (verificationInfo.kind === "login" || verificationInfo.kind === "api_blocked")) {
+    console.warn("[bridge] Không thể resume verification cho job không phải thử thách CAPTCHA:", jobId);
+    return;
+  }
   console.log("[bridge] Resuming verification, jobId:", jobId);
   if (jobId) notifiedVerificationJobIds.delete(jobId);
   updateState("connected");
@@ -1218,6 +1342,7 @@ async function dispatchEnvelope(envelope) {
 
   // Backward-compatible ingest.job message
   if (envelope.type === "ingest.job") {
+    enqueueLegacyJob(envelope.job, "websocket");
     const job = envelope.job ? { ...envelope.job } : {};
     if (envelope.retry || envelope.job?.retry) job.retry = true;
     if (!job.id && envelope.id) job.id = envelope.id;
@@ -1389,6 +1514,10 @@ async function configureConnection(message) {
 // ── WebSocket Job Delivery ─────────────────────────────────────────────────
 function enqueueLegacyJob(job) {
   if (!job || !job.id) return;
+  if (activeJobs.has(job.id)) {
+    console.log("[bridge] Job already active, skipping duplicate enqueue:", job.id);
+    return;
+  }
   bridgeSend({ v: 1, type: "accepted", id: job.id, jobId: job.id });
   if (job.retry) {
     knownJobs.delete(job.id);

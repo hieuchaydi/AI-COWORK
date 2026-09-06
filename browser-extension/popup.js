@@ -26,20 +26,75 @@ function renderStatus(state, details) {
   } else if (state === "awaiting_user_verification") {
     statusBadge.textContent = "Verification";
     statusBadge.className = "badge verification";
+  } else if (state === "login_required") {
+    statusBadge.textContent = "Login Req";
+    statusBadge.className = "badge warning";
+  } else if (state === "api_blocked") {
+    statusBadge.textContent = "Blocked";
+    statusBadge.className = "badge error";
   } else {
     statusBadge.textContent = "Disconnected";
   }
 
+  const verifTitle = document.getElementById("verificationTitle");
   if (details && details.verification) {
     currentVerification = details.verification;
     verificationBox.style.display = "block";
     verificationMsg.textContent = `Yêu cầu xác minh tại: ${details.verification.url || details.verification.hostname || "tab hiện tại"}`;
     if (verificationReason) {
       verificationReason.textContent = details.verification.reason || "Lý do: Shopee yêu cầu giải CAPTCHA hoặc xác minh danh tính tài khoản";
+    const kind = details.verification.kind || "verification";
+    const targetUrl = details.verification.url || details.verification.hostname || "";
+
+    if (kind === "login") {
+      verificationBox.className = "alert-box login-box";
+      if (verifTitle) verifTitle.textContent = "🔑 Yêu cầu Đăng nhập Shopee";
+      verificationMsg.textContent = "Shopee yêu cầu bạn đăng nhập tài khoản trên Chrome. Hãy mở tab Shopee và đăng nhập, sau đó tạo lại yêu cầu cào mới (không thể tự động bypass).";
+      if (verificationReason) {
+        verificationReason.textContent = details.verification.reason || "Lý do: Shopee trả mã 90309999 / is_login=false (Chưa đăng nhập)";
+      }
+      if (btnOpenVerificationTab) {
+        btnOpenVerificationTab.style.display = "block";
+        btnOpenVerificationTab.textContent = "Mở Shopee để đăng nhập";
+      }
+      if (btnResumeVerification) {
+        btnResumeVerification.style.display = "none";
+      }
+    } else if (kind === "api_blocked") {
+      verificationBox.className = "alert-box blocked-box";
+      if (verifTitle) verifTitle.textContent = "🚫 Shopee chặn API (HTTP 403 / WAF)";
+      verificationMsg.textContent = "Shopee đã chặn IP hoặc phiên truy cập của API đánh giá (HTTP 403). Đây không phải là CAPTCHA hoặc lỗi đăng nhập.";
+      if (verificationReason) {
+        verificationReason.textContent = details.verification.reason || "Lý do: HTTP 403 Forbidden / Access Denied";
+      }
+      if (btnOpenVerificationTab) {
+        btnOpenVerificationTab.style.display = "none";
+      }
+      if (btnResumeVerification) {
+        btnResumeVerification.style.display = "none";
+      }
+    } else {
+      // verification (CAPTCHA / challenge)
+      verificationBox.className = "alert-box";
+      if (verifTitle) verifTitle.textContent = "⚠️ Yêu cầu giải CAPTCHA / Xác minh";
+      verificationMsg.textContent = `Yêu cầu xác minh tại: ${targetUrl || "tab Shopee"}. Vui lòng mở tab để kéo thanh trượt / giải CAPTCHA, sau đó bấm Tiếp tục.`;
+      if (verificationReason) {
+        verificationReason.textContent = details.verification.reason || "Lý do: Shopee yêu cầu thử thách CAPTCHA / xác minh traffic";
+      }
+      if (btnOpenVerificationTab) {
+        btnOpenVerificationTab.style.display = (targetUrl || details.verification.tab_id) ? "block" : "none";
+        btnOpenVerificationTab.textContent = "Mở tab Shopee cần xác minh";
+      }
+      if (btnResumeVerification) {
+        btnResumeVerification.style.display = "block";
+        btnResumeVerification.textContent = "Tiếp tục sau khi đã giải CAPTCHA";
+      }
     }
     const targetUrl = details.verification.url || details.verification.hostname || "";
+
     if (verificationTargetUrl) {
       verificationTargetUrl.textContent = targetUrl ? `URL cần mở: ${targetUrl}` : "";
+      verificationTargetUrl.textContent = targetUrl ? `URL: ${targetUrl}` : "";
     }
     if (btnOpenVerificationTab) {
       btnOpenVerificationTab.style.display = (targetUrl || details.verification.tab_id) ? "block" : "none";
@@ -47,6 +102,9 @@ function renderStatus(state, details) {
   } else {
     currentVerification = null;
     verificationBox.style.display = "none";
+    if (btnResumeVerification) {
+      btnResumeVerification.style.display = "block";
+    }
   }
 
   if (details && details.currentJob) {
@@ -131,6 +189,9 @@ if (btnOpenVerificationTab) {
 }
 
 btnResumeVerification.addEventListener("click", () => {
+  if (currentVerification && (currentVerification.kind === "login" || currentVerification.kind === "api_blocked")) {
+    return;
+  }
   const jobId = currentVerification?.job_id;
   chrome.runtime.sendMessage({ action: "resumeVerification", jobId });
   verificationBox.style.display = "none";

@@ -468,6 +468,7 @@ def _on_browser_ws_message(message: dict) -> None:
     if kind == "ingest.rpc":
         _INGEST_RPC.submit(message)
     elif kind in ("ingest.ack", "accepted"):
+        job_id = str(message.get("jobId") or message.get("id") or "")
         params = message.get("params") or {}
         job_id = str(
             message.get("jobId")
@@ -516,6 +517,7 @@ _BROWSER_WS.on_message = _on_browser_ws_message
 
 def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
     """Persist a result shared by WebSocket ingestion and legacy HTTP clients."""
+    job_id = (body.get("job") if isinstance(body, dict) else None) or ""
     job_id = (
         (body.get("job") or body.get("jobId") or body.get("job_id"))
         if isinstance(body, dict)
@@ -527,28 +529,70 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
 
     # A job that failed in the browser reports here too — otherwise the agent
     # would poll /ingest/result forever waiting for a run that already died.
-    if isinstance(body, dict) and (body.get("error") or body.get("verification_required") or body.get("login_required")):
+    if isinstance(body, dict) and (body.get("error") or body.get("verification_required") or body.get("login_required") or body.get("api_blocked")):
         err_msg = str(body.get("error") or "Shopee yêu cầu đăng nhập hoặc xác minh")[:500]
         lowered = err_msg.lower()
+        # 1. Login required
         is_login = bool(
             body.get("login_required")
             or "login required" in lowered
             or "is_login=false" in lowered
+            or ("is_login" in lowered and "false" in lowered)
             or "90309999" in lowered
         )
-        is_verification = bool(
-            body.get("verification_required")
-            or "verification required" in lowered
-            or "/verify/traffic" in lowered
-            or "captcha" in lowered
-            or "challenge" in lowered
+
+        # 2. API Blocked (HTTP 403 / Access Denied without CAPTCHA or Login)
+        explicit_api_blocked = bool(
+            body.get("api_blocked")
+            or body.get("stage") == "api_blocked"
         )
+        text_api_blocked = bool(
+            "không thấy captcha" in lowered
+            or "không có captcha" in lowered
+            or "api access denied" in lowered
+            or "access denied" in lowered
+            or "api_blocked" in lowered
+            or "api blocked" in lowered
+            or ("403" in lowered and "/verify/traffic" not in lowered and "challenge" not in lowered)
+        )
+        is_api_blocked = not is_login and (explicit_api_blocked or text_api_blocked)
+
+        # 3. Verification / CAPTCHA (Challenge requiring user interaction)
+        is_verification = not is_login and not is_api_blocked and (
+            body.get("verification_required") is True
+            or (
+                body.get("verification_required") is not False
+                and (
+                    "verification required" in lowered
+                    or "/verify/traffic" in lowered
+                    or "challenge" in lowered
+                    or ("captcha" in lowered and "không thấy captcha" not in lowered and "không có captcha" not in lowered)
+                )
+            )
+        )
+
+        if is_login:
+            status = "login_required"
+            stage = "login_required"
+        elif is_verification:
+            status = "awaiting_user_verification"
+            stage = "verification_required"
+        elif is_api_blocked:
+            status = "error"
+            stage = "api_blocked"
+        else:
+            status = "error"
+            stage = "failed"
+
         if job_id:
             result = {
                 "ok": False,
                 "error": err_msg,
+                "status": status,
+                "stage": stage,
                 "verification_required": is_verification,
                 "login_required": is_login,
+                "api_blocked": is_api_blocked,
             }
             _INGEST_RESULTS[job_id] = result
             with _INGEST_JOBS_LOCK:
@@ -558,8 +602,11 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
                 {
                     "status": "awaiting_user_verification" if (is_verification or is_login) else "error",
                     "stage": "login_required" if is_login else ("verification_required" if is_verification else "failed"),
+                    "status": status,
+                    "stage": stage,
                     "verification_required": is_verification,
                     "login_required": is_login,
+                    "api_blocked": is_api_blocked,
                     "message": err_msg,
                     "error": err_msg,
                     "percent": 100,
@@ -568,6 +615,15 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
             _persist_ingest_state()
             return 200, {"ok": True, "recorded": "error"}
         return 200, {"ok": False, "error": err_msg, "verification_required": is_verification, "login_required": is_login}
+        return 200, {
+            "ok": False,
+            "error": err_msg,
+            "status": status,
+            "stage": stage,
+            "verification_required": is_verification,
+            "login_required": is_login,
+            "api_blocked": is_api_blocked,
+        }
 
     rows = body.get("rows") if isinstance(body, dict) else body
     if not isinstance(rows, list):
@@ -1730,25 +1786,51 @@ class _HelperHandler(BaseHTTPRequestHandler):
         if self.path.split("?", 1)[0] == "/browser/status":
             transport_state = _BROWSER_WS.transport.get_state()
             verif_job = None
+            login_job = None
+            blocked_job = None
             with _INGEST_PROGRESS_LOCK:
                 for jid, p in reversed(list(_INGEST_PROGRESS.items())):
-                    if p.get("status") == "awaiting_user_verification" or p.get("verification_required"):
-                        verif_job = {
-                            "job_id": jid,
-                            "url": p.get("url"),
-                            "reason": p.get("message") or p.get("error"),
-                        }
-                        break
-            state = "awaiting_user_verification" if (verif_job or transport_state == "awaiting_user_verification") else transport_state
+                    if p.get("status") == "login_required" or p.get("login_required"):
+                        if not login_job:
+                            login_job = {
+                                "job_id": jid,
+                                "url": p.get("url"),
+                                "reason": p.get("message") or p.get("error"),
+                            }
+                    elif p.get("stage") == "api_blocked" or p.get("api_blocked"):
+                        if not blocked_job:
+                            blocked_job = {
+                                "job_id": jid,
+                                "url": p.get("url"),
+                                "reason": p.get("message") or p.get("error"),
+                            }
+                    elif p.get("status") == "awaiting_user_verification" or p.get("verification_required"):
+                        if not verif_job:
+                            verif_job = {
+                                "job_id": jid,
+                                "url": p.get("url"),
+                                "reason": p.get("message") or p.get("error"),
+                            }
+            if verif_job or transport_state == "awaiting_user_verification":
+                state = "awaiting_user_verification"
+            elif login_job:
+                state = "login_required"
+            elif blocked_job:
+                state = "api_blocked"
+            else:
+                state = transport_state
             self._json(
                 200,
                 {
                     "ok": True,
                     "transport": "extension-websocket",
-                    "state": _BROWSER_WS.transport.get_state(),
                     "state": state,
                     "verification_required": bool(verif_job or state == "awaiting_user_verification"),
+                    "login_required": bool(login_job or state == "login_required"),
+                    "api_blocked": bool(blocked_job or state == "api_blocked"),
                     "pending_verification": verif_job,
+                    "pending_login": login_job,
+                    "pending_blocked": blocked_job,
                     "connected": _BROWSER_WS.connected,
                     "protocolVersion": "1.0",
                     "wsPort": HELPER_WS_PORT,
@@ -1785,9 +1867,27 @@ class _HelperHandler(BaseHTTPRequestHandler):
             if not job_id:
                 with _INGEST_PROGRESS_LOCK:
                     for jid, p in reversed(list(_INGEST_PROGRESS.items())):
-                        if p.get("status") == "awaiting_user_verification" or p.get("verification_required"):
+                        if (p.get("status") == "awaiting_user_verification" or p.get("verification_required")) and not p.get("login_required") and not p.get("api_blocked"):
                             job_id = jid
                             break
+
+            if job_id:
+                with _INGEST_PROGRESS_LOCK:
+                    target_p = _INGEST_PROGRESS.get(job_id, {})
+                if target_p.get("status") == "login_required" or target_p.get("login_required"):
+                    self._json(400, {
+                        "ok": False,
+                        "error": "Không thể resume verification: Job yêu cầu đăng nhập tài khoản Shopee trên trình duyệt Chrome. Vui lòng đăng nhập và tạo yêu cầu cào mới.",
+                        "login_required": True,
+                    })
+                    return
+                if target_p.get("stage") == "api_blocked" or target_p.get("api_blocked"):
+                    self._json(400, {
+                        "ok": False,
+                        "error": "Không thể resume verification: Shopee đã chặn truy cập API (HTTP 403 / API Blocked).",
+                        "api_blocked": True,
+                    })
+                    return
 
             msg = {
                 "v": 1,
@@ -2435,9 +2535,27 @@ class _HelperHandler(BaseHTTPRequestHandler):
             if not job_id:
                 with _INGEST_PROGRESS_LOCK:
                     for jid, p in reversed(list(_INGEST_PROGRESS.items())):
-                        if p.get("status") == "awaiting_user_verification" or p.get("verification_required"):
+                        if (p.get("status") == "awaiting_user_verification" or p.get("verification_required")) and not p.get("login_required") and not p.get("api_blocked"):
                             job_id = jid
                             break
+
+            if job_id:
+                with _INGEST_PROGRESS_LOCK:
+                    target_p = _INGEST_PROGRESS.get(job_id, {})
+                if target_p.get("status") == "login_required" or target_p.get("login_required"):
+                    _reply(400, {
+                        "ok": False,
+                        "error": "Không thể resume verification: Job yêu cầu đăng nhập tài khoản Shopee trên trình duyệt Chrome. Vui lòng đăng nhập và tạo yêu cầu cào mới.",
+                        "login_required": True,
+                    })
+                    return
+                if target_p.get("stage") == "api_blocked" or target_p.get("api_blocked"):
+                    _reply(400, {
+                        "ok": False,
+                        "error": "Không thể resume verification: Shopee đã chặn truy cập API (HTTP 403 / API Blocked).",
+                        "api_blocked": True,
+                    })
+                    return
 
             msg = {
                 "v": 1,
