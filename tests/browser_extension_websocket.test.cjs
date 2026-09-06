@@ -71,7 +71,7 @@ test('active job replays still receive an accepted ACK without starting twice', 
   const { context, frames } = await worker();
   vm.runInContext('activeJobs.set("active-job", {id: "active-job"}); enqueueLegacyJob({id: "active-job"});', context);
   assert.equal(frames.filter(frame => frame.type === 'accepted' && frame.id === 'active-job').length, 1);
-  assert.equal(context.activeJobs.size, 1);
+  assert.equal(vm.runInContext('activeJobs.size', context), 1);
 });
 
 test('unacknowledged requests are replayed with the same correlation id', async () => {
