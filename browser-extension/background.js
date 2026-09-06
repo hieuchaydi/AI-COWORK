@@ -166,7 +166,6 @@ function idsFrom(url) {
   return any ? { shopid: null, itemid: any[1] } : {};
 }
 
-async function resolveShopId(itemid, originalUrl, progress) {
 async function findOrOpenShopeeTab(targetUrl, itemid) {
   const tabs = await chrome.tabs.query({});
   // 1. Prefer a tab already displaying this item
@@ -305,31 +304,11 @@ async function extractShopeeReviews(job, progress) {
   let total = null;
 
   while (all.length < MAX_REVIEWS) {
-    const apiUrl = `https://shopee.vn/api/v2/item/get_ratings?filter=0&flag=1&itemid=${itemid}&limit=${PAGE_SIZE}&offset=${offset}&shopid=${shopid}&type=0`;
-    const res = await fetch(apiUrl, {
-      credentials: "include",
-      headers: {
-        "Accept": "application/json, text/plain, */*",
-      },
-      referrer: job.url,
-      referrerPolicy: "strict-origin-when-cross-origin",
-    });
-    const text = await res.text();
-    let json = null;
-    try {
-      json = JSON.parse(text);
-    } catch {}
-    if (json && (json.error === 90309999 || json.is_login === false || (json.data && json.data.is_login === false))) {
-      throw new Error("Shopee error 90309999 (is_login=false)");
-    }
-    if (!res.ok) {
-      if (res.status === 403 || res.url.includes("/verify/traffic")) {
     const fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, job.url);
     if (!fetchRes.ok) {
       if (fetchRes.status === 403 || (fetchRes.url && fetchRes.url.includes("/verify/traffic"))) {
         throw new Error("Shopee challenge / verification required");
       }
-      throw new Error(`Shopee API error HTTP ${res.status}`);
       throw new Error(`Shopee API error HTTP ${fetchRes.status}: ${fetchRes.error || fetchRes.textSample || ""}`);
     }
 
@@ -345,8 +324,6 @@ async function extractShopeeReviews(job, progress) {
     for (const r of ratings) all.push(normaliseRating(r));
     if (progress) {
       await progress({
-        stage: "fetch-background",
-        message: `Đã lấy ${all.length} đánh giá`,
         stage: "fetch-tab",
         message: `Đã lấy ${all.length} đánh giá qua tab Shopee`,
         rows: all.length,
