@@ -1736,6 +1736,44 @@ class _HelperHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
 
+        if path_only == "/browser/command":
+            from browser_bridge.protocol import MAX_MESSAGE_BYTES, MessageEnvelope
+            from browser_bridge.actions import validate_action_params
+
+            token = self.headers.get("X-Bridge-Token", "")
+            authorization = self.headers.get("Authorization", "")
+            if not token and authorization.startswith("Bearer "):
+                token = authorization[7:].strip()
+            origin = self.headers.get("Origin", "")
+            if origin and not validate_extension_origin(origin, _BROWSER_WS.allowlisted_extension_ids)[0]:
+                _reply(403, {"ok": False, "error": "Origin forbidden"})
+                return
+            if not token or not (verify_pairing_token(token, _BROWSER_WS.token) or verify_pairing_token(token, API_TOKEN)):
+                _reply(401, {"ok": False, "error": "Valid bridge or API token required"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= MAX_MESSAGE_BYTES:
+                    _reply(413, {"ok": False, "error": "Invalid command body size"})
+                    return
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                envelope = MessageEnvelope.model_validate(body)
+                if envelope.type != "command" or not envelope.action:
+                    raise ValueError("Expected a command envelope with action")
+                if envelope.deadlineMs is None or not 1 <= envelope.deadlineMs <= 120000:
+                    raise ValueError("deadlineMs must be between 1 and 120000")
+                validate_action_params(envelope.action, envelope.params)
+            except (ValueError, TypeError) as exc:
+                _reply(400, {"ok": False, "error": str(exc)})
+                return
+            ok, result, error = _BROWSER_WS.transport.execute_command(
+                envelope.action, envelope.params, deadline_ms=envelope.deadlineMs,
+                command_id=envelope.id, session_id=envelope.sessionId,
+            )
+            _reply(200, {"ok": ok, "id": envelope.id, "result": result,
+                         "error": error.to_dict() if error else None})
+            return
+
         # ─── /ingest — data pushed in from a normal browser tab ──────────────
         # The CDP-free path: sites that fingerprint automation (Shopee) still serve
         # their own JS fine, so a bookmarklet in the user's everyday Chrome collects

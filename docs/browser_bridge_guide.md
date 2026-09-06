@@ -189,7 +189,7 @@ from browser_bridge.transport import TransportManager, WebSocketTransport, HttpP
 from browser_ws_bridge import BrowserWebSocketBridge
 
 # Khởi tạo hoặc lấy instance bridge hiện có
-# TransportManager ưu tiên 100% qua WebSocket realtime, nếu extension ngắt kết nối sẽ tự động fallback sang HTTP polling
+# TransportManager ưu tiên WebSocket. HTTP fallback chỉ dành cho job ingest tương thích; không dùng để thay thế typed action DOM.
 transport_mgr = TransportManager(ws_transport=bridge.transport, http_transport=HttpPollingTransport(base_url="http://127.0.0.1:8766"))
 
 # Thực thi lệnh trực tiếp với typed params và correlation ID
@@ -204,3 +204,39 @@ if ok:
 else:
     print("Lỗi thực thi:", error.message)
 ```
+
+
+## 8. Gọi typed action từ client bên ngoài launcher
+
+Khi `python launch.py` đang chạy và extension đã kết nối, client gửi
+`POST http://127.0.0.1:8766/browser/command` với header
+`Authorization: Bearer <API_TOKEN>` (hoặc `X-Bridge-Token` chứa pairing token).
+Không đưa token vào URL. API_TOKEN là token của launcher đang chạy.
+
+```python
+import json
+import os
+import urllib.request
+
+request = urllib.request.Request(
+    "http://127.0.0.1:8766/browser/command",
+    data=json.dumps({
+        "v": 1, "type": "command", "id": "list-tabs-1",
+        "action": "tab.list", "params": {}, "deadlineMs": 10000,
+    }).encode("utf-8"),
+    headers={
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + os.environ["API_TOKEN"],
+    },
+)
+with urllib.request.urlopen(request, timeout=15) as response:
+    print(json.load(response))
+```
+
+Kết quả có `ok`, `id`, `result`, `error`. Deadline cho phép 1–120000 ms;
+body tối đa 8 MiB. Sai xác thực trả HTTP 401, website origin không được phép
+trả 403, envelope/params không hợp lệ trả 400. Lỗi thực thi trả `ok: false`
+và error có cấu trúc. API chỉ gửi typed action qua WebSocket; extension chưa
+kết nối sẽ trả lỗi, không chuyển thao tác DOM thành job cào dữ liệu HTTP.
+HTTP ingest cũ vẫn dùng cho job cào dữ liệu. Extension tự lấy lại pairing token
+của gateway mặc định sau khi launcher khởi động lại.

@@ -310,7 +310,7 @@ class WebSocketTransport(BrowserTransport):
 
             with self._lock:
                 self._pending.pop(cid, None)
-                if self._state == ExtensionState.BUSY:
+                if self._state == ExtensionState.BUSY and not self._pending:
                     self._state = ExtensionState.CONNECTED
 
             if not finished:
@@ -327,7 +327,15 @@ class WebSocketTransport(BrowserTransport):
                 return False, None, pending.error
 
             return True, pending.result, None
+        except Exception as exc:
+            return False, None, BridgeError.create(
+                ErrorCode.INTERNAL_ERROR, f"Command transmission failed: {exc}", retryable=True,
+            )
         finally:
+            with self._lock:
+                self._pending.pop(cid, None)
+                if self._state == ExtensionState.BUSY and not self._pending:
+                    self._state = ExtensionState.CONNECTED
             self._semaphore.release()
 
     def cancel_command(self, command_id: str) -> bool:
@@ -401,7 +409,7 @@ class HttpPollingTransport(BrowserTransport):
             )
 
         job = self._queue_fn(url, action)
-        job_id = job.get("id", "")
+        job_id = (job.get("job") or job).get("id", "")
         if not job_id:
             return False, None, BridgeError.create(
                 ErrorCode.INTERNAL_ERROR,

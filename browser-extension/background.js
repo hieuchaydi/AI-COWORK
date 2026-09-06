@@ -911,8 +911,13 @@ async function connectBridge() {
       let token = stored.pairingToken;
       let wsUrl = stored.gatewayUrl;
 
-      // Auto-pair if missing token
-      if (!token) {
+      // The local gateway rotates its token on restart. Refresh the default
+      // gateway pairing on reconnect instead of retrying a stale stored token.
+      const localGateway = !wsUrl || [
+        "ws://127.0.0.1:8766/browser/v1/ws",
+        "ws://127.0.0.1:8767/browser-extension",
+      ].includes(wsUrl);
+      if (!token || localGateway) {
         const pairResponse = await fetch(`${HELPER}/browser/pair`, { cache: "no-store" });
         if (!pairResponse.ok) throw new Error(`pair HTTP ${pairResponse.status}`);
         const pair = await pairResponse.json();
