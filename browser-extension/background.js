@@ -173,7 +173,10 @@ async function resolveShopId(itemid, originalUrl, progress) {
     return m ? m[1] : null;
   }
   try {
-    const r = await fetch(originalUrl, { headers: { "User-Agent": navigator.userAgent } });
+    const r = await fetch(originalUrl, {
+      credentials: "include",
+      headers: { "User-Agent": navigator.userAgent },
+    });
     const s = scrape(await r.text());
     if (s) return s;
   } catch {}
@@ -194,18 +197,29 @@ async function extractShopeeReviews(job, progress) {
 
   while (all.length < MAX_REVIEWS) {
     const apiUrl = `https://shopee.vn/api/v2/item/get_ratings?filter=0&flag=1&itemid=${itemid}&limit=${PAGE_SIZE}&offset=${offset}&shopid=${shopid}&type=0`;
-    const res = await fetch(apiUrl);
+    const res = await fetch(apiUrl, {
+      credentials: "include",
+      headers: {
+        "Accept": "application/json, text/plain, */*",
+      },
+      referrer: job.url,
+      referrerPolicy: "strict-origin-when-cross-origin",
+    });
+    const text = await res.text();
+    let json = null;
+    try {
+      json = JSON.parse(text);
+    } catch {}
+    if (json && (json.error === 90309999 || json.is_login === false || (json.data && json.data.is_login === false))) {
+      throw new Error("Shopee error 90309999 (is_login=false)");
+    }
     if (!res.ok) {
       if (res.status === 403 || res.url.includes("/verify/traffic")) {
         throw new Error("Shopee challenge / verification required");
       }
       throw new Error(`Shopee API error HTTP ${res.status}`);
     }
-    const json = await res.json();
-    if (json.error === 90309999 || (json.data && json.data.is_login === false)) {
-      throw new Error("Shopee error 90309999 (is_login=false)");
-    }
-    const ratings = (json.data && json.data.ratings) || [];
+    const ratings = (json && json.data && json.data.ratings) || [];
     if (!ratings.length) break;
     if (total === null) total = ratingTotal(json);
 
