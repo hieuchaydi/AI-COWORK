@@ -260,9 +260,11 @@ def test_failed_job_is_recorded_so_the_agent_stops_waiting(server):
     done = _get(base, f"/ingest/result?id={job_id}")
     assert done["ok"] and done["result"]["ok"] is False
     assert "90309999" in done["result"]["error"]
-    assert done["result"]["verification_required"] is True
     assert done["progress"]["status"] == "awaiting_user_verification"
-    assert done["progress"]["stage"] == "verification_required"
+    assert done["progress"]["status"] == "awaiting_user_verification"
+    assert done["progress"]["stage"] == "login_required"
+    assert done["result"]["verification_required"] is False
+    assert done["result"]["login_required"] is True
 
     # 2. General non-verification failure records error
     job_id2 = _get(base, "/ingest/job?url=https://shopee.vn/product/3/4")["job"]["id"]
@@ -507,6 +509,7 @@ def test_verification_failure_no_fake_success_and_retry(server):
     assert done["ok"] is True
     assert done["result"]["ok"] is False  # Never fake success!
     assert done["result"]["verification_required"] is True
+    assert done["progress"]["status"] == "awaiting_user_verification"
     assert done["progress"]["status"] == "awaiting_user_verification"
     assert done["progress"]["stage"] == "verification_required"
 

@@ -415,14 +415,14 @@ async function extractShopeeReviews(job, progress) {
     const fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, job.url);
     if (!fetchRes.ok) {
       if (fetchRes.status === 403 || (fetchRes.url && fetchRes.url.includes("/verify/traffic"))) {
-        throw new Error("Shopee challenge / verification required");
+        throw new Error(`Shopee verification required (HTTP ${fetchRes.status})`);
       }
       throw new Error(`Shopee API error HTTP ${fetchRes.status}: ${fetchRes.error || fetchRes.textSample || ""}`);
     }
 
     const json = fetchRes.json;
     if (json && (json.error === 90309999 || json.is_login === false || (json.data && json.data.is_login === false))) {
-      throw new Error("Shopee error 90309999 (is_login=false) — Shopee yêu cầu đăng nhập trên trình duyệt để xem đánh giá");
+      throw new Error("Shopee login required (error 90309999, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome");
     }
 
     const ratings = (json && json.data && json.data.ratings) || [];
@@ -465,29 +465,34 @@ async function runJob(job) {
     console.log("[bridge] ✔ job", job.id, "finished:", rows.length, "rows");
   } catch (e) {
     console.error("[bridge] ✘ job", job.id, "failed:", e.message);
-    const isVerification = e.message.includes("verification required") ||
-                           e.message.includes("is_login=false") ||
-                           e.message.includes("90309999");
-    if (isVerification) {
+    const message = String(e.message || e);
+    const isVerification = message.includes("verification required") ||
+                           message.includes("/verify/traffic");
+    const isLoginRequired = message.includes("login required") ||
+                            message.includes("is_login=false") ||
+                            message.includes("90309999");
+    if (isVerification || isLoginRequired) {
       lastVerificationJob = job;
       pendingVerificationJobs.set(job.id, job);
       triggerVerificationRequired({
         job_id: job.id,
         url: job.url,
         tab_id: job._targetTabId || null,
-        reason: e.message,
+        reason: message,
+        kind: isLoginRequired ? "login" : "verification",
       });
     }
     await progress({
-      status: isVerification ? "awaiting_user_verification" : "error",
-      stage: isVerification ? "verification_required" : "failed",
-      message: String(e.message || e),
+      status: (isVerification || isLoginRequired) ? "awaiting_user_verification" : "error",
+      stage: isLoginRequired ? "login_required" : (isVerification ? "verification_required" : "failed"),
+      message,
       percent: 100
     });
     await uploadIngestResult({
       job: job.id,
-      error: String(e.message || e),
-      verification_required: isVerification
+      error: message,
+      verification_required: isVerification,
+      login_required: isLoginRequired,
     });
   } finally {
     activeJobs.delete(job.id);
@@ -537,6 +542,7 @@ function resumeVerification(jobId) {
       lastVerificationJob = null;
     }
     knownJobs.delete(jobToResume.id);
+    enqueueLegacyJob(jobToResume);
     if (!activeJobs.has(jobToResume.id)) {
       enqueueLegacyJob(jobToResume);
     }

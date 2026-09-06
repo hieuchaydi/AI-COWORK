@@ -307,6 +307,8 @@ def _extract_shopee_itemid(value: object) -> str | None:
     m = re.search(r"shopee_(\d{6,})", text)
     if m:
         return m.group(1)
+    # Any trailing 8+ digit id
+    m = re.search(r"[./-](\d{8,})(?:[?&#/]|$)", text)
     # Any trailing 6+ digit id
     m = re.search(r"[./-](\d{6,})(?:[?&#/]|$)", text)
     if m:
@@ -512,21 +514,28 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
 
     # A job that failed in the browser reports here too — otherwise the agent
     # would poll /ingest/result forever waiting for a run that already died.
-    if isinstance(body, dict) and (body.get("error") or body.get("verification_required")):
-        err_msg = str(body.get("error") or "Yêu cầu xác minh danh tính Shopee")[:500]
+    if isinstance(body, dict) and (body.get("error") or body.get("verification_required") or body.get("login_required")):
+        err_msg = str(body.get("error") or "Shopee yêu cầu đăng nhập hoặc xác minh")[:500]
+        lowered = err_msg.lower()
+        is_login = bool(
+            body.get("login_required")
+            or "login required" in lowered
+            or "is_login=false" in lowered
+            or "90309999" in lowered
+        )
         is_verification = bool(
             body.get("verification_required")
-            or "verification required" in err_msg.lower()
-            or "is_login=false" in err_msg.lower()
-            or "90309999" in err_msg
-            or "/verify/traffic" in err_msg
-            or "challenge" in err_msg.lower()
+            or "verification required" in lowered
+            or "/verify/traffic" in lowered
+            or "captcha" in lowered
+            or "challenge" in lowered
         )
         if job_id:
             result = {
                 "ok": False,
                 "error": err_msg,
                 "verification_required": is_verification,
+                "login_required": is_login,
             }
             _INGEST_RESULTS[job_id] = result
             with _INGEST_JOBS_LOCK:
@@ -534,16 +543,18 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
             _update_ingest_progress(
                 job_id,
                 {
-                    "status": "awaiting_user_verification" if is_verification else "error",
-                    "stage": "verification_required" if is_verification else "failed",
+                    "status": "awaiting_user_verification" if (is_verification or is_login) else "error",
+                    "stage": "login_required" if is_login else ("verification_required" if is_verification else "failed"),
                     "verification_required": is_verification,
+                    "login_required": is_login,
                     "message": err_msg,
                     "error": err_msg,
                     "percent": 100,
                 },
             )
             _persist_ingest_state()
-        return 200, {"ok": False, "error": err_msg, "verification_required": is_verification}
+            return 200, {"ok": True, "recorded": "error"}
+        return 200, {"ok": False, "error": err_msg, "verification_required": is_verification, "login_required": is_login}
 
     rows = body.get("rows") if isinstance(body, dict) else body
     if not isinstance(rows, list):
@@ -848,7 +859,6 @@ def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tupl
     stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", name[:-5] if name.endswith(".json") else name).strip("._")
     if not stem:
         stem = "shopee_reviews"
-    media_root = _outputs_root() / "shopee_reviews" / stem / "media"
     media_root = _outputs_root() / "media" / stem
     media_root.mkdir(parents=True, exist_ok=True)
 
@@ -1722,6 +1732,7 @@ class _HelperHandler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "transport": "extension-websocket",
+                    "state": _BROWSER_WS.transport.get_state(),
                     "state": state,
                     "verification_required": bool(verif_job or state == "awaiting_user_verification"),
                     "pending_verification": verif_job,
