@@ -160,6 +160,94 @@ _INGEST_JOB_EVENT = threading.Event()
 _INGEST_RESULTS: dict[str, dict] = {}
 _INGEST_PROGRESS: dict[str, dict] = {}
 _INGEST_PROGRESS_LOCK = threading.Lock()
+_INGEST_TRACES: dict[str, list[dict]] = {}
+_INGEST_TRACES_LOCK = threading.Lock()
+
+
+def _sanitize_trace_url(url: object) -> str | None:
+    if not url or not isinstance(url, str):
+        return None
+    url_str = url.strip()
+    if not url_str:
+        return None
+    clean = url_str.split("#")[0]
+    clean = re.sub(
+        r"([?&][^=]*(?:token|auth|session|cookie|sig|signature|sp_atk|password|key|passkey)[^=]*=)[^&#]+",
+        r"\1[REDACTED]",
+        clean,
+        flags=re.IGNORECASE,
+    )
+    return clean
+
+
+def _sanitize_trace_error(err: object) -> str | None:
+    if not err:
+        return None
+    msg = str(err)
+    msg = re.sub(r"<[^>]*>", " ", msg)
+    msg = re.sub(r"(?:token|cookie|auth|session)=[^\s,;&]+", "[REDACTED]", msg, flags=re.IGNORECASE)
+    msg = re.sub(r"\s+", " ", msg).strip()
+    return msg[:400] if msg else None
+
+
+def _record_shopee_trace(entry: dict) -> dict:
+    if not isinstance(entry, dict):
+        return {}
+    job_id = str(entry.get("jobId") or entry.get("job_id") or entry.get("job") or "")
+    if not job_id:
+        return entry
+
+    itemid = entry.get("itemid")
+    if itemid is None and job_id in _INGEST_ALL_JOBS:
+        itemid = _INGEST_ALL_JOBS[job_id].get("itemid")
+    shopid = entry.get("shopid")
+    tab_url = entry.get("tabUrl")
+    if not tab_url and job_id in _INGEST_ALL_JOBS:
+        tab_url = _INGEST_ALL_JOBS[job_id].get("url")
+
+    clean_entry = {
+        "jobId": job_id,
+        "itemid": str(itemid) if itemid is not None else None,
+        "shopid": str(shopid) if shopid is not None else None,
+        "tabId": int(entry["tabId"]) if isinstance(entry.get("tabId"), int) else None,
+        "tabUrl": _sanitize_trace_url(tab_url),
+        "event": str(entry.get("event") or "unknown"),
+        "offset": int(entry["offset"]) if isinstance(entry.get("offset"), int) else None,
+        "limit": int(entry["limit"]) if isinstance(entry.get("limit"), int) else None,
+        "requestStart": str(entry.get("requestStart")) if entry.get("requestStart") else None,
+        "requestEnd": str(entry.get("requestEnd")) if entry.get("requestEnd") else None,
+        "httpStatus": int(entry["httpStatus"]) if isinstance(entry.get("httpStatus"), int) else (
+            int(entry["status"]) if isinstance(entry.get("status"), int) else None
+        ),
+        "responseUrl": _sanitize_trace_url(entry.get("responseUrl")),
+        "elapsedMs": int(entry["elapsedMs"]) if isinstance(entry.get("elapsedMs"), (int, float)) else None,
+        "error": _sanitize_trace_error(entry.get("error")),
+        "at": str(entry.get("at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+    }
+
+    if isinstance(entry.get("rowsCount"), int):
+        clean_entry["rowsCount"] = entry["rowsCount"]
+    if isinstance(entry.get("batchSize"), int):
+        clean_entry["batchSize"] = entry["batchSize"]
+    if isinstance(entry.get("totalTarget"), int):
+        clean_entry["totalTarget"] = entry["totalTarget"]
+
+    with _INGEST_TRACES_LOCK:
+        if job_id not in _INGEST_TRACES:
+            _INGEST_TRACES[job_id] = []
+        _INGEST_TRACES[job_id].append(clean_entry)
+
+    # Persist trace to outputs/logs/shopee_jobs.jsonl
+    try:
+        log_dir = _outputs_root() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "shopee_jobs.jsonl"
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(clean_entry, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"[trace] error writing to shopee_jobs.jsonl: {exc}", file=sys.stderr)
+
+    return clean_entry
 
 
 def _persist_ingest_state() -> None:
@@ -379,11 +467,17 @@ def _queue_ingest_job(url: str, kind: str) -> dict:
     }
     if itemid:
         job["itemid"] = itemid
-        job["name"] = f"shopee_{itemid}"
         job["name"] = f"shopee_{itemid}_reviews"
     _INGEST_ALL_JOBS[job["id"]] = job
     with _INGEST_JOBS_LOCK:
         _INGEST_JOBS.append(job)
+    _record_shopee_trace({
+        "jobId": job["id"],
+        "itemid": itemid,
+        "event": "job-dispatch",
+        "tabUrl": url,
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
     _update_ingest_progress(
         job["id"],
         {
@@ -410,6 +504,11 @@ def _queue_ingest_job(url: str, kind: str) -> dict:
 def _update_ingest_progress(job_id: str, patch: dict) -> dict | None:
     if not job_id:
         return None
+    if isinstance(patch, dict):
+        if "trace" in patch and isinstance(patch["trace"], dict):
+            _record_shopee_trace(patch["trace"])
+        elif patch.get("stage") == "trace" and isinstance(patch.get("debug"), dict):
+            _record_shopee_trace(patch["debug"])
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     with _INGEST_PROGRESS_LOCK:
         current = dict(_INGEST_PROGRESS.get(job_id) or {})
@@ -446,6 +545,14 @@ def _claim_ingest_jobs(wait_seconds: float) -> list[dict]:
 def _ack_ingest_job(job_id: str) -> None:
     if not job_id:
         return
+    job_obj = _INGEST_ALL_JOBS.get(job_id, {})
+    _record_shopee_trace({
+        "jobId": job_id,
+        "itemid": job_obj.get("itemid"),
+        "event": "job-accepted",
+        "tabUrl": job_obj.get("url"),
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
     with _INGEST_JOBS_LOCK:
         for i, j in enumerate(_INGEST_JOBS):
             if j.get("id") == job_id:
@@ -600,8 +707,6 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
             _update_ingest_progress(
                 job_id,
                 {
-                    "status": "awaiting_user_verification" if (is_verification or is_login) else "error",
-                    "stage": "login_required" if is_login else ("verification_required" if is_verification else "failed"),
                     "status": status,
                     "stage": stage,
                     "verification_required": is_verification,
@@ -613,8 +718,15 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
                 },
             )
             _persist_ingest_state()
-            return 200, {"ok": True, "recorded": "error"}
-        return 200, {"ok": False, "error": err_msg, "verification_required": is_verification, "login_required": is_login}
+            return 200, {
+                "ok": False,
+                "error": err_msg,
+                "status": status,
+                "stage": stage,
+                "verification_required": is_verification,
+                "login_required": is_login,
+                "api_blocked": is_api_blocked,
+            }
         return 200, {
             "ok": False,
             "error": err_msg,
@@ -2110,7 +2222,32 @@ class _HelperHandler(BaseHTTPRequestHandler):
             job_id = (qs.get("id", [""])[0] or "").strip()
             done = _INGEST_RESULTS.get(job_id)
             progress = _INGEST_PROGRESS.get(job_id)
-            self._json(200, {"ok": bool(done), "result": done, "progress": progress})
+            with _INGEST_TRACES_LOCK:
+                traces = list(_INGEST_TRACES.get(job_id, []))
+            self._json(200, {
+                "ok": bool(done),
+                "result": done,
+                "progress": progress,
+                "traces": traces,
+                "traces_count": len(traces),
+            })
+            return
+
+        # /ingest/traces?id=… — retrieve structured trace log for a job or recent jobs
+        if self.path.split("?", 1)[0] == "/ingest/traces":
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            job_id = (qs.get("id", [""])[0] or qs.get("jobId", [""])[0] or "").strip()
+            with _INGEST_TRACES_LOCK:
+                if job_id:
+                    traces = list(_INGEST_TRACES.get(job_id, []))
+                else:
+                    traces = [t for t_list in _INGEST_TRACES.values() for t in t_list][-200:]
+            self._json(200, {
+                "ok": True,
+                "jobId": job_id or None,
+                "count": len(traces),
+                "traces": traces,
+            })
             return
 
         # /ingest/progress?id=… — lightweight status for UIs and agents while a

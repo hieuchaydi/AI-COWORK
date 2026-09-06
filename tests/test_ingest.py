@@ -642,3 +642,146 @@ def test_verification_failure_no_fake_success_and_retry(server):
     retried = _get(base, f"/ingest/retry?id={job_id}")
     assert retried["ok"] is True
     assert retried["retried"] == job_id
+
+
+def test_shopee_structured_trace_lifecycle(server):
+    base, outputs = server
+    import launch
+
+    # 1. Server queues a job -> triggers job-dispatch trace with sanitized url
+    q = _get(base, "/ingest/job?url=https://shopee.vn/product/999/888888?token=secret_token_123")
+    assert q["ok"]
+    job_id = q["job"]["id"]
+
+    # 2. Ack job -> triggers job-accepted trace
+    launch._ack_ingest_job(job_id)
+
+    # 3. Simulate extension reporting traces via _update_ingest_progress
+    trace_tab_ready = {
+        "jobId": job_id,
+        "itemid": "888888",
+        "shopid": "999",
+        "tabId": 101,
+        "tabUrl": "https://shopee.vn/product/999/888888?auth=secret_auth",
+        "event": "tab-ready",
+    }
+    launch._update_ingest_progress(job_id, {"stage": "trace", "trace": trace_tab_ready})
+
+    trace_shop_resolved = {
+        "jobId": job_id,
+        "itemid": "888888",
+        "shopid": "999",
+        "tabId": 101,
+        "tabUrl": "https://shopee.vn/product/999/888888",
+        "event": "shop-resolved",
+    }
+    launch._update_ingest_progress(job_id, {"stage": "trace", "trace": trace_shop_resolved})
+
+    trace_req = {
+        "jobId": job_id,
+        "itemid": "888888",
+        "shopid": "999",
+        "tabId": 101,
+        "tabUrl": "https://shopee.vn/product/999/888888",
+        "event": "ratings-request",
+        "offset": 0,
+        "limit": 50,
+        "requestStart": "2026-09-06T12:00:00Z",
+    }
+    launch._update_ingest_progress(job_id, {"stage": "trace", "trace": trace_req})
+
+    trace_resp = {
+        "jobId": job_id,
+        "itemid": "888888",
+        "shopid": "999",
+        "tabId": 101,
+        "tabUrl": "https://shopee.vn/product/999/888888",
+        "event": "ratings-response",
+        "offset": 0,
+        "limit": 50,
+        "requestStart": "2026-09-06T12:00:00Z",
+        "requestEnd": "2026-09-06T12:00:00.350Z",
+        "httpStatus": 200,
+        "responseUrl": "https://shopee.vn/api/v2/item/get_ratings?itemid=888888&shopid=999&session=super_secret",
+        "elapsedMs": 350,
+        "error": None,
+    }
+    launch._update_ingest_progress(job_id, {"stage": "trace", "trace": trace_resp})
+
+    trace_up_start = {
+        "jobId": job_id,
+        "itemid": "888888",
+        "shopid": "999",
+        "tabId": 101,
+        "tabUrl": "https://shopee.vn/product/999/888888",
+        "event": "upload-start",
+        "rowsCount": 1,
+    }
+    launch._update_ingest_progress(job_id, {"stage": "trace", "trace": trace_up_start})
+
+    # Complete job payload
+    rows = [{"user": "test_user", "sao": 5, "noi_dung": "tot", "thoi_gian": "2026-01-01"}]
+    _post(base, "/ingest", {"job": job_id, "source": "https://shopee.vn/product/999/888888", "rows": rows})
+
+    trace_up_complete = {
+        "jobId": job_id,
+        "itemid": "888888",
+        "shopid": "999",
+        "tabId": 101,
+        "tabUrl": "https://shopee.vn/product/999/888888",
+        "event": "upload-complete",
+        "rowsCount": 1,
+    }
+    launch._update_ingest_progress(job_id, {"stage": "trace", "trace": trace_up_complete})
+
+    # 4. Check /ingest/traces?id=job_id endpoint
+    traces_res = _get(base, f"/ingest/traces?id={job_id}")
+    assert traces_res["ok"] is True
+    assert traces_res["jobId"] == job_id
+    traces = traces_res["traces"]
+    assert len(traces) >= 7
+
+    events = [t["event"] for t in traces]
+    for required_event in [
+        "job-dispatch",
+        "job-accepted",
+        "tab-ready",
+        "shop-resolved",
+        "ratings-request",
+        "ratings-response",
+        "upload-start",
+        "upload-complete",
+    ]:
+        assert required_event in events
+
+    # Check 13 required fields for every trace
+    required_fields = [
+        "jobId", "itemid", "shopid", "tabId", "tabUrl", "event",
+        "offset", "limit", "requestStart", "requestEnd", "httpStatus",
+        "responseUrl", "elapsedMs", "error",
+    ]
+    for t in traces:
+        for rf in required_fields:
+            assert rf in t, f"Trace {t.get('event')} missing field {rf}"
+        # Security sanitization checks: never leak token/cookie/auth
+        if t.get("tabUrl"):
+            assert "secret_token_123" not in t["tabUrl"]
+            assert "secret_auth" not in t["tabUrl"]
+        if t.get("responseUrl"):
+            assert "super_secret" not in t["responseUrl"]
+            assert "[REDACTED]" in t["responseUrl"]
+
+    # 5. Check /ingest/result has traces included
+    res = _get(base, f"/ingest/result?id={job_id}")
+    assert res["ok"] is True
+    assert "traces" in res
+    assert res["traces_count"] == len(traces)
+
+    # 6. Check log file outputs/logs/shopee_jobs.jsonl
+    log_file = outputs / "logs" / "shopee_jobs.jsonl"
+    assert log_file.is_file()
+    lines = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    log_job_events = [line["event"] for line in lines if line.get("jobId") == job_id]
+    for ev in ["job-dispatch", "job-accepted", "ratings-response"]:
+        assert ev in log_job_events
+

@@ -95,22 +95,82 @@ async function reportProgress(job, progress) {
   if (job && job.id) await sendIngestRequest({ operation: "progress", job: job.id, progress });
 }
 
-async function traceJob(job, progress, event, details = {}) {
+function sanitizeUrlForTrace(url) {
+  if (!url || typeof url !== "string") return null;
+  try {
+    let clean = url.split("#")[0];
+    clean = clean.replace(/([?&][^=]*(?:token|auth|session|cookie|sig|signature|sp_atk|password|key|passkey)[^=]*=)[^&#]+/gi, "$1[REDACTED]");
+    return clean;
+  } catch {
+    return null;
+  }
+}
+
+function sanitizeErrorForTrace(err) {
+  if (!err) return null;
+  const raw = typeof err === "object" ? (err.message || String(err)) : String(err);
+  return raw
+    .replace(/<[^>]*>/g, " ")
+    .replace(/([^=&\s]*(?:token|cookie|auth|session)[^=&\s]*)=[^\s,;&]+/gi, "$1=[REDACTED]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 400);
+}
+
+function buildTraceEntry(job, event, details = {}) {
+  const itemid = details.itemid ?? job?.itemid ?? (job?.url ? idsFrom(job.url).itemid : null) ?? null;
+  const shopid = details.shopid ?? job?._targetShopId ?? job?.shopid ?? (job?.url ? idsFrom(job.url).shopid : null) ?? null;
+  const tabId = details.tabId ?? job?._targetTabId ?? null;
+  const tabUrl = sanitizeUrlForTrace(details.tabUrl ?? job?._targetTabUrl ?? job?.url ?? null);
+
+  const reqStart = details.requestStart
+    ? (typeof details.requestStart === "number" ? new Date(details.requestStart).toISOString() : String(details.requestStart))
+    : null;
+  const reqEnd = details.requestEnd
+    ? (typeof details.requestEnd === "number" ? new Date(details.requestEnd).toISOString() : String(details.requestEnd))
+    : null;
+
+  const httpStatus = typeof details.httpStatus === "number"
+    ? details.httpStatus
+    : (typeof details.status === "number" ? details.status : null);
+
   const entry = {
+    jobId: job?.id || details.jobId || null,
+    itemid: itemid !== null && itemid !== undefined ? String(itemid) : null,
+    shopid: shopid !== null && shopid !== undefined ? String(shopid) : null,
+    tabId: typeof tabId === "number" ? tabId : null,
+    tabUrl,
+    event: String(event),
+    offset: typeof details.offset === "number" ? details.offset : null,
+    limit: typeof details.limit === "number" ? details.limit : null,
+    requestStart: reqStart,
+    requestEnd: reqEnd,
+    httpStatus,
+    responseUrl: sanitizeUrlForTrace(details.responseUrl ?? null),
+    elapsedMs: typeof details.elapsedMs === "number" ? details.elapsedMs : null,
+    error: details.error ? sanitizeErrorForTrace(details.error) : null,
     at: new Date().toISOString(),
-    jobId: job?.id || null,
-    event,
-    ...details,
   };
+
+  if (typeof details.rowsCount === "number") entry.rowsCount = details.rowsCount;
+  if (typeof details.batchSize === "number") entry.batchSize = details.batchSize;
+  if (typeof details.totalTarget === "number") entry.totalTarget = details.totalTarget;
+
+  return entry;
+}
+
+async function traceJob(job, progress, event, details = {}) {
+  const entry = buildTraceEntry(job, event, details);
   // Keep this structured and omit review text, cookies, and media URLs.
   console.log("[bridge][job-trace]", JSON.stringify(entry));
-  if (progress && job?.id) {
+  if (progress && entry.jobId) {
     try {
-      await progress({ stage: "trace", message: `[${event}]`, debug: entry });
+      await progress({ stage: "trace", trace: entry, message: `[${event}]` });
     } catch (error) {
       console.warn("[bridge][job-trace] progress upload failed:", error?.message || error);
     }
   }
+  return entry;
 }
 
 async function uploadIngestResult(body) {
@@ -457,16 +517,28 @@ async function extractShopeeReviews(job, progress) {
   let itemid = parsed.itemid;
   let shopid = parsed.shopid;
   if (!itemid) throw new Error(`Không đọc được itemid từ URL: ${job.url}`);
+  job.itemid = itemid;
 
   // Find or attach to a Shopee tab in the user's browser FIRST to leverage the real user session
   const tab = await findOrOpenShopeeTab(job.url, itemid);
   if (!tab || !tab.id) throw new Error("Không tìm thấy hoặc không mở được tab Shopee trên trình duyệt");
   job._targetTabId = tab.id;
-  await traceJob(job, progress, "tab-ready", { tabId: tab.id, tabUrl: tab.url || "" });
+  job._targetTabUrl = tab.url || "";
+  await traceJob(job, progress, "tab-ready", {
+    itemid,
+    tabId: tab.id,
+    tabUrl: tab.url || "",
+  });
 
   if (!shopid) shopid = await resolveShopId(itemid, job.url, tab, progress);
   if (!shopid) throw new Error(`Không tìm thấy shopid cho item ${itemid}`);
-  await traceJob(job, progress, "shop-resolved", { itemid, shopid });
+  job._targetShopId = shopid;
+  await traceJob(job, progress, "shop-resolved", {
+    itemid,
+    shopid,
+    tabId: tab.id,
+    tabUrl: tab.url || "",
+  });
 
   let all = [];
   let offset = 0;
@@ -474,19 +546,38 @@ async function extractShopeeReviews(job, progress) {
 
   while (all.length < MAX_REVIEWS) {
     const requestStarted = Date.now();
+    const requestStartIso = new Date(requestStarted).toISOString();
     await traceJob(job, progress, "ratings-request", {
-      itemid, shopid, offset, limit: PAGE_SIZE, tabId: tab.id,
+      itemid,
+      shopid,
+      offset,
+      limit: PAGE_SIZE,
+      tabId: tab.id,
+      tabUrl: tab.url || "",
+      requestStart: requestStartIso,
     });
     const fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, tab.url || job.url);
+    const requestEnded = Date.now();
+    const requestEndIso = new Date(requestEnded).toISOString();
+    const elapsedMs = requestEnded - requestStarted;
+    const httpStatus = typeof fetchRes.status === "number" ? fetchRes.status : (fetchRes.ok ? 200 : 500);
+
     await traceJob(job, progress, "ratings-response", {
-      itemid, shopid, offset, limit: PAGE_SIZE, status: fetchRes.status ?? null,
-      ok: Boolean(fetchRes.ok), elapsedMs: Date.now() - requestStarted,
-    ok: Boolean(fetchRes.ok), elapsedMs: Date.now() - requestStarted,
-      responseUrl: fetchRes.url || null, pageUrl: fetchRes.pageUrl || tab.url || null,
-      responseBytes: String(fetchRes.textSample || "").length,
+      itemid,
+      shopid,
+      offset,
+      limit: PAGE_SIZE,
+      tabId: tab.id,
+      tabUrl: tab.url || "",
+      requestStart: requestStartIso,
+      requestEnd: requestEndIso,
+      elapsedMs,
+      httpStatus,
+      responseUrl: fetchRes.url || null,
+      error: fetchRes.ok ? null : (fetchRes.error || "Shopee API request failed"),
     });
+
     if (!fetchRes.ok) {
-      throw new Error(fetchRes.error ? `Shopee API request failed: ${fetchRes.error}` : formatShopeeFailure(fetchRes));
       const err = new Error(fetchRes.error ? `Shopee API request failed: ${fetchRes.error}` : formatShopeeFailure(fetchRes));
       err.failureKind = classifyShopeeFailure(fetchRes);
       err.fetchRes = fetchRes;
@@ -495,15 +586,12 @@ async function extractShopeeReviews(job, progress) {
 
     const json = fetchRes.json;
     if (json && (json.error === 90309999 || json.is_login === false || (json.data && json.data.is_login === false))) {
-      throw new Error("Shopee login required (error 90309999, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome");
       const err = new Error("Shopee login required (error 90309999, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome");
       err.failureKind = "login";
       err.fetchRes = fetchRes;
       throw err;
     }
 
-    const ratings = (json && json.data && json.data.ratings) || [];
-    if (!ratings.length) break;
     const batch = (json && (json.data?.ratings || json.ratings || json.items)) || [];
     if (!Array.isArray(batch) || batch.length === 0) break;
 
@@ -512,24 +600,25 @@ async function extractShopeeReviews(job, progress) {
     if (total === null) total = ratingTotal(json);
     const pct = crawlPercent(all.length, total, 10, 80);
     await traceJob(job, progress, "ratings-batch", {
-      batch: batch.length, totalCollected: all.length, targetTotal: total, percent: pct,
+      itemid,
+      shopid,
+      offset,
+      limit: PAGE_SIZE,
+      tabId: tab.id,
+      tabUrl: tab.url || "",
+      batchSize: batch.length,
+      rowsCount: all.length,
+      totalTarget: total,
     });
     await progress({
-      status: "running", stage: "fetch",
+      status: "running",
+      stage: "fetch",
       message: `Đã cào ${all.length}${total ? "/" + total : ""} đánh giá`,
-      rows: all.length, percent: pct,
+      rows: all.length,
+      percent: pct,
     });
 
-    for (const r of ratings) all.push(normaliseRating(r));
-    if (progress) {
-      await progress({
-        stage: "fetch-tab",
-        message: `Đã lấy ${all.length} đánh giá qua tab Shopee`,
-        rows: all.length,
-        percent: crawlPercent(all.length, total, 20, 70),
-      });
-    }
-    if (ratings.length < PAGE_SIZE) break;
+    if (batch.length < PAGE_SIZE) break;
     offset += PAGE_SIZE;
     await new Promise((s) => setTimeout(s, PACE_MS));
   }
@@ -543,7 +632,11 @@ async function runJob(job) {
 
   const progress = (patch) => reportProgress(job, patch);
   try {
-    await traceJob(job, progress, "job-start", { kind: job.kind, sourceUrl: job.url });
+    await traceJob(job, progress, "job-start", {
+      kind: job.kind,
+      sourceUrl: job.url,
+      itemid: job.itemid || (job.url ? idsFrom(job.url).itemid : null),
+    });
     await progress({ status: "running", stage: "init", message: "Bắt đầu cào", percent: 5 });
     let rows = [];
     if (job.kind === "shopee-reviews" || job.url.includes("shopee.vn")) {
@@ -552,14 +645,34 @@ async function runJob(job) {
     const parsed = idsFrom(job.url);
     const itemid = parsed.itemid || job.itemid;
     const outputName = itemid ? "shopee_" + itemid + "_reviews" : (job.name || "shopee_" + job.id);
-    await traceJob(job, progress, "upload-start", { rows: rows.length, outputName });
+    await traceJob(job, progress, "upload-start", {
+      itemid,
+      shopid: job._targetShopId,
+      tabId: job._targetTabId,
+      tabUrl: job._targetTabUrl,
+      rowsCount: rows.length,
+      outputName,
+    });
     await progress({ status: "saving", stage: "upload", message: `Đang lưu ${rows.length} dòng`, rows: rows.length, percent: 95 });
     await uploadIngestResult({ job: job.id, name: outputName, source: job.url, rows });
-    await traceJob(job, progress, "upload-complete", { rows: rows.length, outputName });
+    await traceJob(job, progress, "upload-complete", {
+      itemid,
+      shopid: job._targetShopId,
+      tabId: job._targetTabId,
+      tabUrl: job._targetTabUrl,
+      rowsCount: rows.length,
+      outputName,
+    });
     console.log("[bridge] ✔ job", job.id, "finished:", rows.length, "rows");
   } catch (e) {
     console.error("[bridge] ✘ job", job.id, "failed:", e.message);
-    await traceJob(job, progress, "job-failed", { error: String(e.message || e).slice(0, 500) });
+    await traceJob(job, progress, "job-failed", {
+      itemid: job.itemid || (job.url ? idsFrom(job.url).itemid : null),
+      shopid: job._targetShopId || job.shopid,
+      tabId: job._targetTabId,
+      tabUrl: job._targetTabUrl,
+      error: String(e.message || e),
+    });
     const message = String(e.message || e);
     const failureKind = e.failureKind || classifyShopeeFailure({ error: message, textSample: message });
 
@@ -1342,10 +1455,10 @@ async function dispatchEnvelope(envelope) {
 
   // Backward-compatible ingest.job message
   if (envelope.type === "ingest.job") {
-    enqueueLegacyJob(envelope.job, "websocket");
     const job = envelope.job ? { ...envelope.job } : {};
     if (envelope.retry || envelope.job?.retry) job.retry = true;
     if (!job.id && envelope.id) job.id = envelope.id;
+    traceJob(job, null, "job-dispatch", { sourceUrl: job.url });
     enqueueLegacyJob(job, "websocket");
     return;
   }
@@ -1519,13 +1632,10 @@ function enqueueLegacyJob(job) {
     return;
   }
   bridgeSend({ v: 1, type: "accepted", id: job.id, jobId: job.id });
+  traceJob(job, null, "job-accepted", { sourceUrl: job.url });
   if (job.retry) {
     knownJobs.delete(job.id);
     notifiedVerificationJobIds.delete(job.id);
-  }
-  if (activeJobs.has(job.id)) {
-    console.log("[bridge] Job already active, skipping duplicate enqueue:", job.id);
-    return;
   }
   if (knownJobs.has(job.id)) return;
   knownJobs.add(job.id);

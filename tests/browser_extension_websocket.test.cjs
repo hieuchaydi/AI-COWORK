@@ -154,3 +154,86 @@ test('classifies Shopee API 403 separately from login and traffic verification',
     textSample: '{"error":90309999,"is_login":false}'
   })`, context), 'login');
 });
+
+test('buildTraceEntry includes all 13 required fields and sanitizes sensitive data', async () => {
+  const { context } = await worker();
+  const entry = vm.runInContext(`
+    buildTraceEntry(
+      { id: "job-abc-123", url: "https://shopee.vn/product/12345/67890?sp_atk=sensitive_token#header" },
+      "ratings-response",
+      {
+        itemid: "67890",
+        shopid: "12345",
+        tabId: 42,
+        tabUrl: "https://shopee.vn/product/12345/67890?auth=secret_auth",
+        offset: 20,
+        limit: 10,
+        requestStart: 1700000000000,
+        requestEnd: 1700000000250,
+        status: 200,
+        responseUrl: "https://shopee.vn/api/v2/item/get_ratings?itemid=67890&shopid=12345&token=sensitive_session_token",
+        elapsedMs: 250,
+        error: null,
+      }
+    )
+  `, context);
+
+  // 13 required fields check
+  const requiredFields = [
+    'jobId', 'itemid', 'shopid', 'tabId', 'tabUrl', 'event',
+    'offset', 'limit', 'requestStart', 'requestEnd', 'httpStatus',
+    'responseUrl', 'elapsedMs', 'error',
+  ];
+  for (const field of requiredFields) {
+    assert.ok(field in entry, `Missing required field: ${field}`);
+  }
+
+  assert.equal(entry.jobId, 'job-abc-123');
+  assert.equal(entry.itemid, '67890');
+  assert.equal(entry.shopid, '12345');
+  assert.equal(entry.tabId, 42);
+  assert.equal(entry.event, 'ratings-response');
+  assert.equal(entry.offset, 20);
+  assert.equal(entry.limit, 10);
+  assert.equal(entry.httpStatus, 200);
+  assert.equal(entry.elapsedMs, 250);
+  assert.equal(entry.error, null);
+
+  // Sanitization checks: no raw token / auth / session / secret
+  assert.ok(!entry.tabUrl.includes('secret_auth'));
+  assert.ok(entry.tabUrl.includes('[REDACTED]'));
+  assert.ok(!entry.responseUrl.includes('sensitive_session_token'));
+  assert.ok(entry.responseUrl.includes('[REDACTED]'));
+
+  // Ensure no sensitive review comments, reviewer username or media urls are present
+  assert.equal(entry.comment, undefined);
+  assert.equal(entry.review_text, undefined);
+  assert.equal(entry.author, undefined);
+  assert.equal(entry.image_url, undefined);
+  assert.equal(entry.media_url, undefined);
+});
+
+test('traceJob emits progress trace envelope to bridge with sanitized error', async () => {
+  const { context, frames } = await worker();
+  await vm.runInContext(`
+    traceJob(
+      { id: "job-test-err", url: "https://shopee.vn/product/111/222" },
+      (patch) => reportProgress({ id: "job-test-err" }, patch),
+      "job-failed",
+      {
+        error: "HTTP 403 Forbidden with cookie=secret_cookie_val and <b>HTML</b> body",
+      }
+    )
+  `, context);
+
+  const progressFrames = frames.filter(f => f.params?.operation === 'progress');
+  assert.ok(progressFrames.length >= 1);
+  const lastProgress = progressFrames.at(-1).params.progress;
+  assert.equal(lastProgress.stage, 'trace');
+  assert.equal(lastProgress.trace.event, 'job-failed');
+  assert.equal(lastProgress.trace.jobId, 'job-test-err');
+  assert.ok(!lastProgress.trace.error.includes('secret_cookie_val'));
+  assert.ok(lastProgress.trace.error.includes('[REDACTED]'));
+  assert.ok(!lastProgress.trace.error.includes('<b>'));
+});
+
