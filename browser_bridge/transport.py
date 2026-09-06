@@ -60,6 +60,18 @@ class BrowserTransport(ABC):
         """Attempts to cancel an in-flight command."""
         pass
 
+    def require_verification(self, url: str = "", reason: str = "") -> None:
+        """Sets the transport state to awaiting user verification."""
+        pass
+
+    def resume_verification(self) -> None:
+        """Resumes transport state from awaiting user verification back to connected."""
+        pass
+
+    def is_paused(self) -> bool:
+        """Returns True if the transport is paused awaiting verification."""
+        return False
+
 
 class _PendingCommand:
     def __init__(self, command_id: str, action: str, deadline: float):
@@ -155,6 +167,14 @@ class WebSocketTransport(BrowserTransport):
             if self._state == ExtensionState.AWAITING_USER_VERIFICATION:
                 self._state = ExtensionState.CONNECTED
                 self._verification_info = None
+
+    def require_verification(self, url: str = "", reason: str = "") -> None:
+        with self._lock:
+            self.set_state(ExtensionState.AWAITING_USER_VERIFICATION, {"url": url, "reason": reason})
+
+    def is_paused(self) -> bool:
+        with self._lock:
+            return self._state == ExtensionState.AWAITING_USER_VERIFICATION
 
     def handle_inbound_envelope(self, envelope_data: Dict[str, Any]) -> None:
         """Processes an incoming message envelope from the extension."""
