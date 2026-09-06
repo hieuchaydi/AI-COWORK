@@ -264,7 +264,7 @@ def test_shopee_full_workflow_from_queue_to_results(setup_shopee_environment):
         csv_path = tmp_path / "csv" / "shopee_25018847315_reviews.csv"
         assert csv_path.is_file()
         raw_csv_bytes = csv_path.read_bytes()
-        assert raw_csv_bytes.startswith(b"ï»¿")  # UTF-8 BOM!
+        assert raw_csv_bytes.startswith(b"\xef\xbb\xbf")  # UTF-8 BOM!
         assert raw_csv_bytes[:3] == bytes.fromhex("efbbbf")  # UTF-8 BOM!
         csv_text = raw_csv_bytes.decode("utf-8-sig")
         csv_lines = csv_text.strip().splitlines()
