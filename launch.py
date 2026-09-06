@@ -390,6 +390,7 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
     source = (body.get("source") if isinstance(body, dict) else None)
     source_text = str(source or "")
     media_dir = None
+    zip_rel = None
     if name.lower().startswith("shopee_") or "shopee.vn" in source_text.lower():
         if job_id:
             _update_ingest_progress(
@@ -403,6 +404,7 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
                 },
             )
         rows, media_dir = _prepare_shopee_review_rows(name, rows, job_id)
+        rows, media_dir, zip_rel = _prepare_shopee_review_rows(name, rows, job_id)
     inbox = _outputs_root() / "inbox"
     inbox.mkdir(parents=True, exist_ok=True)
     target = inbox / name
@@ -411,6 +413,7 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
         "source": source,
         "count": len(rows),
         "media_dir": f"outputs/{media_dir}" if media_dir else None,
+        "zip": zip_rel,
         "rows": rows,
     }
     try:
@@ -433,6 +436,8 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
         "url": f"/outputs/inbox/{name}",
         "csv": csv_rel,
         "media_dir": f"outputs/{media_dir}" if media_dir else None,
+        "zip": zip_rel,
+        "zip_url": f"/{zip_rel}" if zip_rel else None,
     }
     if job_id:
         _INGEST_RESULTS[job_id] = result
@@ -444,11 +449,14 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
                 "status": "done",
                 "stage": "saved",
                 "message": f"Đã lưu {len(rows)} dòng",
+                "message": f"Đã lưu {len(rows)} dòng" + (f", đóng gói {zip_rel}" if zip_rel else ""),
                 "rows": len(rows),
                 "count": len(rows),
                 "path": result["path"],
                 "csv": csv_rel,
                 "media_dir": result.get("media_dir"),
+                "zip": zip_rel,
+                "zip_url": result.get("zip_url"),
                 "percent": 100,
             },
         )
@@ -499,12 +507,15 @@ _SHOPEE_REVIEW_COLUMNS = [
     "so_anh",
     "anh_urls",
     "image_files",
+    "image_names",
     "video",
     "so_video",
     "video_urls",
     "video_files",
+    "video_names",
     "media_urls",
     "media_files",
+    "media_names",
     "media_dir",
     "media_errors",
 ]
@@ -600,8 +611,30 @@ def _download_ingest_media(url: str, target_without_ext: Path) -> str:
 
 
 def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tuple[list, str | None]:
+def _zip_shopee_media(media_root: Path, stem: str) -> str | None:
+    if not media_root.exists():
+        return None
+    files = [p for p in media_root.iterdir() if p.is_file()]
+    if not files:
+        return None
+    zips_dir = _outputs_root() / "zips"
+    zips_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = zips_dir / f"{stem}_media.zip"
+    try:
+        import zipfile
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for f in sorted(files):
+                zf.write(f, arcname=f.name)
+        return f"outputs/zips/{zip_path.name}"
+    except Exception as exc:
+        print(f"[ingest] failed to zip media {media_root}: {exc}", file=sys.stderr)
+        return None
+
+
+def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tuple[list, str | None, str | None]:
     if not rows or not all(isinstance(r, dict) for r in rows):
         return rows, None
+        return rows, None, None
 
     stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", name[:-5] if name.endswith(".json") else name).strip("._")
     if not stem:
@@ -629,11 +662,16 @@ def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tupl
 
     for idx, row in enumerate(sorted_rows, start=1):
         image_files: list[str] = []
+        image_names: list[str] = []
         video_files: list[str] = []
+        video_names: list[str] = []
         errors: list[str] = []
         for kind, urls, bucket in (
             ("image", _split_ingest_urls(row.get("anh_urls") or row.get("image_urls")), image_files),
             ("video", _split_ingest_urls(row.get("video_urls")), video_files),
+        for kind, urls, bucket_files, bucket_names in (
+            ("image", _split_ingest_urls(row.get("anh_urls") or row.get("image_urls")), image_files, image_names),
+            ("video", _split_ingest_urls(row.get("video_urls")), video_files, video_names),
         ):
             for media_idx, url in enumerate(urls, start=1):
                 media_root.mkdir(parents=True, exist_ok=True)
@@ -641,6 +679,8 @@ def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tupl
                 try:
                     rel = _download_ingest_media(url, base)
                     bucket.append(rel)
+                    bucket_files.append(rel)
+                    bucket_names.append(Path(rel).name)
                     media_saved += 1
                     media_dir_rel = media_root.relative_to(_outputs_root()).as_posix()
                 except Exception as exc:  # noqa: BLE001
@@ -659,16 +699,35 @@ def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tupl
                     )
         if image_files:
             row["image_files"] = "|".join(image_files)
+            row["image_names"] = "|".join(image_names)
         if video_files:
             row["video_files"] = "|".join(video_files)
+            row["video_names"] = "|".join(video_names)
         media_files = image_files + video_files
+        media_names = image_names + video_names
         if media_files:
             row["media_files"] = "|".join(media_files)
+            row["media_names"] = "|".join(media_names)
             row["media_dir"] = f"outputs/{media_dir_rel}" if media_dir_rel else ""
         if errors:
             row["media_errors"] = " || ".join(errors[:10])
 
     return [_ordered_shopee_review_row(r) for r in sorted_rows], media_dir_rel
+    zip_rel = None
+    if media_saved > 0:
+        if job_id:
+            _update_ingest_progress(
+                job_id,
+                {
+                    "status": "saving",
+                    "stage": "zipping",
+                    "message": f"Đang nén {media_saved} file media vào ZIP",
+                    "percent": 99,
+                },
+            )
+        zip_rel = _zip_shopee_media(media_root, stem)
+
+    return [_ordered_shopee_review_row(r) for r in sorted_rows], media_dir_rel, zip_rel
 
 
 # The bookmarklet body. Runs in the user's ORDINARY Chrome — no Playwright, no CDP,

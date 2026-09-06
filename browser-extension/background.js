@@ -167,11 +167,47 @@ function idsFrom(url) {
 }
 
 async function resolveShopId(itemid, originalUrl, progress) {
+async function findOrOpenShopeeTab(targetUrl, itemid) {
+  const tabs = await chrome.tabs.query({});
+  // 1. Prefer a tab already displaying this item
+  let tab = tabs.find((t) => t.url && itemid && t.url.includes(itemid));
+  // 2. Or any tab on shopee.vn
+  if (!tab) {
+    tab = tabs.find((t) => t.url && t.url.includes("shopee.vn"));
+  }
+  // 3. Or create a new tab if none exists
+  if (!tab) {
+    tab = await chrome.tabs.create({ url: targetUrl, active: false });
+    await new Promise((resolve) => {
+      let timer = null;
+      const listener = (tid, changeInfo) => {
+        if (tid === tab.id && changeInfo.status === "complete") {
+          cleanup();
+          resolve();
+        }
+      };
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(listener);
+      };
+      chrome.tabs.onUpdated.addListener(listener);
+      timer = setTimeout(() => {
+        cleanup();
+        resolve();
+      }, 15000);
+    });
+  }
+  return tab;
+}
+
+async function resolveShopId(itemid, originalUrl, tab, progress) {
   if (progress) await progress({ stage: "resolve-shop", message: "Đang tìm shopid", itemid, percent: 10 });
   function scrape(text) {
     const m = text.match(/"shopid"\s*:\s*"?(\d+)/) || text.match(/"shop_id"\s*:\s*"?(\d+)/);
     return m ? m[1] : null;
   }
+
+  // 1. Try URL regex from original URL
   try {
     const r = await fetch(originalUrl, {
       credentials: "include",
@@ -179,8 +215,75 @@ async function resolveShopId(itemid, originalUrl, progress) {
     });
     const s = scrape(await r.text());
     if (s) return s;
+    const u = new URL(originalUrl);
+    const m = u.pathname.match(/^\/product\/(\d+)\//) || u.href.match(/i\.(\d+)\./);
+    if (m) return m[1];
   } catch {}
+
+  // 2. Try current tab URL (might have redirected to /product/<shopid>/<itemid>)
+  if (tab && tab.url) {
+    try {
+      const u = new URL(tab.url);
+      const m = u.pathname.match(/^\/product\/(\d+)\//) || u.href.match(/i\.(\d+)\./);
+      if (m) return m[1];
+    } catch {}
+  }
+
+  // 3. Scrape from DOM in tab context
+  if (tab && tab.id) {
+    try {
+      const res = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => {
+          const m = location.pathname.match(/^\/product\/(\d+)\//) || location.href.match(/i\.(\d+)\./);
+          if (m) return m[1];
+          const html = document.documentElement.innerHTML;
+          const s = html.match(/"shopid"\s*:\s*"?(\d+)/) || html.match(/"shop_id"\s*:\s*"?(\d+)/);
+          return s ? s[1] : null;
+        },
+      });
+      const sid = res[0]?.result;
+      if (sid) return sid;
+    } catch {}
+  }
+
   return null;
+}
+
+async function fetchRatingsFromTab(tabId, itemid, shopid, offset, limit, referer) {
+  const res = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: async (iid, sid, off, lim, ref) => {
+      const path = `/api/v2/item/get_ratings?filter=0&flag=1&itemid=${iid}&limit=${lim}&offset=${off}&shopid=${sid}&type=0`;
+      try {
+        const resp = await fetch(path, {
+          credentials: "include",
+          headers: {
+            "Accept": "application/json, text/plain, */*",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-Api-Source": "pc",
+            "X-Shopee-Language": "vi",
+          },
+          referrer: ref,
+          referrerPolicy: "strict-origin-when-cross-origin",
+        });
+        const text = await resp.text();
+        let json = null;
+        try { json = JSON.parse(text); } catch {}
+        return {
+          ok: resp.ok,
+          status: resp.status,
+          url: resp.url,
+          json,
+          textSample: text.slice(0, 300),
+        };
+      } catch (err) {
+        return { ok: false, error: err.message };
+      }
+    },
+    args: [itemid, shopid, offset, limit, referer],
+  });
+  return res[0]?.result || { ok: false, error: "executeScript returned no result" };
 }
 
 async function extractShopeeReviews(job, progress) {
@@ -189,6 +292,12 @@ async function extractShopeeReviews(job, progress) {
   let shopid = parsed.shopid;
   if (!itemid) throw new Error(`Không đọc được itemid từ URL: ${job.url}`);
   if (!shopid) shopid = await resolveShopId(itemid, job.url, progress);
+
+  // Find or attach to a Shopee tab in the user's browser
+  const tab = await findOrOpenShopeeTab(job.url, itemid);
+  if (!tab || !tab.id) throw new Error("Không tìm thấy hoặc không mở được tab Shopee trên trình duyệt");
+
+  if (!shopid) shopid = await resolveShopId(itemid, job.url, tab, progress);
   if (!shopid) throw new Error(`Không tìm thấy shopid cho item ${itemid}`);
 
   let all = [];
@@ -215,10 +324,20 @@ async function extractShopeeReviews(job, progress) {
     }
     if (!res.ok) {
       if (res.status === 403 || res.url.includes("/verify/traffic")) {
+    const fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, job.url);
+    if (!fetchRes.ok) {
+      if (fetchRes.status === 403 || (fetchRes.url && fetchRes.url.includes("/verify/traffic"))) {
         throw new Error("Shopee challenge / verification required");
       }
       throw new Error(`Shopee API error HTTP ${res.status}`);
+      throw new Error(`Shopee API error HTTP ${fetchRes.status}: ${fetchRes.error || fetchRes.textSample || ""}`);
     }
+
+    const json = fetchRes.json;
+    if (json && (json.error === 90309999 || json.is_login === false || (json.data && json.data.is_login === false))) {
+      throw new Error("Shopee error 90309999 (is_login=false) — Shopee yêu cầu đăng nhập trên trình duyệt để xem đánh giá");
+    }
+
     const ratings = (json && json.data && json.data.ratings) || [];
     if (!ratings.length) break;
     if (total === null) total = ratingTotal(json);
@@ -228,6 +347,8 @@ async function extractShopeeReviews(job, progress) {
       await progress({
         stage: "fetch-background",
         message: `Đã lấy ${all.length} đánh giá`,
+        stage: "fetch-tab",
+        message: `Đã lấy ${all.length} đánh giá qua tab Shopee`,
         rows: all.length,
         percent: crawlPercent(all.length, total, 20, 70),
       });

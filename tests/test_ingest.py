@@ -81,9 +81,14 @@ def test_shopee_ingest_adds_local_media_paths(tmp_path, monkeypatch):
     def fake_download(url: str, target_without_ext: Path) -> str:
         suffix = ".mp4" if url.endswith(".mp4") else ".jpg"
         return f"outputs/{target_without_ext.with_suffix(suffix).relative_to(tmp_path).as_posix()}"
+        target = target_without_ext.with_suffix(suffix)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"fake_content")
+        return f"outputs/{target.relative_to(tmp_path).as_posix()}"
 
     monkeypatch.setattr(launch, "_download_ingest_media", fake_download)
     rows, media_dir = launch._prepare_shopee_review_rows(
+    rows, media_dir, zip_rel = launch._prepare_shopee_review_rows(
         "shopee_123.json",
         [
             {
@@ -96,8 +101,13 @@ def test_shopee_ingest_adds_local_media_paths(tmp_path, monkeypatch):
 
     assert media_dir == "shopee_reviews/shopee_123/media"
     assert rows[0]["image_files"].endswith("review_00001_image_01.jpg")
+    assert rows[0]["image_names"] == "review_00001_image_01.jpg"
     assert rows[0]["video_files"].endswith("review_00001_video_01.mp4")
+    assert rows[0]["video_names"] == "review_00001_video_01.mp4"
+    assert rows[0]["media_names"] == "review_00001_image_01.jpg|review_00001_video_01.mp4"
     assert rows[0]["media_dir"] == "outputs/shopee_reviews/shopee_123/media"
+    assert zip_rel == "outputs/zips/shopee_123_media.zip"
+    assert (tmp_path / "zips" / "shopee_123_media.zip").is_file()
 
 
 def test_ingest_csv_aligns_ragged_rows_under_a_union_header(server):
@@ -282,3 +292,53 @@ def test_ingested_file_is_served_back_for_the_agent_to_read(server):
     with urllib.request.urlopen(base + "/outputs/inbox/shopee_123.json", timeout=5) as r:
         assert r.status == 200
         assert "tốt" in json.loads(r.read())["rows"][0]["noi_dung"]
+
+
+def test_shopee_ingest_e2e_zip_and_csv(server, monkeypatch):
+    base, outputs = server
+    import launch
+
+    def fake_download(url: str, target_without_ext: Path) -> str:
+        target = target_without_ext.with_suffix(".jpg")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"img_bytes_123")
+        return f"outputs/{target.relative_to(outputs).as_posix()}"
+
+    monkeypatch.setattr(launch, "_download_ingest_media", fake_download)
+
+    job_id = _get(base, "/ingest/job?url=https://shopee.vn/product/11/22")["job"]["id"]
+    _get(base, "/ingest/jobs?wait=1")
+    status, out = _post(
+        base,
+        "/ingest",
+        {
+            "job": job_id,
+            "name": "shopee_22",
+            "source": "https://shopee.vn/product/11/22",
+            "rows": [
+                {
+                    "user": "tester",
+                    "sao": 5,
+                    "noi_dung": "dep lam",
+                    "anh_urls": "https://down-vn.img.susercontent.com/file/pic1",
+                    "thoi_gian": "2026-09-01 10:00:00",
+                }
+            ],
+        },
+    )
+
+    assert status == 200 and out["ok"]
+    assert out["zip"] == "outputs/zips/shopee_22_media.zip"
+    assert out["zip_url"] == "/outputs/zips/shopee_22_media.zip"
+    assert (outputs / "zips" / "shopee_22_media.zip").is_file()
+
+    # Check zip contents
+    import zipfile
+    with zipfile.ZipFile(outputs / "zips" / "shopee_22_media.zip") as zf:
+        namelist = zf.namelist()
+        assert "review_00001_image_01.jpg" in namelist
+
+    # Check CSV contents
+    csv_text = (outputs / "csv" / "shopee_22.csv").read_bytes().decode("utf-8-sig")
+    assert "image_names" in csv_text
+    assert "review_00001_image_01.jpg" in csv_text
