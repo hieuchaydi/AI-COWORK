@@ -152,7 +152,7 @@ python launch.py
 Lúc này Gateway sẽ tự động lắng nghe:
 - HTTP API & WebSocket Upgrade: `http://127.0.0.1:8766`
 - Raw WebSocket Endpoint: `ws://127.0.0.1:8767/browser-extension`
-- Đồng thời Chrome sẽ tự khởi động với profile chuyên biệt tại `chrome-profile/` đã tải sẵn extension.
+- Chrome mở profile riêng tại `chrome-profile/`. Lần đầu cần bật Developer mode và Load unpacked thư mục `browser-extension/` trong `chrome://extensions/`. Chrome chính thức từ bản 137 không hỗ trợ tự nạp bằng `--load-extension`; launcher không coi việc mở Chrome là đã kết nối extension.
 
 ### Cài đặt Extension thủ công trên Chrome thường (tùy chọn)
 1. Mở Chrome, truy cập: `chrome://extensions/`
@@ -224,3 +224,22 @@ và error có cấu trúc. API chỉ gửi typed action qua WebSocket; extension
 kết nối sẽ trả lỗi, không chuyển thao tác DOM thành job cào dữ liệu HTTP.
 HTTP ingest cũ vẫn dùng cho job cào dữ liệu. Extension tự lấy lại pairing token
 của gateway mặc định sau khi launcher khởi động lại.
+
+
+## 9. Chẩn đoán kết nối
+
+- Chạy `run-web.bat` hoặc `.venv\Scripts\python.exe launch.py`. Chỉ chạy GUI,
+  backend hoặc `run.bat` (TUI) sẽ không tự tạo helper WebSocket.
+- Mở `http://127.0.0.1:8766/browser/status`: nếu không truy cập được, launcher
+  chưa chạy hoặc helper lỗi khởi động. `connected: false` nghĩa là gateway
+  đang chạy nhưng chưa có extension kết nối.
+- Trong đúng cửa sổ/profile Chrome đang dùng: mở `chrome://extensions`, bật
+  Developer mode, Load unpacked thư mục `browser-extension` của checkout này.
+  Sau khi cập nhật code, bấm Reload extension.
+- Popup hiển thị lỗi ghép nối/socket gần nhất. Connect lưu cấu hình trước khi
+  thử kết nối. Disconnect được ghi nhớ qua lần worker khởi động lại.
+- Ghép nối giới hạn 8 giây, handshake 10 giây; nếu gateway không gửi dữ liệu
+  trong hơn 45 giây, watchdog heartbeat đóng socket và reconnect theo backoff.
+  Các callback của lần kết nối cũ không được thay đổi kết nối mới.
+- Chrome 137+ đã bỏ cờ `--load-extension` trong bản Chrome chính thức:
+  https://groups.google.com/a/chromium.org/g/chromium-extensions/c/1-g8EFx2BBY

@@ -5,14 +5,15 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { randomUUID } = require('node:crypto');
 
-async function worker() {
-  const frames = [], fetches = [], timers = new Map();
+async function worker(options = {}) {
+  const frames = [], fetches = [], timers = new Map(), timeouts = new Map(), sockets = [];
+  const stored = { ...options.stored };
   let nextTimer = 0;
   const listener = { addListener() {} };
   class Socket {
     static OPEN = 1;
     static CONNECTING = 0;
-    constructor() { this.readyState = 1; }
+    constructor(url) { this.url = url; this.readyState = 1; sockets.push(this); }
     send(raw) {
       const frame = JSON.parse(raw);
       frames.push(frame);
@@ -24,7 +25,8 @@ async function worker() {
   }
   const context = vm.createContext({
     console, URL, WebSocket: Socket, crypto: { randomUUID }, AbortController,
-    setTimeout, clearTimeout,
+    setTimeout: (fn, ms) => { timeouts.set(++nextTimer, { fn, ms }); return nextTimer; },
+    clearTimeout: id => timeouts.delete(id),
     setInterval: fn => { timers.set(++nextTimer, fn); return nextTimer; },
     clearInterval: id => timers.delete(id),
     fetch: async url => {
@@ -34,14 +36,14 @@ async function worker() {
     },
     chrome: {
       action: { setBadgeText() {}, setBadgeBackgroundColor() {} },
-      storage: { local: { get: async () => ({}), set: async () => {} } },
+      storage: { local: { get: async () => ({ ...stored }), set: async value => { Object.assign(stored, value); } } },
       runtime: { onInstalled: listener, onStartup: listener, onMessage: listener },
       alarms: { onAlarm: listener, create() {} },
     },
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../browser-extension/background.js'), 'utf8'), context);
   await new Promise(resolve => setImmediate(resolve));
-  return { context, frames, fetches, timers };
+  return { context, frames, fetches, timers, timeouts, sockets, stored };
 }
 
 test('progress and large results use acknowledged WebSocket chunks exclusively', async () => {
@@ -74,4 +76,59 @@ test('unacknowledged requests are replayed with the same correlation id', async 
   await result;
   assert.equal(frames.length, 1);
   assert.equal(timers.size, 0);
+});
+
+
+test('manual disconnect persists and prevents alarm reconnect', async () => {
+  const { context, sockets, stored, timeouts } = await worker();
+  await vm.runInContext('configureConnection({action: "disconnect"})', context);
+  await vm.runInContext('connectBridge()', context);
+  assert.equal(sockets.length, 1);
+  assert.equal(stored.connectionEnabled, false);
+  assert.equal(timeouts.size, 0);
+  const restarted = await worker({ stored });
+  assert.equal(restarted.sockets.length, 0);
+});
+
+test('connect saves new configuration before pairing and clears stale callbacks', async () => {
+  const { context, sockets, fetches, timeouts } = await worker();
+  const oldOpen = sockets[0].onopen;
+  const oldClose = sockets[0].onclose;
+  await vm.runInContext('configureConnection({action: "connect", url: "ws://localhost:9876/browser/v1/ws", token: "old"})', context);
+  assert.equal(fetches.at(-1), 'http://localhost:9876/browser/pair');
+  assert.match(sockets[1].url, /^ws:\/\/localhost:9876\/browser\/v1\/ws\?token=new-token$/);
+  oldOpen();
+  oldClose();
+  assert.equal(sockets[1].readyState, 1);
+  assert.equal(timeouts.size, 1); // Only the new handshake deadline remains.
+});
+
+test('handshake timeout closes socket and schedules reconnect', async () => {
+  const { sockets, timeouts, stored } = await worker();
+  [...timeouts.values()].find(entry => entry.ms === 10000).fn();
+  assert.equal(sockets[0].readyState, 3);
+  assert.match(stored.lastConnectionError, /10 giây/);
+  assert.equal(timeouts.size, 1);
+});
+
+test('heartbeat detects an unresponsive gateway', async () => {
+  const { context, sockets, timers, stored } = await worker();
+  sockets[0].onopen();
+  vm.runInContext('lastBridgeMessageAt = Date.now() - 60000', context);
+  for (const heartbeat of timers.values()) heartbeat();
+  assert.equal(sockets[0].readyState, 3);
+  assert.match(stored.lastConnectionError, /heartbeat/);
+});
+
+test('disconnect during pairing invalidates the asynchronous attempt', async () => {
+  const { context, sockets } = await worker();
+  await vm.runInContext('configureConnection({action: "disconnect"})', context);
+  let resolvePair;
+  context.fetch = () => new Promise(resolve => { resolvePair = resolve; });
+  const connecting = vm.runInContext('configureConnection({action: "connect"})', context);
+  await new Promise(resolve => setImmediate(resolve));
+  await vm.runInContext('configureConnection({action: "disconnect"})', context);
+  resolvePair({ ok: true, json: async () => ({ token: 'late-token' }) });
+  await connecting;
+  assert.equal(sockets.length, 1);
 });

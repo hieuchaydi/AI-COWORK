@@ -206,6 +206,7 @@ class BrowserGatewayServer:
             self.token = new_token
             conn = self._active_conn
             self._active_conn = None
+            self.transport.reset_pending("Gateway stopped")
         if conn:
             conn.close()
         logger.info("Rotated pairing token to %s", mask_token(new_token))
@@ -299,10 +300,12 @@ class BrowserGatewayServer:
         with self._lock:
             prev = self._active_conn
             self._active_conn = conn
+            if prev and prev is not conn:
+                self.transport.reset_pending("Extension connection replaced")
+            self.transport.set_state(ExtensionState.CONNECTED)
         if prev and prev is not conn:
             prev.close()
 
-        self.transport.set_state(ExtensionState.CONNECTED)
         self.audit.record("client.connected", details={"extension_id": conn.extension_id})
 
         # Send greeting envelope
@@ -328,9 +331,10 @@ class BrowserGatewayServer:
             if self._active_conn is conn:
                 self._active_conn = None
                 was_active = True
+                self.transport.set_state(ExtensionState.DISCONNECTED)
+                self.transport.reset_pending("Extension disconnected")
         conn.close()
         if was_active:
-            self.transport.set_state(ExtensionState.DISCONNECTED)
             self.audit.record("client.disconnected", details={"extension_id": conn.extension_id})
             if self.on_disconnect:
                 try:

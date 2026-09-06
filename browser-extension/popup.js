@@ -39,10 +39,16 @@ function renderStatus(state, details) {
   }
 }
 
+let configLoaded = false;
+
 async function loadConfig() {
-  chrome.storage.local.get(["gatewayUrl", "pairingToken", "extensionState", "verificationInfo", "currentJob"], (res) => {
-    gatewayUrlInput.value = res.gatewayUrl || "ws://127.0.0.1:8766/browser/v1/ws";
-    pairingTokenInput.value = res.pairingToken || "";
+  chrome.storage.local.get(["gatewayUrl", "pairingToken", "extensionState", "verificationInfo", "currentJob", "lastConnectionError"], (res) => {
+    if (!configLoaded) {
+      gatewayUrlInput.value = res.gatewayUrl || "ws://127.0.0.1:8766/browser/v1/ws";
+      pairingTokenInput.value = res.pairingToken || "";
+      configLoaded = true;
+    }
+    document.getElementById("connectionError").textContent = res.lastConnectionError || "";
     renderStatus(res.extensionState, { verification: res.verificationInfo, currentJob: res.currentJob });
   });
   loadTabs();
@@ -74,35 +80,21 @@ async function loadTabs() {
   }
 }
 
-btnAutoPair.addEventListener("click", async () => {
+async function changeConnection(action) {
   try {
-    const r = await fetch("http://127.0.0.1:8766/browser/pair", { cache: "no-store" });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const data = await r.json();
-    if (data.token) {
-      pairingTokenInput.value = data.token;
-      gatewayUrlInput.value = data.wsUrl || "ws://127.0.0.1:8766/browser/v1/ws";
-      chrome.storage.local.set({
-        gatewayUrl: gatewayUrlInput.value,
-        pairingToken: data.token,
-      });
-      chrome.runtime.sendMessage({ action: "connect", url: gatewayUrlInput.value, token: data.token });
-    }
-  } catch (e) {
-    alert("Auto-pair failed: " + e.message);
+    const response = await chrome.runtime.sendMessage({
+      action, url: gatewayUrlInput.value.trim(), token: pairingTokenInput.value.trim(),
+    });
+    if (!response || !response.ok) throw new Error(response?.error || "Extension worker không phản hồi");
+    await loadConfig();
+  } catch (error) {
+    document.getElementById("connectionError").textContent = error.message;
   }
-});
+}
 
-btnConnect.addEventListener("click", () => {
-  const url = gatewayUrlInput.value.trim();
-  const token = pairingTokenInput.value.trim();
-  chrome.storage.local.set({ gatewayUrl: url, pairingToken: token });
-  chrome.runtime.sendMessage({ action: "connect", url, token });
-});
-
-btnDisconnect.addEventListener("click", () => {
-  chrome.runtime.sendMessage({ action: "disconnect" });
-});
+btnAutoPair.addEventListener("click", () => changeConnection("connect"));
+btnConnect.addEventListener("click", () => changeConnection("connect"));
+btnDisconnect.addEventListener("click", () => changeConnection("disconnect"));
 
 btnResumeVerification.addEventListener("click", () => {
   chrome.runtime.sendMessage({ action: "resumeVerification" });

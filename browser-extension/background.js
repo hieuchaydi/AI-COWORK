@@ -22,6 +22,11 @@ let bridgeConnecting = null;
 let bridgeHeartbeat = null;
 let bridgeReconnectTimeout = null;
 let reconnectAttempts = 0;
+let connectionGeneration = 0;
+let connectionEnabled = true;
+let bridgeHandshakeTimeout = null;
+let lastBridgeMessageAt = 0;
+let pairingController = null;
 let jobChain = Promise.resolve();
 let extensionState = "disconnected";
 let activeJobs = new Map();
@@ -894,28 +899,32 @@ function bridgeSend(message) {
   return true;
 }
 
+function clearReconnect() {
+  if (bridgeReconnectTimeout) clearTimeout(bridgeReconnectTimeout);
+  bridgeReconnectTimeout = null;
+}
+
 function closeBridgeSocket() {
+  if (bridgeHandshakeTimeout) clearTimeout(bridgeHandshakeTimeout);
+  bridgeHandshakeTimeout = null;
   if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
   bridgeHeartbeat = null;
   if (bridgeSocket) {
-    bridgeSocket.onclose = null;
-    try {
-      bridgeSocket.close();
-    } catch {}
+    bridgeSocket.onopen = bridgeSocket.onmessage = bridgeSocket.onerror = bridgeSocket.onclose = null;
+    try { bridgeSocket.close(); } catch {}
   }
   bridgeSocket = null;
   updateState("disconnected");
 }
 
-function scheduleBridgeReconnect() {
-  if (bridgeReconnectTimeout) return;
-  reconnectAttempts++;
-  // Exponential backoff with random jitter (1s, 1.5s, 2.25s ... capped at 30s)
-  const baseDelay = Math.min(30000, 1000 * Math.pow(1.5, Math.min(reconnectAttempts, 8)));
-  const jitter = Math.floor(Math.random() * 1000);
-  const delay = baseDelay + jitter;
+function connectionError(message) {
+  chrome.storage.local.set({ lastConnectionError: message });
+}
 
-  console.log(`[bridge] Scheduling reconnect in ${(delay / 1000).toFixed(1)}s (attempt ${reconnectAttempts})`);
+function scheduleBridgeReconnect() {
+  if (!connectionEnabled || bridgeReconnectTimeout) return;
+  reconnectAttempts++;
+  const delay = Math.min(30000, 1000 * Math.pow(1.5, Math.min(reconnectAttempts, 8))) + Math.floor(Math.random() * 1000);
   bridgeReconnectTimeout = setTimeout(() => {
     bridgeReconnectTimeout = null;
     connectBridge();
@@ -923,93 +932,120 @@ function scheduleBridgeReconnect() {
 }
 
 async function connectBridge() {
-  if (bridgeSocket && (bridgeSocket.readyState === WebSocket.OPEN || bridgeSocket.readyState === WebSocket.CONNECTING)) {
-    return;
-  }
+  if (!connectionEnabled) return;
+  if (bridgeSocket && (bridgeSocket.readyState === WebSocket.OPEN || bridgeSocket.readyState === WebSocket.CONNECTING)) return;
   if (bridgeConnecting) return bridgeConnecting;
-
-  bridgeConnecting = (async () => {
+  const generation = connectionGeneration;
+  const current = () => generation === connectionGeneration && connectionEnabled;
+  const attempt = (async () => {
     try {
-      let stored = await chrome.storage.local.get(["gatewayUrl", "pairingToken"]);
-      let token = stored.pairingToken;
-      let wsUrl = stored.gatewayUrl;
-
-      // The local gateway rotates its token on restart. Refresh the default
-      // gateway pairing on reconnect instead of retrying a stale stored token.
-      const localGateway = !wsUrl || [
-        "ws://127.0.0.1:8766/browser/v1/ws",
-        "ws://127.0.0.1:8767/browser-extension",
-      ].includes(wsUrl);
-      if (!token || localGateway) {
-        const pairResponse = await fetch(`${HELPER}/browser/pair`, { cache: "no-store" });
-        if (!pairResponse.ok) throw new Error(`pair HTTP ${pairResponse.status}`);
-        const pair = await pairResponse.json();
-        token = pair.token;
-        wsUrl = pair.wsUrl || `${HELPER.replace("http", "ws")}/browser/v1/ws`;
-        await chrome.storage.local.set({ gatewayUrl: wsUrl, pairingToken: token });
+      const stored = await chrome.storage.local.get(["gatewayUrl", "pairingToken", "connectionEnabled"]);
+      if (!current()) return;
+      if (stored.connectionEnabled === false) {
+        connectionEnabled = false;
+        closeBridgeSocket();
+        return;
       }
-
-      if (!wsUrl) wsUrl = "ws://127.0.0.1:8766/browser/v1/ws";
-      const fullUrl = `${wsUrl}${wsUrl.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`;
-
-      const socket = new WebSocket(fullUrl);
+      let token = stored.pairingToken;
+      let wsUrl = stored.gatewayUrl || "ws://127.0.0.1:8766/browser/v1/ws";
+      const target = new URL(wsUrl);
+      if (!['ws:', 'wss:'].includes(target.protocol) ||
+          !['127.0.0.1', 'localhost', '[::1]'].includes(target.hostname) || target.username || target.password) {
+        throw new Error("Gateway phải là địa chỉ WebSocket localhost hợp lệ");
+      }
+      // Refresh the process-local token on every reconnect, including custom helper ports.
+      const pairUrl = new URL(target.toString());
+      pairUrl.protocol = target.protocol === 'wss:' ? 'https:' : 'http:';
+      if (pairUrl.port === '8767') pairUrl.port = '8766';
+      pairUrl.pathname = '/browser/pair';
+      pairUrl.search = pairUrl.hash = '';
+      const controller = new AbortController();
+      pairingController = controller;
+      const timeout = setTimeout(() => controller.abort(), 8000);
+      try {
+        const response = await fetch(pairUrl.toString(), { cache: "no-store", signal: controller.signal });
+        if (!response.ok) throw new Error(`Ghép nối bị từ chối (HTTP ${response.status})`);
+        const pair = await response.json();
+        if (typeof pair.token !== 'string' || !pair.token) throw new Error("Gateway không trả pairing token");
+        token = pair.token;
+      } finally {
+        clearTimeout(timeout);
+        if (pairingController === controller) pairingController = null;
+      }
+      if (!current()) return;
+      await chrome.storage.local.set({ gatewayUrl: wsUrl, pairingToken: token });
+      if (!current()) return;
+      target.searchParams.set('token', token);
+      const socket = new WebSocket(target.toString());
       bridgeSocket = socket;
-
-      socket.onopen = () => {
-        console.log("[bridge] WebSocket connected to", wsUrl);
-        reconnectAttempts = 0;
-        for (const pending of pendingIngestRequests.values()) bridgeSend(pending.message);
-        updateState("connected");
-
-        // Authenticate envelope
-        bridgeSend({
-          v: 1,
-          type: "authenticate",
-          id: "auth-" + Date.now(),
-          auth: { token },
-        });
-
-        // 20s Heartbeat keeps MV3 worker active
-        if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
-        bridgeHeartbeat = setInterval(() => {
-          bridgeSend({
-            v: 1,
-            type: "ping",
-            id: "ping-" + Date.now(),
-            params: { at: Date.now() },
-          });
-        }, 20000);
-      };
-
-      socket.onmessage = (event) => {
-        let envelope;
-        try {
-          envelope = JSON.parse(event.data);
-        } catch {
-          return;
-        }
-        dispatchEnvelope(envelope);
-      };
-
-      socket.onerror = (err) => {
-        console.warn("[bridge] WebSocket error:", err);
-      };
-
-      socket.onclose = () => {
-        console.log("[bridge] WebSocket disconnected");
-        if (bridgeSocket === socket) closeBridgeSocket();
+      const ownsSocket = () => current() && bridgeSocket === socket;
+      const fail = message => {
+        if (!ownsSocket()) return;
+        connectionError(message);
+        closeBridgeSocket();
         scheduleBridgeReconnect();
       };
+      bridgeHandshakeTimeout = setTimeout(() => fail("Gateway không hoàn tất kết nối trong 10 giây"), 10000);
+      socket.onopen = () => {
+        if (!ownsSocket()) return;
+        clearTimeout(bridgeHandshakeTimeout);
+        bridgeHandshakeTimeout = null;
+        clearReconnect();
+        reconnectAttempts = 0;
+        lastBridgeMessageAt = Date.now();
+        connectionError("");
+        updateState(verificationInfo ? "awaiting_user_verification" : activeJobs.size ? "busy" : "connected", verificationInfo);
+        for (const pending of pendingIngestRequests.values()) bridgeSend(pending.message);
+        if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
+        bridgeHeartbeat = setInterval(() => {
+          if (!ownsSocket()) return;
+          if (Date.now() - lastBridgeMessageAt > 45000) {
+            fail("Gateway không phản hồi heartbeat; đang kết nối lại");
+            return;
+          }
+          bridgeSend({ v: 1, type: "ping", id: "ping-" + Date.now(), params: { at: Date.now() } });
+        }, 20000);
+      };
+      socket.onmessage = event => {
+        if (!ownsSocket()) return;
+        lastBridgeMessageAt = Date.now();
+        let envelope;
+        try { envelope = JSON.parse(event.data); } catch { return; }
+        Promise.resolve(dispatchEnvelope(envelope)).catch(error => console.warn("[bridge] dispatch failed:", error.message));
+      };
+      socket.onerror = () => fail("Không kết nối được WebSocket. Kiểm tra launcher, URL và quyền extension");
+      socket.onclose = () => fail("Kết nối gateway đã đóng; đang kết nối lại");
     } catch (error) {
-      console.warn("[bridge] WebSocket unavailable, reconnecting:", error.message);
+      if (!current()) return;
+      connectionError(error.name === 'AbortError' ? "Gateway không phản hồi ghép nối trong 8 giây" : `Không kết nối được gateway: ${error.message}`);
       closeBridgeSocket();
       scheduleBridgeReconnect();
     }
-  })().finally(() => {
-    bridgeConnecting = null;
-  });
+  })();
+  bridgeConnecting = attempt;
+  try { await attempt; } finally {
+    if (bridgeConnecting === attempt) bridgeConnecting = null;
+  }
+}
 
-  return bridgeConnecting;
+async function configureConnection(message) {
+  connectionGeneration++;
+  connectionEnabled = false;
+  clearReconnect();
+  if (pairingController) pairingController.abort();
+  closeBridgeSocket();
+  bridgeConnecting = null;
+  const enabled = message.action === "connect";
+  const config = { connectionEnabled: enabled };
+  if (enabled) {
+    if (typeof message.url === "string") config.gatewayUrl = message.url.trim();
+    if (typeof message.token === "string") config.pairingToken = message.token.trim();
+  }
+  const generation = connectionGeneration;
+  await chrome.storage.local.set(config);
+  if (generation !== connectionGeneration) return;
+  connectionEnabled = enabled;
+  if (enabled) await connectBridge();
 }
 
 // ── WebSocket Job Delivery ─────────────────────────────────────────────────
@@ -1035,19 +1071,17 @@ chrome.runtime.onStartup.addListener(connectBridge);
 chrome.alarms.onAlarm.addListener(connectBridge);
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.action === "connect") {
-    closeBridgeSocket();
-    connectBridge();
-    sendResponse({ ok: true });
-  } else if (msg.action === "disconnect") {
-    closeBridgeSocket();
-    sendResponse({ ok: true });
-  } else if (msg.action === "resumeVerification") {
+  if (msg.action === "connect" || msg.action === "disconnect") {
+    configureConnection(msg).then(() => sendResponse({ ok: true }), error => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+  if (msg.action === "resumeVerification") {
     resumeVerification();
     sendResponse({ ok: true });
   }
-  return true;
+  return false;
 });
 
-// Auto-start
+// Recreate the watchdog alarm when an MV3 worker starts after browser restart.
+chrome.alarms.create("bridge_heartbeat_alarm", { periodInMinutes: 1 });
 connectBridge();

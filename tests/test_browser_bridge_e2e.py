@@ -560,3 +560,52 @@ def test_e2e_ingest_progress_chunks_and_result_over_websocket(gateway_server, mo
     finally:
         client.close()
         rpc.executor.shutdown(wait=True)
+
+
+def test_helper_http_websocket_upgrade_and_reconnect(monkeypatch):
+    import launch
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    gateway = BrowserGatewayServer(token="helper-test-token")
+    monkeypatch.setattr(launch, "_BROWSER_WS", gateway)
+    helper = ThreadingHTTPServer(("127.0.0.1", 0), launch._HelperHandler)
+    thread = threading.Thread(target=helper.serve_forever, daemon=True)
+    thread.start()
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{helper.server_port}/browser/pair",
+            headers={"Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"},
+        )
+        with urllib.request.urlopen(request, timeout=3) as response:
+            pairing = json.load(response)
+        for _ in range(3):
+            client = SimpleWebSocketTestClient("127.0.0.1", helper.server_port)
+            try:
+                assert client.connect(token=pairing["token"]) == 101
+                assert client.recv_json()["type"] == "hello"
+                client.send_json({"v": 1, "type": "ping", "id": "heartbeat"})
+                assert client.recv_json()["type"] == "pong"
+            finally:
+                client.close()
+    finally:
+        gateway.stop()
+        helper.shutdown()
+        helper.server_close()
+        thread.join(timeout=2)
+
+
+def test_socket_disconnect_releases_pending_command(gateway_server):
+    server, port, token = gateway_server
+    client = SimpleWebSocketTestClient("127.0.0.1", port)
+    assert client.connect(token=token) == 101
+    assert client.recv_json()["type"] == "hello"
+    results = []
+    thread = threading.Thread(target=lambda: results.append(server.transport.execute_command("tab.list", deadline_ms=30000)))
+    thread.start()
+    assert client.recv_json()["type"] == "command"
+    client.close()
+    thread.join(timeout=2)
+    assert not thread.is_alive(), "Socket loss must release the caller immediately"
+    assert not results[0][0]
+    assert "disconnected" in results[0][2].message.lower()

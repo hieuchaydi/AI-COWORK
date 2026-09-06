@@ -2178,11 +2178,9 @@ def _start_helper() -> ThreadingHTTPServer | None:
     return srv
 
 
-# ── Chrome Extension Auto-Launch ──────────────────────────────────────────────
-# Tự mở Chrome với profile riêng đã load sẵn browser-extension/.
-# Profile nằm tại <root>/chrome-profile/ — tách biệt hoàn toàn với Chrome cá nhân
-# của user. Extension persist trong profile này, không cần cài lại mỗi lần.
-# User chỉ cần đăng nhập Shopee 1 lần trong profile này.
+# ── Chrome Extension Setup ───────────────────────────────────────────────────
+# Official Chrome 137+ ignores --load-extension. Load unpacked once in the
+# dedicated profile; subsequent launches reuse the installed extension.
 
 def _find_chrome() -> str | None:
     """Tìm chrome.exe theo priority list. Trả None nếu không tìm thấy."""
@@ -2220,17 +2218,27 @@ def _find_chrome() -> str | None:
 _chrome_proc: subprocess.Popen | None = None  # giữ reference để cleanup
 
 
+def _profile_has_browser_extension(profile_dir: Path) -> bool:
+    """Check only extension registration, without reading browser history/cookies."""
+    expected = (ROOT / "browser-extension").resolve()
+    for filename in ("Preferences", "Secure Preferences"):
+        try:
+            data = json.loads((profile_dir / "Default" / filename).read_text(encoding="utf-8"))
+            settings = data.get("extensions", {}).get("settings", {})
+            for extension in settings.values():
+                path = extension.get("path")
+                if path and Path(path).resolve() == expected:
+                    return True
+        except (OSError, ValueError, TypeError):
+            continue
+    return False
+
+
 def _ensure_chrome_with_extension() -> bool:
-    """Mở Chrome với profile riêng đã load sẵn browser-extension/.
+    """Open the persistent Chrome profile and offer one-time unpacked setup.
 
-    - Profile tại <root>/chrome-profile/ (persist qua restart)
-    - Extension được load mỗi lần Chrome mở (--load-extension flag)
-    - Nếu Chrome đã đang chạy với profile này thì skip
-    - Trả True nếu launch thành công, False nếu không tìm được Chrome
-
-    Note: extension KHÔNG bền vững kiểu "installed" — nó được load qua flag.
-    Chrome sẽ hỏi "disable developer mode extensions?" → user bấm Cancel/Keep.
-    Đây là trade-off: không cần user cài thủ công, nhưng có popup 1 lần.
+    A successful process launch does not imply that the extension connected;
+    /browser/status is the authority for connectivity.
     """
     global _chrome_proc
 
@@ -2251,15 +2259,17 @@ def _ensure_chrome_with_extension() -> bool:
     # Trang mặc định khi mở: ingest help page — giải thích cho user biết Chrome này dùng để gì
     start_url = f"http://127.0.0.1:{HELPER_PORT}/ingest"
 
+    installed = _profile_has_browser_extension(profile_dir)
     args = [
         chrome_exe,
         f"--user-data-dir={profile_dir}",
-        f"--load-extension={ext_dir}",
         "--no-first-run",               # bỏ qua wizard chào mừng của Chrome
         "--no-default-browser-check",   # không hỏi đặt làm trình duyệt mặc định
         "--disable-background-networking",  # giảm network noise
         start_url,
     ]
+    if not installed:
+        args.append("chrome://extensions/")
 
     try:
         _chrome_proc = subprocess.Popen(
@@ -2269,9 +2279,13 @@ def _ensure_chrome_with_extension() -> bool:
             # Không kế thừa console của launcher để Chrome không bị kill khi Ctrl+C
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
         )
-        print(f"[launch] Chrome launched (pid={_chrome_proc.pid}) with AI cowork extension.")
+        print(f"[launch] Chrome launched (pid={_chrome_proc.pid}); waiting for extension connection.")
         print(f"[launch]   Profile: {profile_dir}")
         print(f"[launch]   Extension: {ext_dir}")
+        if not installed:
+            print("[launch]   Chrome 137+ requires one-time Load unpacked setup.")
+            print("[launch]   In chrome://extensions: enable Developer mode, click Load unpacked,")
+            print(f"[launch]   then select: {ext_dir}")
         print(f"[launch]   Tip: đăng nhập Shopee trong cửa sổ Chrome này để crawl hoạt động.")
         return True
     except OSError as e:
@@ -2950,8 +2964,7 @@ def main() -> None:
     # Tiny helper HTTP: Google/connectors wizards + outputs/artifacts serving.
     _start_helper()
 
-    # Auto-launch Chrome with the browser-extension pre-loaded.
-    # This lets the Shopee ingest pipeline work without manual extension install.
+    # Open Chrome and guide one-time unpacked extension installation if needed.
     # Chrome opens a separate profile so it doesn't interfere with the user's
     # personal Chrome session. User only needs to log into Shopee once per profile.
     _ensure_chrome_with_extension()

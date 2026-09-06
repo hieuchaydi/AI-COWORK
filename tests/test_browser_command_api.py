@@ -85,3 +85,26 @@ def test_acknowledged_ingest_job_replays_until_result_saved(monkeypatch, tmp_pat
     bridge.reset_mock()
     launch._on_browser_ws_connect()
     bridge.send.assert_not_called()
+
+
+def test_chrome_launcher_guides_unpacked_setup_instead_of_unsupported_flag(monkeypatch, tmp_path):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    monkeypatch.setattr(launch, "_chrome_proc", None)
+    monkeypatch.setattr(launch, "_find_chrome", lambda: "chrome.exe")
+    popen = Mock()
+    monkeypatch.setattr(launch.subprocess, "Popen", popen)
+    assert launch._ensure_chrome_with_extension()
+    args = popen.call_args.args[0]
+    assert "chrome://extensions/" in args
+    assert not any(arg.startswith("--load-extension") for arg in args)
+
+
+def test_registered_extension_does_not_repeat_setup(monkeypatch, tmp_path):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    profile = tmp_path / "chrome-profile"
+    default = profile / "Default"
+    default.mkdir(parents=True)
+    (default / "Secure Preferences").write_text(json.dumps({"extensions": {"settings": {
+        "example": {"path": str(tmp_path / "browser-extension")}
+    }}}), encoding="utf-8")
+    assert launch._profile_has_browser_extension(profile)
