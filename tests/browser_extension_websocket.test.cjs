@@ -9,6 +9,7 @@ async function worker(options = {}) {
   const frames = [], fetches = [], timers = new Map(), timeouts = new Map(), sockets = [];
   const stored = { ...options.stored };
   let nextTimer = 0;
+  let messageListener = null;
   const listener = { addListener() {} };
   class Socket {
     static OPEN = 1;
@@ -37,14 +38,28 @@ async function worker(options = {}) {
     },
     chrome: {
       action: { setBadgeText() {}, setBadgeBackgroundColor() {} },
-      storage: { local: { get: async () => ({ ...stored }), set: async value => { Object.assign(stored, value); } } },
-      runtime: { onInstalled: listener, onStartup: listener, onMessage: listener },
+      storage: { local: {
+        get: (keys, callback) => {
+          const result = { ...stored };
+          if (typeof callback === 'function') {
+            callback(result);
+            return;
+          }
+          return Promise.resolve(result);
+        },
+        set: async value => { Object.assign(stored, value); },
+      } },
+      runtime: {
+        onInstalled: listener,
+        onStartup: listener,
+        onMessage: { addListener: fn => { messageListener = fn; } },
+      },
       alarms: { onAlarm: listener, create() {} },
     },
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../browser-extension/background.js'), 'utf8'), context);
   await new Promise(resolve => setImmediate(resolve));
-  return { context, frames, fetches, timers, timeouts, sockets, stored };
+  return { context, frames, fetches, timers, timeouts, sockets, stored, getMessageListener: () => messageListener };
 }
 
 test('progress and large results use acknowledged WebSocket chunks exclusively', async () => {
@@ -72,6 +87,24 @@ test('active job replays still receive an accepted ACK without starting twice', 
   vm.runInContext('activeJobs.set("active-job", {id: "active-job"}); enqueueLegacyJob({id: "active-job"});', context);
   assert.equal(frames.filter(frame => frame.type === 'accepted' && frame.id === 'active-job').length, 1);
   assert.equal(vm.runInContext('activeJobs.size', context), 1);
+});
+
+test('getStatus reports the live service-worker socket instead of stale storage', async () => {
+  const { context, sockets, stored, getMessageListener } = await worker({ stored: {
+    extensionState: 'disconnected',
+    lastConnectionError: 'stale error',
+  } });
+  sockets[0].onopen();
+  stored.extensionState = 'disconnected';
+  stored.lastConnectionError = 'stale error';
+  let response;
+  const listener = getMessageListener();
+  assert.equal(listener({ action: 'getStatus' }, {}, value => { response = value; }), true);
+  assert.equal(response.ok, true);
+  assert.equal(response.connected, true);
+  assert.equal(response.extensionState, 'connected');
+  assert.equal(response.lastConnectionError, 'stale error');
+  assert.equal(stored.extensionState, 'disconnected');
 });
 
 test('unacknowledged requests are replayed with the same correlation id', async () => {

@@ -1806,6 +1806,30 @@ chrome.runtime.onStartup.addListener(connectBridge);
 chrome.alarms.onAlarm.addListener(connectBridge);
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.action === "getStatus") {
+    chrome.storage.local.get([
+      "gatewayUrl",
+      "lastConnectionError",
+    ], (stored) => {
+      const socketConnected = Boolean(
+        bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN,
+      );
+      sendResponse({
+        ok: true,
+        extensionState,
+        connected: socketConnected,
+        socketReadyState: bridgeSocket ? bridgeSocket.readyState : WebSocket.CLOSED,
+        socketUrl: bridgeSocket?.url || null,
+        gatewayUrl: stored.gatewayUrl || null,
+        lastConnectionError: stored.lastConnectionError || "",
+        verificationInfo,
+        currentJob: activeJobs.size > 0 ? Array.from(activeJobs.values())[0] : null,
+        reconnectAttempts,
+        lastBridgeMessageAt,
+      });
+    });
+    return true;
+  }
   if (msg.action === "connect" || msg.action === "disconnect") {
     configureConnection(msg).then(() => sendResponse({ ok: true }), error => sendResponse({ ok: false, error: error.message }));
     return true;

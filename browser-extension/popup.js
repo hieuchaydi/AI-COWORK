@@ -17,6 +17,43 @@ const tabList = document.getElementById("tabList");
 
 let currentVerification = null;
 
+function storageGet(keys) {
+  return new Promise((resolve) => chrome.storage.local.get(keys, resolve));
+}
+
+function runtimeStatus() {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ action: "getStatus" }, (response) => {
+      // An older service worker may not know this diagnostic action yet.
+      if (chrome.runtime.lastError || !response) {
+        resolve(null);
+        return;
+      }
+      resolve(response);
+    });
+  });
+}
+
+function gatewayStatusUrl(wsUrl) {
+  const target = new URL(wsUrl || "ws://127.0.0.1:8766/browser/v1/ws");
+  target.protocol = target.protocol === "wss:" ? "https:" : "http:";
+  if (target.port === "8767") target.port = "8766";
+  target.pathname = "/browser/status";
+  target.search = "";
+  target.hash = "";
+  return target.toString();
+}
+
+async function readGatewayStatus(wsUrl) {
+  try {
+    const response = await fetch(gatewayStatusUrl(wsUrl), { cache: "no-store" });
+    if (!response.ok) return { connected: false, error: `HTTP ${response.status}` };
+    return await response.json();
+  } catch (error) {
+    return { connected: false, error: error.message };
+  }
+}
+
 function renderStatus(state, details) {
   const connectionError = document.getElementById("connectionError");
   if (connectionError && (state === "connected" || state === "busy")) {
@@ -119,15 +156,34 @@ function renderStatus(state, details) {
 let configLoaded = false;
 
 async function loadConfig() {
-  chrome.storage.local.get(["gatewayUrl", "pairingToken", "extensionState", "verificationInfo", "currentJob", "lastConnectionError"], (res) => {
-    if (!configLoaded) {
-      gatewayUrlInput.value = res.gatewayUrl || "ws://127.0.0.1:8766/browser/v1/ws";
-      pairingTokenInput.value = res.pairingToken || "";
-      configLoaded = true;
-    }
-    document.getElementById("connectionError").textContent = res.lastConnectionError || "";
-    renderStatus(res.extensionState, { verification: res.verificationInfo, currentJob: res.currentJob });
-  });
+  const res = await storageGet([
+    "gatewayUrl",
+    "pairingToken",
+    "extensionState",
+    "verificationInfo",
+    "currentJob",
+    "lastConnectionError",
+  ]);
+  const runtime = await runtimeStatus();
+  const gateway = await readGatewayStatus(res.gatewayUrl);
+  if (!configLoaded) {
+    gatewayUrlInput.value = res.gatewayUrl || "ws://127.0.0.1:8766/browser/v1/ws";
+    pairingTokenInput.value = res.pairingToken || "";
+    configLoaded = true;
+  }
+
+  const state = runtime?.extensionState || res.extensionState;
+  const verification = runtime?.verificationInfo ?? res.verificationInfo;
+  const currentJob = runtime?.currentJob ?? res.currentJob;
+  const connectionError = document.getElementById("connectionError");
+  if (runtime && !runtime.connected && gateway.connected) {
+    connectionError.textContent = "Gateway đang có client khác kết nối; hãy tắt bản extension/profile trùng rồi bấm Connect.";
+  } else if (runtime && runtime.connected && !gateway.connected) {
+    connectionError.textContent = "Extension đã mở socket nhưng gateway chưa nhận trạng thái connected.";
+  } else {
+    connectionError.textContent = runtime?.lastConnectionError || res.lastConnectionError || "";
+  }
+  renderStatus(state, { verification, currentJob });
   loadTabs();
 }
 
