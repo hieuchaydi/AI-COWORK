@@ -237,3 +237,94 @@ test('traceJob emits progress trace envelope to bridge with sanitized error', as
   assert.ok(!lastProgress.trace.error.includes('<b>'));
 });
 
+test('validates Shopee hostname and rejects foreign origins', async () => {
+  const { context } = await worker();
+  assert.equal(vm.runInContext('isShopeeHostname("shopee.vn")', context), true);
+  assert.equal(vm.runInContext('isShopeeHostname("mall.shopee.vn")', context), true);
+  assert.equal(vm.runInContext('isShopeeHostname("shopee.vn.evil.com")', context), false);
+  assert.equal(vm.runInContext('isShopeeHostname("google.com")', context), false);
+
+  assert.equal(vm.runInContext('isValidShopeeUrl("https://shopee.vn/product/123/456")', context), true);
+  assert.equal(vm.runInContext('isValidShopeeUrl("https://attacker.com/shopee.vn/product/123/456")', context), false);
+});
+
+test('evaluates preflight login detection and status reporting', async () => {
+  const { context } = await worker();
+  // 1. Logged in case
+  const okEval = vm.runInContext(`
+    evaluatePreflightResult({
+      ok: true,
+      status: 200,
+      url: "https://shopee.vn/api/v2/item/get_ratings",
+      json: { data: { ratings: [] } },
+    })
+  `, context);
+  assert.equal(okEval.isLogin, true);
+  assert.equal(okEval.status, 200);
+  assert.equal(okEval.error, null);
+
+  // 2. Error 90309999 login required case
+  const loginErrEval = vm.runInContext(`
+    evaluatePreflightResult({
+      ok: true,
+      status: 200,
+      url: "https://shopee.vn/api/v2/item/get_ratings",
+      json: { error: 90309999, is_login: false },
+    })
+  `, context);
+  assert.equal(loginErrEval.isLogin, false);
+  assert.match(loginErrEval.error, /login required/i);
+
+  // 3. HTTP 401 login required case
+  const unauthEval = vm.runInContext(`
+    evaluatePreflightResult({
+      ok: false,
+      status: 401,
+      url: "https://shopee.vn/api/v2/item/get_ratings",
+      json: null,
+    })
+  `, context);
+  assert.equal(unauthEval.isLogin, false);
+  assert.match(unauthEval.error, /login required/i);
+});
+
+test('extractShopeeReviews halts with login_required before crawl when preflight fails login', async () => {
+  const { context } = await worker();
+  vm.runInContext(`
+    chrome.tabs = {
+      query: async () => [{ id: 10, url: "https://shopee.vn/product/111/222" }],
+      create: async () => ({ id: 10, url: "https://shopee.vn/product/111/222" }),
+      get: async () => ({ id: 10, url: "https://shopee.vn/product/111/222" }),
+      onUpdated: { addListener() {}, removeListener() {} },
+    };
+    chrome.scripting = {
+      executeScript: async () => {
+        return [{
+          result: {
+            ok: true,
+            status: 200,
+            url: "https://shopee.vn/api/v2/item/get_ratings",
+            json: { error: 90309999, is_login: false },
+            textSample: '{"error":90309999,"is_login":false}',
+          }
+        }];
+      }
+    };
+  `, context);
+
+  await assert.rejects(async () => {
+    await vm.runInContext(`
+      extractShopeeReviews({
+        id: "job-preflight-fail",
+        url: "https://shopee.vn/product/111/222",
+        itemid: "222",
+      }, () => {})
+    `, context);
+  }, (err) => {
+    assert.equal(err.failureKind, 'login');
+    assert.match(err.message, /login required/i);
+    return true;
+  });
+});
+
+

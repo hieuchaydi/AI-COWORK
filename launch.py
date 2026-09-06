@@ -222,6 +222,9 @@ def _record_shopee_trace(entry: dict) -> dict:
         "responseUrl": _sanitize_trace_url(entry.get("responseUrl")),
         "elapsedMs": int(entry["elapsedMs"]) if isinstance(entry.get("elapsedMs"), (int, float)) else None,
         "error": _sanitize_trace_error(entry.get("error")),
+        "is_login": bool(entry["is_login"]) if isinstance(entry.get("is_login"), bool) else (
+            bool(entry["isLogin"]) if isinstance(entry.get("isLogin"), bool) else None
+        ),
         "at": str(entry.get("at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
     }
 

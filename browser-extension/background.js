@@ -134,6 +134,10 @@ function buildTraceEntry(job, event, details = {}) {
     ? details.httpStatus
     : (typeof details.status === "number" ? details.status : null);
 
+  const isLogin = typeof details.isLogin === "boolean"
+    ? details.isLogin
+    : (typeof details.is_login === "boolean" ? details.is_login : null);
+
   const entry = {
     jobId: job?.id || details.jobId || null,
     itemid: itemid !== null && itemid !== undefined ? String(itemid) : null,
@@ -149,6 +153,7 @@ function buildTraceEntry(job, event, details = {}) {
     responseUrl: sanitizeUrlForTrace(details.responseUrl ?? null),
     elapsedMs: typeof details.elapsedMs === "number" ? details.elapsedMs : null,
     error: details.error ? sanitizeErrorForTrace(details.error) : null,
+    is_login: isLogin,
     at: new Date().toISOString(),
   };
 
@@ -239,6 +244,22 @@ function crawlPercent(rows, total, base, span) {
   return Math.min(95, base + Math.floor((rows / MAX_REVIEWS) * span));
 }
 
+function isShopeeHostname(hostname) {
+  if (!hostname || typeof hostname !== "string") return false;
+  const h = hostname.toLowerCase();
+  return h === "shopee.vn" || h.endsWith(".shopee.vn");
+}
+
+function isValidShopeeUrl(urlStr) {
+  if (!urlStr || typeof urlStr !== "string") return false;
+  try {
+    const u = new URL(urlStr, "https://shopee.vn");
+    return (u.protocol === "http:" || u.protocol === "https:") && isShopeeHostname(u.hostname);
+  } catch {
+    return false;
+  }
+}
+
 function extractShopName(url) {
   try {
     const u = new URL(url, "https://shopee.vn");
@@ -273,9 +294,12 @@ function idsFrom(url) {
 }
 
 async function findOrOpenShopeeTab(targetUrl, itemid) {
+  if (!isValidShopeeUrl(targetUrl)) {
+    throw new Error(`Target URL không thuộc hostname shopee.vn: ${targetUrl}`);
+  }
   const tabs = await chrome.tabs.query({});
-  // 1. Prefer a tab already displaying this item
-  let tab = tabs.find((t) => t.url && itemid && t.url.includes(itemid));
+  // 1. Prefer a tab already displaying this item on shopee.vn
+  let tab = tabs.find((t) => t.url && isValidShopeeUrl(t.url) && itemid && t.url.includes(String(itemid)));
   // 2. Or create a new tab if none exists with this item
   if (!tab) {
     tab = await chrome.tabs.create({ url: targetUrl, active: false });
@@ -302,6 +326,25 @@ async function findOrOpenShopeeTab(targetUrl, itemid) {
       if (updated) tab = updated;
     } catch {}
   }
+
+  if (!tab || !tab.id || !tab.url) {
+    throw new Error("Không thể tìm hoặc mở tab Shopee trên trình duyệt");
+  }
+
+  try {
+    const tabHost = new URL(tab.url).hostname;
+    if (!isShopeeHostname(tabHost)) {
+      throw new Error(`Tab không thuộc hostname shopee.vn (hostname: ${tabHost})`);
+    }
+  } catch (err) {
+    throw new Error(`Tab URL không hợp lệ: ${tab.url} (${err.message})`);
+  }
+
+  const tabIds = idsFrom(tab.url);
+  if (tabIds.itemid && String(tabIds.itemid) !== String(itemid)) {
+    throw new Error(`Tab URL trỏ đến itemid khác (${tabIds.itemid}) so với itemid cần crawl (${itemid})`);
+  }
+
   return tab;
 }
 
@@ -314,14 +357,6 @@ async function resolveShopId(itemid, originalUrl, tab, progress) {
   if (progress) await progress({ stage: "resolve-shop", message: "Đang tìm shopid", itemid, percent: 10 });
 
   const shopname = extractShopName(originalUrl);
-
-  function scrape(text) {
-    if (!text || typeof text !== "string") return null;
-    const m = text.match(/"shopid"\s*:\s*"?(\d+)/i) ||
-              text.match(/"shop_id"\s*:\s*"?(\d+)/i) ||
-              text.match(/"shopId"\s*:\s*"?(\d+)/);
-    return m ? m[1] : null;
-  }
 
   function extractShopIdFromUrl(urlStr) {
     if (!urlStr || typeof urlStr !== "string") return null;
@@ -341,7 +376,7 @@ async function resolveShopId(itemid, originalUrl, tab, progress) {
     if (sid) return sid;
   }
 
-  // 2. Scrape from DOM / canonical / same-origin in tab context (highest fidelity with user session)
+  // 2. Scrape from DOM / canonical / same-origin in tab context (chỉ trong tab, KHÔNG dùng background fetch)
   if (tab && tab.id) {
     try {
       const res = await chrome.scripting.executeScript({
@@ -409,35 +444,7 @@ async function resolveShopId(itemid, originalUrl, tab, progress) {
   const fromOrig = extractShopIdFromUrl(originalUrl);
   if (fromOrig) return fromOrig;
 
-  // 4. Fallback: Background fetch original URL
-  try {
-    const r = await fetch(originalUrl, {
-      credentials: "include",
-      headers: { "User-Agent": navigator.userAgent },
-    });
-    if (r.ok) {
-      const s = scrape(await r.text());
-      if (s) return s;
-      const fromRedir = extractShopIdFromUrl(r.url);
-      if (fromRedir) return fromRedir;
-    }
-  } catch {}
-
-  // 5. Fallback: Background fetch shop detail by vanity shopname
-  if (shopname) {
-    try {
-      const r = await fetch(`https://shopee.vn/api/v4/shop/get_shop_detail?username=${encodeURIComponent(shopname)}`, {
-        credentials: "include",
-        headers: { "User-Agent": navigator.userAgent, "Accept": "application/json" },
-      });
-      if (r.ok) {
-        const j = await r.json();
-        const sid = j?.data?.shopid || j?.data?.shop_id;
-        if (sid) return String(sid);
-      }
-    } catch {}
-  }
-
+  // TUYỆT ĐỐI KHÔNG dùng background fetch thay cho request trong tab (đã gỡ bỏ fallback background fetch)
   return null;
 }
 
@@ -512,14 +519,87 @@ function formatShopeeFailure(fetchRes) {
   return `Shopee reviews API access denied (HTTP ${status}) — không thấy CAPTCHA trên tab; endpoint=${endpoint}; tab=${page}; response=${sample || "empty"}`;
 }
 
+async function preflightRatingsInTab(tabId, itemid, shopid, referer) {
+  const res = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: async (iid, sid, ref) => {
+      const path = `/api/v2/item/get_ratings?filter=0&flag=1&itemid=${iid}&limit=1&offset=0&shopid=${sid}&type=0`;
+      try {
+        const resp = await fetch(path, {
+          credentials: "include",
+          headers: {
+            "Accept": "application/json, text/plain, */*",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-Api-Source": "pc",
+            "X-Shopee-Language": "vi",
+          },
+          referrer: ref,
+          referrerPolicy: "strict-origin-when-cross-origin",
+        });
+        const text = await resp.text();
+        let json = null;
+        try { json = JSON.parse(text); } catch {}
+        return {
+          ok: resp.ok,
+          status: resp.status,
+          url: resp.url,
+          pageUrl: location.href,
+          json,
+          textSample: text.slice(0, 300),
+        };
+      } catch (err) {
+        return { ok: false, error: err.message, pageUrl: location.href };
+      }
+    },
+    args: [itemid, shopid, referer],
+  });
+  return res[0]?.result || { ok: false, error: "executeScript returned no result" };
+}
+
+function evaluatePreflightResult(fetchRes) {
+  const status = typeof fetchRes?.status === "number" ? fetchRes.status : (fetchRes?.ok ? 200 : null);
+  const json = fetchRes?.json || {};
+  const data = json?.data || {};
+  const url = String(fetchRes?.url || "").toLowerCase();
+  const sample = String(fetchRes?.textSample || fetchRes?.error || "").toLowerCase();
+
+  const isLoginRequired =
+    status === 401 ||
+    json?.error === 90309999 ||
+    json?.is_login === false ||
+    data?.is_login === false ||
+    url.includes("/login") ||
+    sample.includes("is_login") ||
+    sample.includes("90309999");
+
+  const isLogin = Boolean(fetchRes?.ok && !isLoginRequired);
+  let error = null;
+  if (isLoginRequired) {
+    error = `Shopee login required (HTTP ${status ?? "unknown"}, error=${json?.error ?? "unknown"}, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome`;
+  } else if (!fetchRes?.ok) {
+    error = fetchRes?.error ? `Shopee API request failed: ${fetchRes.error}` : formatShopeeFailure(fetchRes);
+  }
+
+  return {
+    status,
+    isLogin,
+    error,
+    responseUrl: fetchRes?.url || null,
+  };
+}
+
 async function extractShopeeReviews(job, progress) {
+  if (!isValidShopeeUrl(job.url)) {
+    throw new Error(`Job URL không thuộc hostname shopee.vn: ${job.url}`);
+  }
+
   const parsed = idsFrom(job.url);
   let itemid = parsed.itemid;
   let shopid = parsed.shopid;
   if (!itemid) throw new Error(`Không đọc được itemid từ URL: ${job.url}`);
   job.itemid = itemid;
 
-  // Find or attach to a Shopee tab in the user's browser FIRST to leverage the real user session
+  // 1. Tìm hoặc mở tab Shopee đúng itemid
   const tab = await findOrOpenShopeeTab(job.url, itemid);
   if (!tab || !tab.id) throw new Error("Không tìm thấy hoặc không mở được tab Shopee trên trình duyệt");
   job._targetTabId = tab.id;
@@ -530,6 +610,7 @@ async function extractShopeeReviews(job, progress) {
     tabUrl: tab.url || "",
   });
 
+  // 2. Giải quyết shopid qua in-tab execution (tuyệt đối không dùng background fetch)
   if (!shopid) shopid = await resolveShopId(itemid, job.url, tab, progress);
   if (!shopid) throw new Error(`Không tìm thấy shopid cho item ${itemid}`);
   job._targetShopId = shopid;
@@ -539,6 +620,54 @@ async function extractShopeeReviews(job, progress) {
     tabId: tab.id,
     tabUrl: tab.url || "",
   });
+
+  // 3. Kiểm tra URL hiện tại có đúng shopid/itemid không
+  const currentTabIds = idsFrom(tab.url || "");
+  if (currentTabIds.itemid && String(currentTabIds.itemid) !== String(itemid)) {
+    throw new Error(`Tab URL không khớp itemid: URL có itemid=${currentTabIds.itemid}, yêu cầu itemid=${itemid}`);
+  }
+  if (currentTabIds.shopid && String(currentTabIds.shopid) !== String(shopid)) {
+    console.warn(`[bridge] Tab URL shopid (${currentTabIds.shopid}) khác resolved shopid (${shopid})`);
+  }
+
+  // 4. Chạy preflight ratings API trong chính tab đó với credentials: "include"
+  const preflightStart = Date.now();
+  const preflightRes = await preflightRatingsInTab(tab.id, itemid, shopid, tab.url || job.url);
+  const preflightEnd = Date.now();
+  const preflightElapsed = preflightEnd - preflightStart;
+  const evalResult = evaluatePreflightResult(preflightRes);
+
+  // 5. Ghi rõ status, error, is_login
+  await traceJob(job, progress, "tab-preflight", {
+    itemid,
+    shopid,
+    tabId: tab.id,
+    tabUrl: tab.url || "",
+    httpStatus: evalResult.status,
+    responseUrl: evalResult.responseUrl,
+    elapsedMs: preflightElapsed,
+    error: evalResult.error,
+    isLogin: evalResult.isLogin,
+    requestStart: new Date(preflightStart).toISOString(),
+    requestEnd: new Date(preflightEnd).toISOString(),
+  });
+
+  // Nếu phiên chưa đăng nhập thì báo login_required và dừng ngay
+  if (!evalResult.isLogin) {
+    const err = new Error(evalResult.error || "Shopee login required (error 90309999, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome");
+    err.failureKind = "login";
+    err.fetchRes = preflightRes;
+    throw err;
+  }
+
+  // Nếu preflight bị lỗi khác (như verification hoặc api_blocked)
+  if (!preflightRes.ok) {
+    const failureKind = classifyShopeeFailure(preflightRes);
+    const err = new Error(evalResult.error || formatShopeeFailure(preflightRes));
+    err.failureKind = failureKind;
+    err.fetchRes = preflightRes;
+    throw err;
+  }
 
   let all = [];
   let offset = 0;
@@ -1455,6 +1584,7 @@ async function dispatchEnvelope(envelope) {
 
   // Backward-compatible ingest.job message
   if (envelope.type === "ingest.job") {
+    enqueueLegacyJob(envelope.job, "websocket");
     const job = envelope.job ? { ...envelope.job } : {};
     if (envelope.retry || envelope.job?.retry) job.retry = true;
     if (!job.id && envelope.id) job.id = envelope.id;
@@ -1637,6 +1767,10 @@ function enqueueLegacyJob(job) {
     knownJobs.delete(job.id);
     notifiedVerificationJobIds.delete(job.id);
   }
+  if (activeJobs.has(job.id)) {
+    console.log("[bridge] Job already active, skipping duplicate enqueue:", job.id);
+    return;
+  }
   if (knownJobs.has(job.id)) return;
   knownJobs.add(job.id);
   jobChain = jobChain.then(() => runJob(job)).catch((err) => console.error("[bridge] Job failed:", err))
@@ -1675,7 +1809,13 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     idsFrom,
     extractShopName,
+    isShopeeHostname,
+    isValidShopeeUrl,
+    findOrOpenShopeeTab,
     resolveShopId,
+    preflightRatingsInTab,
+    evaluatePreflightResult,
+    extractShopeeReviews,
     normaliseRating,
     ratingTotal,
     crawlPercent,

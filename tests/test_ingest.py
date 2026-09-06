@@ -785,3 +785,53 @@ def test_shopee_structured_trace_lifecycle(server):
     for ev in ["job-dispatch", "job-accepted", "ratings-response"]:
         assert ev in log_job_events
 
+
+def test_preflight_login_required_stops_and_records_trace(server):
+    base, outputs = server
+    import launch
+
+    # 1. Queue job
+    q = _get(base, "/ingest/job?url=https://shopee.vn/product/123/456")
+    job_id = q["job"]["id"]
+
+    # 2. Extension runs preflight and detects is_login == False
+    preflight_trace = {
+        "jobId": job_id,
+        "itemid": "456",
+        "shopid": "123",
+        "tabId": 12,
+        "tabUrl": "https://shopee.vn/product/123/456",
+        "event": "tab-preflight",
+        "httpStatus": 200,
+        "error": "Shopee login required (error 90309999, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome",
+        "is_login": False,
+        "responseUrl": "https://shopee.vn/api/v2/item/get_ratings",
+    }
+    launch._update_ingest_progress(job_id, {"stage": "trace", "trace": preflight_trace})
+
+    # Extension reports login_required status
+    status, res = _post(base, "/ingest", {
+        "job": job_id,
+        "error": "Shopee login required (error 90309999, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome",
+        "login_required": True,
+    })
+    assert status == 200
+    assert res["ok"] is False
+    assert res["login_required"] is True
+    assert res["status"] == "login_required"
+
+    # Verify result endpoint
+    r = _get(base, f"/ingest/result?id={job_id}")
+    assert r["ok"] is True
+    assert r["result"]["login_required"] is True
+    assert r["progress"]["status"] == "login_required"
+
+    # Verify trace endpoint has tab-preflight trace with is_login == False
+    traces_res = _get(base, f"/ingest/traces?id={job_id}")
+    assert traces_res["ok"] is True
+    preflight_entries = [t for t in traces_res["traces"] if t["event"] == "tab-preflight"]
+    assert len(preflight_entries) == 1
+    assert preflight_entries[0]["is_login"] is False
+    assert "login required" in preflight_entries[0]["error"].lower()
+
+
