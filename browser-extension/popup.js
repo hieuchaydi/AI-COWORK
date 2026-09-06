@@ -74,6 +74,9 @@ function renderStatus(state, details) {
   } else if (state === "api_blocked") {
     statusBadge.textContent = "Blocked";
     statusBadge.className = "badge error";
+  } else if (state === "client_conflict") {
+    statusBadge.textContent = "Client khác";
+    statusBadge.className = "badge warning";
   } else {
     statusBadge.textContent = "Disconnected";
   }
@@ -176,7 +179,10 @@ async function loadConfig() {
   const verification = runtime?.verificationInfo ?? res.verificationInfo;
   const currentJob = runtime?.currentJob ?? res.currentJob;
   const connectionError = document.getElementById("connectionError");
-  if (runtime && !runtime.connected && gateway.connected) {
+  if (state === "client_conflict") {
+    const ownerId = runtime?.connectionConflict?.owner?.clientId;
+    connectionError.textContent = `Gateway đang do client khác giữ${ownerId ? ` (${ownerId})` : ""}; bấm Connect để takeover có chủ đích.`;
+  } else if (runtime && !runtime.connected && gateway.connected) {
     connectionError.textContent = "Gateway đang có client khác kết nối; hãy tắt bản extension/profile trùng rồi bấm Connect.";
   } else if (runtime && runtime.connected && !gateway.connected) {
     connectionError.textContent = "Extension đã mở socket nhưng gateway chưa nhận trạng thái connected.";
@@ -216,7 +222,11 @@ async function loadTabs() {
 async function changeConnection(action) {
   try {
     const response = await chrome.runtime.sendMessage({
-      action, url: gatewayUrlInput.value.trim(), token: pairingTokenInput.value.trim(),
+      action,
+      url: gatewayUrlInput.value.trim(),
+      token: pairingTokenInput.value.trim(),
+      // A manual Connect is the explicit user consent to take over the owner lease.
+      takeover: action === "connect",
     });
     if (!response || !response.ok) throw new Error(response?.error || "Extension worker không phản hồi");
     await loadConfig();

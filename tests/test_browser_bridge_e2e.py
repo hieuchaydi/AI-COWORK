@@ -15,6 +15,7 @@ import socket
 import sys
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -44,9 +45,18 @@ class SimpleWebSocketTestClient:
         path: str = "/browser/v1/ws",
         token: Optional[str] = None,
         origin: Optional[str] = "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+        client_id: Optional[str] = None,
+        takeover: bool = False,
     ) -> int:
         self.sock.connect((self.host, self.port))
-        query = f"?token={token}" if token else ""
+        query_params = {}
+        if token:
+            query_params["token"] = token
+        if client_id:
+            query_params["client_id"] = client_id
+        if takeover:
+            query_params["takeover"] = "1"
+        query = f"?{urllib.parse.urlencode(query_params)}" if query_params else ""
         sec_key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
 
         req = (
@@ -289,22 +299,34 @@ def test_e2e_human_verification_and_resume_flow(gateway_server):
         client.close()
 
 
-def test_e2e_reconnect_does_not_corrupt_active_state(gateway_server):
+def test_e2e_duplicate_client_is_rejected_and_takeover_is_explicit(gateway_server):
     server, port, token = gateway_server
     client1 = SimpleWebSocketTestClient("127.0.0.1", port)
     client2 = SimpleWebSocketTestClient("127.0.0.1", port)
+    client3 = SimpleWebSocketTestClient("127.0.0.1", port)
     try:
         # Client 1 connects
-        s1 = client1.connect(token=token)
+        s1 = client1.connect(token=token, client_id="owner-1")
         assert s1 == 101
         _ = client1.recv_json()
         assert server.is_connected is True
 
-        # Client 2 connects (replaces client 1 as active connection)
-        s2 = client2.connect(token=token)
+        # Client 2 cannot silently replace the single active owner.
+        s2 = client2.connect(token=token, client_id="owner-2")
         assert s2 == 101
-        _ = client2.recv_json()
+        rejection = client2.recv_json()
+        assert rejection["type"] == "error"
+        assert rejection["error"]["code"] == "CLIENT_ALREADY_CONNECTED"
         assert server.is_connected is True
+        assert server.active_connection_info()["clientId"] == "owner-1"
+        client2.close()
+
+        # A user-initiated takeover is the only way to transfer ownership.
+        s3 = client3.connect(token=token, client_id="owner-3", takeover=True)
+        assert s3 == 101
+        _ = client3.recv_json()
+        assert server.is_connected is True
+        assert server.active_connection_info()["clientId"] == "owner-3"
 
         # Client 1 closes its socket
         client1.close()
@@ -314,7 +336,7 @@ def test_e2e_reconnect_does_not_corrupt_active_state(gateway_server):
         assert server.is_connected is True
         assert server.transport.get_state() == ExtensionState.CONNECTED
 
-        # Can still execute command via client 2
+        # Can still execute command via the explicit takeover owner.
         result_container = []
 
         def execute_worker():
@@ -327,11 +349,11 @@ def test_e2e_reconnect_does_not_corrupt_active_state(gateway_server):
         t = threading.Thread(target=execute_worker)
         t.start()
 
-        cmd = client2.recv_json(timeout=3.0)
+        cmd = client3.recv_json(timeout=3.0)
         assert cmd is not None
         assert cmd.get("action") == "tab.list"
 
-        client2.send_json({
+        client3.send_json({
             "v": 1,
             "type": "result",
             "id": cmd.get("id"),
@@ -346,6 +368,7 @@ def test_e2e_reconnect_does_not_corrupt_active_state(gateway_server):
     finally:
         client1.close()
         client2.close()
+        client3.close()
 
 
 def test_e2e_pipelined_handshake_frame_buffering(gateway_server):

@@ -2115,6 +2115,8 @@ class _HelperHandler(BaseHTTPRequestHandler):
                     "pending_login": login_job,
                     "pending_blocked": blocked_job,
                     "connected": _BROWSER_WS.connected,
+                    "connectionPolicy": "exclusive",
+                    "connectionOwner": _BROWSER_WS.active_connection_info(),
                     "protocolVersion": "1.0",
                     "wsPort": HELPER_WS_PORT,
                     "httpPort": HELPER_PORT,

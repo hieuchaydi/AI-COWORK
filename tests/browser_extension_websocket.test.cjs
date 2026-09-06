@@ -107,6 +107,22 @@ test('getStatus reports the live service-worker socket instead of stale storage'
   assert.equal(stored.extensionState, 'disconnected');
 });
 
+test('duplicate owner errors stop reconnect and require an explicit takeover', async () => {
+  const { context, sockets, stored } = await worker();
+  await vm.runInContext(`dispatchEnvelope({
+    type: 'error',
+    error: {
+      code: 'CLIENT_ALREADY_CONNECTED',
+      message: 'Gateway đang được client khác sử dụng',
+      details: { owner: { clientId: 'owner-1' }, policy: 'exclusive' },
+    },
+  })`, context);
+  assert.equal(stored.connectionEnabled, false);
+  assert.equal(stored.extensionState, 'client_conflict');
+  assert.equal(stored.connectionConflict.owner.clientId, 'owner-1');
+  assert.equal(sockets[0].readyState, 3);
+});
+
 test('unacknowledged requests are replayed with the same correlation id', async () => {
   const { context, frames, timers } = await worker();
   vm.runInContext('bridgeSocket.readyState = 3', context);
@@ -137,7 +153,10 @@ test('connect saves new configuration before pairing and clears stale callbacks'
   const oldClose = sockets[0].onclose;
   await vm.runInContext('configureConnection({action: "connect", url: "ws://localhost:9876/browser/v1/ws", token: "old"})', context);
   assert.equal(fetches.at(-1), 'http://localhost:9876/browser/pair');
-  assert.match(sockets[1].url, /^ws:\/\/localhost:9876\/browser\/v1\/ws\?token=new-token$/);
+  const connectedUrl = new URL(sockets[1].url);
+  assert.equal(connectedUrl.searchParams.get('token'), 'new-token');
+  assert.match(connectedUrl.searchParams.get('client_id'), /^[0-9a-f-]{36}$/);
+  assert.equal(connectedUrl.searchParams.get('takeover'), null);
   oldOpen();
   oldClose();
   assert.equal(sockets[1].readyState, 1);

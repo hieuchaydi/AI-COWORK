@@ -34,6 +34,7 @@ let inFlightCommands = new Map();
 let verificationInfo = null;
 let pendingVerificationJobs = new Map();
 let lastVerificationJob = null;
+let connectionConflict = null;
 
 function setBadge(text, color = "#1a73e8") {
   chrome.action.setBadgeText({ text: String(text || "") });
@@ -42,6 +43,7 @@ function setBadge(text, color = "#1a73e8") {
 
 function updateState(newState, details = null) {
   extensionState = newState;
+  if (newState !== "client_conflict") connectionConflict = null;
   if (newState === "awaiting_user_verification") {
     verificationInfo = details;
     setBadge("PAUS", "#f9ab00");
@@ -56,6 +58,9 @@ function updateState(newState, details = null) {
     setBadge("OK", "#137333");
   } else if (newState === "busy") {
     setBadge("BUSY", "#1a73e8");
+  } else if (newState === "client_conflict") {
+    connectionConflict = details || connectionConflict;
+    setBadge("LOCK", "#ea8600");
   } else {
     verificationInfo = null;
     setBadge("");
@@ -63,6 +68,7 @@ function updateState(newState, details = null) {
   chrome.storage.local.set({
     extensionState,
     verificationInfo,
+    connectionConflict,
     currentJob: activeJobs.size > 0 ? Array.from(activeJobs.values())[0] : null,
   });
 }
@@ -1438,6 +1444,28 @@ async function dispatchEnvelope(envelope) {
     return;
   }
 
+  if (envelope.type === "error") {
+    const error = envelope.error || {};
+    if (error.code === "CLIENT_ALREADY_CONNECTED") {
+      connectionEnabled = false;
+      clearReconnect();
+      connectionConflict = {
+        ...(error.details || {}),
+        message: error.message || "Gateway đang được client khác sử dụng",
+        at: Date.now(),
+      };
+      chrome.storage.local.set({
+        connectionEnabled: false,
+        connectionConflict,
+        lastConnectionError: "Gateway đang được client khác sử dụng; hãy bấm Connect để takeover có chủ đích",
+      });
+      closeBridgeSocket({ preserveState: "client_conflict" });
+    } else {
+      console.warn("[bridge] Gateway error:", error.code || "UNKNOWN", error.message || "");
+    }
+    return;
+  }
+
   // Handle command envelopes
   if (envelope.type === "command") {
     const cmdId = envelope.id;
@@ -1607,7 +1635,7 @@ function clearReconnect() {
   bridgeReconnectTimeout = null;
 }
 
-function closeBridgeSocket({ preserveDetails = false } = {}) {
+function closeBridgeSocket({ preserveDetails = false, preserveState = null } = {}) {
   if (bridgeHandshakeTimeout) clearTimeout(bridgeHandshakeTimeout);
   bridgeHandshakeTimeout = null;
   if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
@@ -1620,12 +1648,15 @@ function closeBridgeSocket({ preserveDetails = false } = {}) {
     }
   }
   bridgeSocket = null;
-  if (preserveDetails && verificationInfo) {
+  if (preserveState) {
+    updateState(preserveState, preserveState === "client_conflict" ? connectionConflict : verificationInfo);
+  } else if (preserveDetails && verificationInfo) {
     extensionState = "disconnected";
     setBadge("");
     chrome.storage.local.set({
       extensionState,
       verificationInfo,
+      connectionConflict,
       currentJob: activeJobs.size > 0 ? Array.from(activeJobs.values())[0] : null,
     });
   } else {
@@ -1655,7 +1686,13 @@ async function connectBridge() {
   const current = () => generation === connectionGeneration && connectionEnabled;
   const attempt = (async () => {
     try {
-      const stored = await chrome.storage.local.get(["gatewayUrl", "pairingToken", "connectionEnabled"]);
+      const stored = await chrome.storage.local.get([
+        "gatewayUrl",
+        "pairingToken",
+        "connectionEnabled",
+        "clientId",
+        "takeover",
+      ]);
       if (!current()) return;
       if (stored.connectionEnabled === false) {
         connectionEnabled = false;
@@ -1664,6 +1701,8 @@ async function connectBridge() {
       }
       let token = stored.pairingToken;
       let wsUrl = stored.gatewayUrl || "ws://127.0.0.1:8766/browser/v1/ws";
+      const clientId = stored.clientId || crypto.randomUUID();
+      const takeover = stored.takeover === true;
       const target = new URL(wsUrl);
       if (!['ws:', 'wss:'].includes(target.protocol) ||
           !['127.0.0.1', 'localhost', '[::1]'].includes(target.hostname) || target.username || target.password) {
@@ -1693,9 +1732,16 @@ async function connectBridge() {
         if (pairingController === controller) pairingController = null;
       }
       if (!current()) return;
-      await chrome.storage.local.set({ gatewayUrl: wsUrl, pairingToken: token });
+      await chrome.storage.local.set({
+        gatewayUrl: wsUrl,
+        pairingToken: token,
+        clientId,
+        takeover: false,
+      });
       if (!current()) return;
       target.searchParams.set('token', token);
+      target.searchParams.set('client_id', clientId);
+      if (takeover) target.searchParams.set('takeover', '1');
       const socket = new WebSocket(target.toString());
       bridgeSocket = socket;
       const ownsSocket = () => current() && bridgeSocket === socket;
@@ -1763,6 +1809,7 @@ async function configureConnection(message) {
   if (enabled) {
     if (typeof message.url === "string") config.gatewayUrl = message.url.trim();
     if (typeof message.token === "string") config.pairingToken = message.token.trim();
+    config.takeover = message.takeover === true;
   }
   const generation = connectionGeneration;
   await chrome.storage.local.set(config);
@@ -1823,6 +1870,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         gatewayUrl: stored.gatewayUrl || null,
         lastConnectionError: stored.lastConnectionError || "",
         verificationInfo,
+        connectionConflict,
         currentJob: activeJobs.size > 0 ? Array.from(activeJobs.values())[0] : null,
         reconnectAttempts,
         lastBridgeMessageAt,
