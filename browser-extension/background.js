@@ -1218,7 +1218,10 @@ async function dispatchEnvelope(envelope) {
 
   // Backward-compatible ingest.job message
   if (envelope.type === "ingest.job") {
-    enqueueLegacyJob(envelope.job, "websocket");
+    const job = envelope.job ? { ...envelope.job } : {};
+    if (envelope.retry || envelope.job?.retry) job.retry = true;
+    if (!job.id && envelope.id) job.id = envelope.id;
+    enqueueLegacyJob(job, "websocket");
     return;
   }
 }
@@ -1386,14 +1389,14 @@ async function configureConnection(message) {
 // ── WebSocket Job Delivery ─────────────────────────────────────────────────
 function enqueueLegacyJob(job) {
   if (!job || !job.id) return;
-  if (activeJobs.has(job.id)) {
-    console.log("[bridge] Job already active, skipping duplicate enqueue:", job.id);
-    return;
-  }
   bridgeSend({ v: 1, type: "accepted", id: job.id, jobId: job.id });
   if (job.retry) {
     knownJobs.delete(job.id);
     notifiedVerificationJobIds.delete(job.id);
+  }
+  if (activeJobs.has(job.id)) {
+    console.log("[bridge] Job already active, skipping duplicate enqueue:", job.id);
+    return;
   }
   if (knownJobs.has(job.id)) return;
   knownJobs.add(job.id);

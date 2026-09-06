@@ -451,6 +451,7 @@ def _ack_ingest_job(job_id: str) -> None:
             if j.get("id") == job_id:
                 _INGEST_INFLIGHT[job_id] = _INGEST_JOBS.pop(i)
                 break
+    _persist_ingest_state()
 
 
 def _on_browser_ws_connect() -> None:
@@ -467,7 +468,15 @@ def _on_browser_ws_message(message: dict) -> None:
     if kind == "ingest.rpc":
         _INGEST_RPC.submit(message)
     elif kind in ("ingest.ack", "accepted"):
-        job_id = str(message.get("jobId") or message.get("id") or "")
+        params = message.get("params") or {}
+        job_id = str(
+            message.get("jobId")
+            or message.get("id")
+            or params.get("jobId")
+            or params.get("id")
+            or params.get("job_id")
+            or ""
+        )
         _ack_ingest_job(job_id)
     elif kind in ("bridge.ping", "ping"):
         _BROWSER_WS.send({"type": "bridge.pong", "at": time.time()})
@@ -507,7 +516,11 @@ _BROWSER_WS.on_message = _on_browser_ws_message
 
 def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
     """Persist a result shared by WebSocket ingestion and legacy HTTP clients."""
-    job_id = (body.get("job") if isinstance(body, dict) else None) or ""
+    job_id = (
+        (body.get("job") or body.get("jobId") or body.get("job_id"))
+        if isinstance(body, dict)
+        else None
+    ) or ""
     job_obj = _INGEST_ALL_JOBS.get(job_id) if job_id else None
     source = (body.get("source") if isinstance(body, dict) else None) or (job_obj.get("url") if job_obj else None)
     source_text = str(source or "")

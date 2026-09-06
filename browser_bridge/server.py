@@ -234,6 +234,15 @@ class BrowserGatewayServer:
             return self._active_conn is not None and not self._active_conn.closed
 
     @property
+    def connected(self) -> bool:
+        return self.is_connected
+
+    def send(self, payload: Dict[str, Any] | MessageEnvelope) -> bool:
+        if hasattr(payload, "to_dict"):
+            payload = payload.to_dict()
+        return self.broadcast_or_send(payload)
+
+    @property
     def port(self) -> Optional[int]:
         server = self._server
         return int(server.server_address[1]) if server else None

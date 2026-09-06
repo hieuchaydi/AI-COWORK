@@ -626,3 +626,160 @@ def test_socket_disconnect_releases_pending_command(gateway_server):
     assert not thread.is_alive(), "Socket loss must release the caller immediately"
     assert not results[0][0]
     assert "disconnected" in results[0][2].message.lower()
+
+
+def test_e2e_full_7_step_websocket_ingest_flow(gateway_server, monkeypatch, tmp_path):
+    """End-to-end verification of all 7 WebSocket ingest steps between server and extension."""
+    import launch
+    from browser_bridge.ingest import IngestRPC
+
+    server, port, token = gateway_server
+    monkeypatch.setenv("COWORKER_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(launch, "_BROWSER_WS", server)
+
+    # Initialize IngestRPC attached to server
+    rpc = IngestRPC(
+        send=server.broadcast_or_send,
+        store=launch._store_ingest_payload,
+        progress=launch._update_ingest_progress,
+    )
+    monkeypatch.setattr(launch, "_INGEST_RPC", rpc)
+
+    # Wire up server callbacks to launch handlers
+    server.on_connect = launch._on_browser_ws_connect
+    server.on_message = launch._on_browser_ws_message
+
+    # Reset in-memory state
+    with launch._INGEST_JOBS_LOCK:
+        launch._INGEST_JOBS.clear()
+        launch._INGEST_INFLIGHT.clear()
+        launch._INGEST_ALL_JOBS.clear()
+    with launch._INGEST_PROGRESS_LOCK:
+        launch._INGEST_PROGRESS.clear()
+    launch._INGEST_RESULTS.clear()
+
+    client = SimpleWebSocketTestClient("127.0.0.1", port)
+    try:
+        assert client.connect(token=token) == 101
+        hello = client.recv_json()
+        assert hello["type"] == "hello"
+        time.sleep(0.1)
+
+        # Step 1: Server tạo job
+        test_url = "https://shopee.vn/product/123456/25018847315"
+        job = launch._queue_ingest_job(test_url, "shopee-reviews")
+        job_id = job["id"]
+        assert job_id.startswith("job-")
+        assert launch._INGEST_PROGRESS[job_id]["status"] == "queued"
+
+        # Step 2: Server gửi ingest.job qua WebSocket
+        msg = client.recv_json(timeout=3)
+        assert msg["type"] == "ingest.job"
+        assert msg["job"]["id"] == job_id
+        assert msg["job"]["url"] == test_url
+
+        # Step 3: Extension nhận job và trả accepted
+        client.send_json({"v": 1, "type": "accepted", "id": job_id, "jobId": job_id})
+        time.sleep(0.1)
+
+        # Verify Step 3: Server nhận accepted và đưa job vào inflight
+        with launch._INGEST_JOBS_LOCK:
+            assert job_id not in [j["id"] for j in launch._INGEST_JOBS]
+            assert job_id in launch._INGEST_INFLIGHT
+
+        # Step 4: Extension gửi ingest.rpc (progress)
+        req_id_progress = "rpc-progress-1"
+        client.send_json({
+            "v": 1,
+            "type": "ingest.rpc",
+            "id": req_id_progress,
+            "params": {
+                "operation": "progress",
+                "job": job_id,
+                "progress": {"status": "running", "stage": "crawling", "percent": 45, "message": "Đang cào dữ liệu"},
+            },
+        })
+
+        # Step 5: Server trả ingest.reply đúng correlation id cho progress
+        reply_progress = client.recv_json(timeout=3)
+        assert reply_progress["type"] == "ingest.reply"
+        assert reply_progress["id"] == req_id_progress
+        assert reply_progress["ok"] is True
+        assert launch._INGEST_PROGRESS[job_id]["percent"] == 45
+        assert launch._INGEST_PROGRESS[job_id]["status"] == "running"
+
+        # Step 6: Progress/chunk/complete
+        payload_body = {
+            "job": job_id,
+            "name": "shopee_25018847315_reviews",
+            "source": test_url,
+            "rows": [
+                {
+                    "user": "test_buyer",
+                    "sao": 5,
+                    "noi_dung": "Dép đi rất êm và bền",
+                    "thoi_gian": "2026-09-06 20:00:00",
+                    "anh": 0,
+                    "video": 0,
+                }
+            ],
+        }
+        chunk_str = json.dumps(payload_body, ensure_ascii=False)
+        req_id_chunk = "rpc-chunk-0"
+        upload_id = "upload-test-123"
+        client.send_json({
+            "v": 1,
+            "type": "ingest.rpc",
+            "id": req_id_chunk,
+            "params": {
+                "operation": "chunk",
+                "uploadId": upload_id,
+                "index": 0,
+                "chunk": chunk_str,
+            },
+        })
+        reply_chunk = client.recv_json(timeout=3)
+        assert reply_chunk["type"] == "ingest.reply"
+        assert reply_chunk["id"] == req_id_chunk
+        assert reply_chunk["ok"] is True
+        assert reply_chunk["result"]["index"] == 0
+
+        # Complete operation
+        req_id_complete = "rpc-complete-1"
+        client.send_json({
+            "v": 1,
+            "type": "ingest.rpc",
+            "id": req_id_complete,
+            "params": {
+                "operation": "complete",
+                "uploadId": upload_id,
+            },
+        })
+        reply_complete = client.recv_json(timeout=5)
+        assert reply_complete["type"] == "ingest.reply"
+        assert reply_complete["id"] == req_id_complete
+        assert reply_complete["ok"] is True
+        assert reply_complete["result"]["count"] == 1
+
+        # Step 7: Server ghi kết quả cuối
+        assert job_id in launch._INGEST_RESULTS
+        res = launch._INGEST_RESULTS[job_id]
+        assert res["ok"] is True
+        assert res["count"] == 1
+        assert "shopee_25018847315_reviews.csv" in res["csv"]
+        assert (tmp_path / "csv" / "shopee_25018847315_reviews.csv").exists()
+        assert launch._INGEST_PROGRESS[job_id]["status"] == "done"
+        assert launch._INGEST_PROGRESS[job_id]["percent"] == 100
+
+        # Inflight queue should be cleaned up
+        with launch._INGEST_JOBS_LOCK:
+            assert job_id not in launch._INGEST_INFLIGHT
+
+        # State persistence file exists
+        state_file = tmp_path / ".ingest_jobs_state.json"
+        assert state_file.exists()
+        state_data = json.loads(state_file.read_text(encoding="utf-8"))
+        assert job_id in state_data["results"]
+    finally:
+        client.close()
+        rpc.executor.shutdown(wait=True)

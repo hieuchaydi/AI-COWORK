@@ -33,7 +33,7 @@ class IngestRPC:
                 if len(self.requests) >= 512:
                     oldest_done = next((key for key, value in self.requests.items() if value[1].done()), None)
                     if oldest_done is None:
-                        self.send({"type": "ingest.reply", "id": request_id,
+                        self.send({"v": 1, "type": "ingest.reply", "id": request_id,
                                    "ok": False, "error": "Ingest queue is full"})
                         return
                     del self.requests[oldest_done]
@@ -52,13 +52,14 @@ class IngestRPC:
     def _execute(self, params):
         operation = params.get("operation")
         if operation == "progress":
-            job = params.get("job")
+            job = params.get("job") or params.get("jobId") or params.get("job_id")
             patch = params.get("progress")
             if not isinstance(job, str) or not job or not isinstance(patch, dict):
                 raise ValueError("job and progress are required")
             return self.progress(job, patch)
         if operation == "chunk":
-            upload_id, index, chunk = params.get("uploadId"), params.get("index"), params.get("chunk")
+            upload_id = params.get("uploadId") or params.get("upload_id")
+            index, chunk = params.get("index"), params.get("chunk")
             if (not isinstance(upload_id, str) or not upload_id or len(upload_id) > 128
                     or type(index) is not int or index < 0
                     or not isinstance(chunk, str) or len(chunk) > 262144):
@@ -84,8 +85,9 @@ class IngestRPC:
                 upload[0], upload[2] = now, upload[2] + size
                 return {"index": index}
         if operation == "complete":
+            upload_id = params.get("uploadId") or params.get("upload_id")
             with self.lock:
-                upload = self.uploads.pop(params.get("uploadId"), None)
+                upload = self.uploads.pop(upload_id, None)
             if not upload:
                 raise ValueError("Upload missing or expired")
             body = json.loads("".join(upload[1]))
