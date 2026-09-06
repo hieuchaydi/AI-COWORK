@@ -18,6 +18,11 @@ const tabList = document.getElementById("tabList");
 let currentVerification = null;
 
 function renderStatus(state, details) {
+  const connectionError = document.getElementById("connectionError");
+  if (connectionError && (state === "connected" || state === "busy")) {
+    // A transient socket close may leave the previous error in storage after reconnect.
+    connectionError.textContent = "";
+  }
   statusBadge.className = "badge " + (state || "disconnected");
   if (state === "connected") {
     statusBadge.textContent = "Connected";
@@ -200,4 +205,3 @@ btnResumeVerification.addEventListener("click", () => {
 // Periodic refresh
 loadConfig();
 setInterval(loadConfig, 2000);
-
