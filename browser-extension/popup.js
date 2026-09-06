@@ -40,11 +40,12 @@ function renderStatus(state, details) {
   if (details && details.verification) {
     currentVerification = details.verification;
     verificationBox.style.display = "block";
-    verificationMsg.textContent = `Yêu cầu xác minh tại: ${details.verification.url || details.verification.hostname || "tab hiện tại"}`;
-    if (verificationReason) {
-      verificationReason.textContent = details.verification.reason || "Lý do: Shopee yêu cầu giải CAPTCHA hoặc xác minh danh tính tài khoản";
     const kind = details.verification.kind || "verification";
     const targetUrl = details.verification.url || details.verification.hostname || "";
+
+    if (verificationReason) {
+      verificationReason.textContent = details.verification.reason || "Lý do: Shopee yêu cầu giải CAPTCHA hoặc xác minh danh tính tài khoản";
+    }
 
     if (kind === "login") {
       verificationBox.className = "alert-box login-box";
@@ -90,14 +91,9 @@ function renderStatus(state, details) {
         btnResumeVerification.textContent = "Tiếp tục sau khi đã giải CAPTCHA";
       }
     }
-    const targetUrl = details.verification.url || details.verification.hostname || "";
 
     if (verificationTargetUrl) {
       verificationTargetUrl.textContent = targetUrl ? `URL cần mở: ${targetUrl}` : "";
-      verificationTargetUrl.textContent = targetUrl ? `URL: ${targetUrl}` : "";
-    }
-    if (btnOpenVerificationTab) {
-      btnOpenVerificationTab.style.display = (targetUrl || details.verification.tab_id) ? "block" : "none";
     }
   } else {
     currentVerification = null;
