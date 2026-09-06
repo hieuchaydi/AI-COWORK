@@ -128,6 +128,7 @@ class GatewayClientConnection:
         self.extension_id = extension_id
         self.send_lock = threading.Lock()
         self.closed = False
+        self.close_sent = False
 
     def send(self, payload: Dict[str, Any] | MessageEnvelope) -> None:
         if hasattr(payload, "to_dict"):
@@ -136,24 +137,34 @@ class GatewayClientConnection:
         if len(raw) > MAX_MESSAGE_BYTES:
             raise ValueError(f"Outbound payload {len(raw)} exceeds {MAX_MESSAGE_BYTES}")
         with self.send_lock:
-            if self.closed:
+            if self.closed or self.close_sent:
                 raise ConnectionError("Connection is closed")
             self.sock.sendall(_encode_frame(raw))
 
     def send_control(self, opcode: int, payload: bytes = b"") -> None:
         with self.send_lock:
-            if not self.closed:
+            if self.closed:
+                return
+            if opcode == 0x8:
+                if self.close_sent:
+                    return
+                self.close_sent = True
+            try:
                 self.sock.sendall(_encode_frame(payload[:125], opcode=opcode))
+            except OSError:
+                pass
 
     def close(self) -> None:
         with self.send_lock:
             if self.closed:
                 return
             self.closed = True
-            try:
-                self.sock.sendall(_encode_frame(b"", opcode=0x8))
-            except OSError:
-                pass
+            if not self.close_sent:
+                self.close_sent = True
+                try:
+                    self.sock.sendall(_encode_frame(b"", opcode=0x8))
+                except OSError:
+                    pass
             try:
                 self.sock.shutdown(socket.SHUT_RDWR)
             except OSError:
@@ -418,10 +429,11 @@ class BrowserGatewayServer:
             while True:
                 opcode, raw = _read_frame(reader)
                 if opcode == 0x8:  # Close
-                    try:
-                        conn.send_control(0x8, raw[:125])
-                    except Exception:
-                        pass
+                    if not conn.close_sent:
+                        try:
+                            conn.send_control(0x8, raw[:125])
+                        except Exception:
+                            pass
                     break
                 elif opcode == 0x9:  # Ping
                     conn.send_control(0xA, raw)

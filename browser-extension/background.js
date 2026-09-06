@@ -1612,8 +1612,11 @@ function closeBridgeSocket() {
   if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
   bridgeHeartbeat = null;
   if (bridgeSocket) {
-    bridgeSocket.onopen = bridgeSocket.onmessage = bridgeSocket.onerror = bridgeSocket.onclose = null;
-    try { bridgeSocket.close(); } catch {}
+    const s = bridgeSocket;
+    s.onopen = s.onmessage = s.onerror = s.onclose = null;
+    if (s.readyState === WebSocket.OPEN || s.readyState === WebSocket.CONNECTING) {
+      try { s.close(1000, "Normal closure"); } catch {}
+    }
   }
   bridgeSocket = null;
   updateState("disconnected");
@@ -1635,7 +1638,7 @@ function scheduleBridgeReconnect() {
 
 async function connectBridge() {
   if (!connectionEnabled) return;
-  if (bridgeSocket && (bridgeSocket.readyState === WebSocket.OPEN || bridgeSocket.readyState === WebSocket.CONNECTING)) return;
+  if (bridgeSocket && bridgeSocket.readyState !== WebSocket.CLOSED) return;
   if (bridgeConnecting) return bridgeConnecting;
   const generation = connectionGeneration;
   const current = () => generation === connectionGeneration && connectionEnabled;
