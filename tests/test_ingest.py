@@ -362,6 +362,57 @@ def test_shopee_classification_api_blocked_vs_login_vs_captcha(server):
     assert res4["progress"]["stage"] == "failed"
 
 
+def test_browser_status_does_not_mix_stale_job_failures(server):
+    """Only the newest job may drive the popup's attention state."""
+    base, _ = server
+    import launch
+
+    with launch._INGEST_PROGRESS_LOCK:
+        saved = dict(launch._INGEST_PROGRESS)
+        launch._INGEST_PROGRESS.clear()
+        launch._INGEST_PROGRESS["old-login"] = {
+            "status": "login_required",
+            "login_required": True,
+            "url": "https://shopee.vn/product/1/2",
+        }
+        launch._INGEST_PROGRESS["old-block"] = {
+            "status": "error",
+            "stage": "api_blocked",
+            "api_blocked": True,
+            "url": "https://shopee.vn/product/3/4",
+        }
+        launch._INGEST_PROGRESS["current"] = {
+            "status": "running",
+            "stage": "fetch",
+            "url": "https://shopee.vn/product/5/6",
+        }
+
+    try:
+        status = _get(base, "/browser/status")
+        assert status["login_required"] is False
+        assert status["api_blocked"] is False
+        assert status["verification_required"] is False
+        assert status["pending_login"] is None
+        assert status["pending_blocked"] is None
+
+        with launch._INGEST_PROGRESS_LOCK:
+            launch._INGEST_PROGRESS["current"] = {
+                "status": "error",
+                "stage": "api_blocked",
+                "api_blocked": True,
+                "url": "https://shopee.vn/product/5/6",
+            }
+        status = _get(base, "/browser/status")
+        assert status["state"] == "api_blocked"
+        assert status["api_blocked"] is True
+        assert status["login_required"] is False
+        assert status["pending_blocked"]["job_id"] == "current"
+    finally:
+        with launch._INGEST_PROGRESS_LOCK:
+            launch._INGEST_PROGRESS.clear()
+            launch._INGEST_PROGRESS.update(saved)
+
+
 def test_job_endpoint_rejects_a_non_http_url(server):
     base, _ = server
     with pytest.raises(urllib.error.HTTPError) as e:

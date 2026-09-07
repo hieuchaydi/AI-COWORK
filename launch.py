@@ -2132,28 +2132,30 @@ class _HelperHandler(BaseHTTPRequestHandler):
             login_job = None
             blocked_job = None
             with _INGEST_PROGRESS_LOCK:
-                for jid, p in reversed(list(_INGEST_PROGRESS.items())):
+                # Browser attention is scoped to the newest job. Scanning the
+                # entire history made an old login failure remain active after
+                # a newer API-blocked or successfully running job, producing
+                # contradictory login_required/api_blocked flags.
+                latest = next(reversed(_INGEST_PROGRESS.items()), None) if _INGEST_PROGRESS else None
+                for jid, p in [latest] if latest else []:
                     if p.get("status") == "login_required" or p.get("login_required"):
-                        if not login_job:
-                            login_job = {
-                                "job_id": jid,
-                                "url": p.get("url"),
-                                "reason": p.get("message") or p.get("error"),
-                            }
+                        login_job = {
+                            "job_id": jid,
+                            "url": p.get("url"),
+                            "reason": p.get("message") or p.get("error"),
+                        }
                     elif p.get("stage") == "api_blocked" or p.get("api_blocked"):
-                        if not blocked_job:
-                            blocked_job = {
-                                "job_id": jid,
-                                "url": p.get("url"),
-                                "reason": p.get("message") or p.get("error"),
-                            }
+                        blocked_job = {
+                            "job_id": jid,
+                            "url": p.get("url"),
+                            "reason": p.get("message") or p.get("error"),
+                        }
                     elif p.get("status") == "awaiting_user_verification" or p.get("verification_required"):
-                        if not verif_job:
-                            verif_job = {
-                                "job_id": jid,
-                                "url": p.get("url"),
-                                "reason": p.get("message") or p.get("error"),
-                            }
+                        verif_job = {
+                            "job_id": jid,
+                            "url": p.get("url"),
+                            "reason": p.get("message") or p.get("error"),
+                        }
             if verif_job or transport_state == "awaiting_user_verification":
                 state = "awaiting_user_verification"
             elif login_job:
