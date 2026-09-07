@@ -244,6 +244,46 @@ MATRIX: dict[str, ModelEntry] = {
         ModelCapabilities(tools=False, vision=True, streaming=True),
         16_000,
     ),
+    # Cohere unversioned aliases
+    "cohere:command-a-plus": ModelEntry(
+        "Command A+ (218B) · Cohere", _AGENTIC_VISION, 128_000
+    ),
+    "cohere:command-a": ModelEntry(
+        "Command A (111B) · Cohere", _AGENTIC, 256_000
+    ),
+    "cohere:command-r-plus": ModelEntry(
+        "Command R+ · Cohere", _AGENTIC, 128_000
+    ),
+    "cohere:command-r": ModelEntry(
+        "Command R · Cohere", _AGENTIC, 128_000
+    ),
+    "cohere:command-r7b": ModelEntry(
+        "Command R7B · Cohere", _AGENTIC, 128_000
+    ),
+    "cohere:command-a-reasoning": ModelEntry(
+        "Command A Reasoning · Cohere", _AGENTIC, 256_000
+    ),
+    "cohere:command-a-translate": ModelEntry(
+        "Command A Translate · Cohere", _AGENTIC, 8_000
+    ),
+    "cohere:command-a-vision": ModelEntry(
+        "Command A Vision · Cohere",
+        ModelCapabilities(tools=False, vision=True, streaming=True),
+        128_000,
+    ),
+    "cohere:command-r7b-arabic": ModelEntry(
+        "Command R7B Arabic · Cohere", _AGENTIC, 128_000
+    ),
+    "cohere:aya-expanse-32b": ModelEntry(
+        "Aya Expanse 32B · Cohere",
+        ModelCapabilities(tools=False, vision=False, streaming=True),
+        128_000,
+    ),
+    "cohere:aya-vision-32b": ModelEntry(
+        "Aya Vision 32B · Cohere",
+        ModelCapabilities(tools=False, vision=True, streaming=True),
+        16_000,
+    ),
     # -- cloud accounts (models running in the user's own AWS/GCP) ----------------
     # Bedrock ids carry a family segment (claude/ → native Anthropic path, other/ →
     # Converse) plus AWS's own `-v<n>:<m>` version suffix. Some regions require the

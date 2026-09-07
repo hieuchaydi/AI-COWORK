@@ -109,23 +109,6 @@ CEREBRAS_KEY = os.environ.get("CEREBRAS_API_KEY", "")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
 COHERE_KEY = os.environ.get("COHERE_API_KEY", "")
-# Cloudflare Workers AI — partner models (Gemini/GPT/Claude) on Cloudflare billing.
-# Both halves are required: the endpoint URL is account-scoped.
-CLOUDFLARE_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
-CLOUDFLARE_ACCOUNT = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
-# Defaults are the @cf/* open-weight models: those run on the account's Workers AI
-# allocation, while partner models (google/…, openai/…) bill against an AI Gateway
-# balance and answer 402 until it's funded — a dead picker entry we don't want by
-# default. Add "cloudflare:google/gemini-3.6-flash" here once the gateway has credit.
-CLOUDFLARE_MODELS = [
-    m.strip()
-    for m in os.environ.get(
-        "CLOUDFLARE_MODEL",
-        "cloudflare:@cf/openai/gpt-oss-120b,"
-        "cloudflare:@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-    ).split(",")
-    if m.strip()
-]
 API_TOKEN = os.environ.get("CONNECT_AI_API_TOKEN") or os.environ.get(
     "COWORKER_API_TOKEN", "connect-ai-dev-token"
 )
