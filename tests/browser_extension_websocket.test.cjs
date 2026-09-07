@@ -412,6 +412,33 @@ test('ratings preflight and pagination execute in the Shopee page MAIN world', a
   assert.equal(vm.runInContext('PACE_MS', context), 1200);
 });
 
+test('ratings script retries when Chrome transiently returns no result', async () => {
+  const { context, timeouts } = await worker();
+  vm.runInContext(`
+    globalThis.ratingAttempts = 0;
+    chrome.scripting = {
+      executeScript: async () => {
+        ratingAttempts++;
+        return ratingAttempts === 1
+          ? []
+          : [{ result: { ok: true, status: 200, json: { data: { ratings: [] } } } }];
+      },
+    };
+  `, context);
+
+  const pending = vm.runInContext(`
+    fetchRatingsFromTab(42, "1546910319", "93922606", 0, 6, "https://shopee.vn/product/93922606/1546910319")
+  `, context);
+  await new Promise(resolve => setImmediate(resolve));
+  const retryTimer = [...timeouts.values()].find(entry => entry.ms === 250);
+  assert.ok(retryTimer, 'expected the first executeScript retry delay');
+  retryTimer.fn();
+
+  const result = await pending;
+  assert.equal(result.ok, true);
+  assert.equal(vm.runInContext('ratingAttempts', context), 2);
+});
+
 test('extractShopeeReviews halts with login_required before crawl when preflight fails login', async () => {
   const { context } = await worker();
   vm.runInContext(`

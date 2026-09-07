@@ -471,8 +471,33 @@ async function resolveShopId(itemid, originalUrl, tab, progress) {
   return null;
 }
 
+const SCRIPT_RETRY_DELAYS_MS = [250, 750, 1500];
+
+async function executeScriptResultWithRetry(options) {
+  let lastError = "executeScript returned no result";
+  for (let attempt = 0; attempt <= SCRIPT_RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      const results = await chrome.scripting.executeScript(options);
+      if (results?.length && results[0] && Object.prototype.hasOwnProperty.call(results[0], "result")) {
+        return results[0].result;
+      }
+      lastError = "executeScript returned no result";
+    } catch (error) {
+      lastError = error?.message || String(error);
+    }
+    if (attempt < SCRIPT_RETRY_DELAYS_MS.length) {
+      await new Promise(resolve => setTimeout(resolve, SCRIPT_RETRY_DELAYS_MS[attempt]));
+    }
+  }
+  return {
+    ok: false,
+    error: `${lastError} after ${SCRIPT_RETRY_DELAYS_MS.length + 1} attempts`,
+    retryableTabError: true,
+  };
+}
+
 async function fetchRatingsFromTab(tabId, itemid, shopid, offset, limit, referer) {
-  const res = await chrome.scripting.executeScript({
+  return executeScriptResultWithRetry({
     target: { tabId },
     // Run as the Shopee page itself. The default ISOLATED world gives the
     // request an extension/content-script initiator that Shopee's WAF rejects
@@ -509,7 +534,6 @@ async function fetchRatingsFromTab(tabId, itemid, shopid, offset, limit, referer
     },
     args: [itemid, shopid, offset, limit, referer],
   });
-  return res[0]?.result || { ok: false, error: "executeScript returned no result" };
 }
 
 function shopeeLoginState(fetchRes) {
@@ -560,7 +584,7 @@ function formatShopeeFailure(fetchRes) {
 }
 
 async function preflightRatingsInTab(tabId, itemid, shopid, referer) {
-  const res = await chrome.scripting.executeScript({
+  return executeScriptResultWithRetry({
     target: { tabId },
     world: "MAIN",
     func: async (iid, sid, ref) => {
@@ -594,7 +618,6 @@ async function preflightRatingsInTab(tabId, itemid, shopid, referer) {
     },
     args: [itemid, shopid, referer],
   });
-  return res[0]?.result || { ok: false, error: "executeScript returned no result" };
 }
 
 function evaluatePreflightResult(fetchRes) {
@@ -630,7 +653,7 @@ async function extractShopeeReviews(job, progress) {
   job.itemid = itemid;
 
   // 1. Tìm hoặc mở tab Shopee đúng itemid
-  const tab = await findOrOpenShopeeTab(job.url, itemid);
+  let tab = await findOrOpenShopeeTab(job.url, itemid);
   if (!tab || !tab.id) throw new Error("Không tìm thấy hoặc không mở được tab Shopee trên trình duyệt");
   job._targetTabId = tab.id;
   job._targetTabUrl = tab.url || "";
@@ -716,7 +739,25 @@ async function extractShopeeReviews(job, progress) {
       tabUrl: tab.url || "",
       requestStart: requestStartIso,
     });
-    const fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, tab.url || job.url);
+    let fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, tab.url || job.url);
+    if (!fetchRes.ok && fetchRes.retryableTabError) {
+      const recoveredTab = await findOrOpenShopeeTab(job.url, itemid);
+      if (recoveredTab?.id) {
+        tab = recoveredTab;
+        job._targetTabId = tab.id;
+        job._targetTabUrl = tab.url || job.url;
+        await traceJob(job, progress, "tab-recovered", {
+          itemid,
+          shopid,
+          tabId: tab.id,
+          tabUrl: tab.url || job.url,
+          offset,
+          limit: PAGE_SIZE,
+          error: fetchRes.error,
+        });
+        fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, tab.url || job.url);
+      }
+    }
     const requestEnded = Date.now();
     const requestEndIso = new Date(requestEnded).toISOString();
     const elapsedMs = requestEnded - requestStarted;
