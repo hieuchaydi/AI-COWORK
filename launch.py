@@ -3734,6 +3734,23 @@ def _ow_post(path: str, body: dict, timeout: float = 5) -> dict | None:
         return None
 
 
+def _ow_delete(path: str, timeout: float = 5) -> dict | None:
+    try:
+        req = urllib.request.Request(
+            f"http://{API_HOST}:{API_PORT}{path}",
+            headers={"x-connect-ai-token": API_TOKEN},
+            method="DELETE",
+        )
+        raw = urllib.request.urlopen(req, timeout=timeout).read()
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        return json.loads(raw or b"null")
+    except ValueError:
+        return None
+
+
+
 def _seed_runtime_state() -> None:
     """Idempotent boot seeding — every restart re-asserts our full config so nothing
     drifts between runs. Writes MUST go through the sidecar API (not direct file I/O
@@ -3746,11 +3763,9 @@ def _seed_runtime_state() -> None:
     # of an existing id is a no-op inside OpenWorker).
     picker = [
         # Google key is mandatory for this launcher. Order by useful free-tier pool:
-        # Flash-Lite 500 RPD, Gemma 14.4K RPD, then newer Flash/Pro reasoning models.
+        # Flash-Lite 500 RPD, then newer Flash/Pro reasoning models.
         "gemini:gemini-3.5-flash-lite",
         "gemini:gemini-3.1-flash-lite",
-        "gemini:gemma-4-31b-it",
-        "gemini:gemma-4-26b-a4b-it",
         "gemini:gemini-3.8-flash",
         "gemini:gemini-3.1-pro-preview",
         "gemini:gemini-3.7-flash",
@@ -3809,28 +3824,6 @@ def _seed_runtime_state() -> None:
     # Add OpenAI models when key is present.
     if OPENAI_KEY:
         picker[:0] = ["openai:gpt-5.5", "openai:gpt-5.6-luna"]
-    # Cloudflare needs BOTH halves (the endpoint is account-scoped) — with only one of
-    # them the model would sit in the picker and fail on first use, so skip it instead.
-    if CLOUDFLARE_TOKEN and CLOUDFLARE_ACCOUNT:
-        fields = {"api_key": CLOUDFLARE_TOKEN, "account_id": CLOUDFLARE_ACCOUNT}
-        _ow_post("/v1/providers", {"name": "cloudflare", "fields": fields})
-        # Gate the picker entry on a live credential check. A model that 401s is worse
-        # than a missing one: quota failover walks the picker, so a dead entry at the end
-        # of the chain turns "out of quota, retrying" into a hard turn failure (seen
-        # 2026-08-08 with a zone-scoped token). Only an outright auth rejection hides it —
-        # a 404/timeout proves nothing, so those still get the benefit of the doubt.
-        check = _ow_post(
-            "/v1/providers/verify", {"name": "cloudflare", "fields": fields}, timeout=20
-        )
-        if isinstance(check, dict) and not check.get("ok") and "Workers AI" in str(
-            check.get("error", "")
-        ):
-            print(
-                f"[launch] skipping Cloudflare models: {check.get('error')}",
-                file=sys.stderr,
-            )
-        else:
-            picker.extend(CLOUDFLARE_MODELS)
     for model in picker:
         _ow_post("/v1/settings/models/add", {"model": model})
 
@@ -3843,30 +3836,25 @@ def _seed_runtime_state() -> None:
         "gemini:gemini-2.5-pro",               # deprecated, shutdown 2026-10-16
         "gemini:gemini-3.1-flash-lite-preview",
         "gemini:gemini-3-flash-preview",        # superseded by 3.5+
+        "gemini:gemma-4-31b-it",               # removed per user request
+        "gemini:gemma-4-26b-a4b-it",            # removed per user request
         "groq:llama-3.3-70b-versatile",        # deprecated 2026-08-16
         "ollama:qwen2.5:7b",
+        "cloudflare:@cf/openai/gpt-oss-120b",
+        "cloudflare:@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "cloudflare:google/gemini-3.6-flash",
     ]
-    # Cloudflare partner models bill against an AI Gateway balance and 402 while it's
-    # empty. Skipping the add is NOT enough: models/add persists, so an entry seeded by
-    # an earlier boot (or a hand-run curl) survives forever and keeps poisoning the
-    # quota-failover chain. Anything not opted into via CLOUDFLARE_MODEL gets removed.
-    for partner in ("cloudflare:google/gemini-3.6-flash",):
-        if partner not in CLOUDFLARE_MODELS:
-            hide.append(partner)
     for model in hide:
         _ow_post("/v1/settings/models/remove", {"model": model})
+    _ow_delete("/v1/providers/cloudflare")
 
-    # 1c. Pin default model: Claude Haiku > Cloudflare gpt-oss-120b > Gemini 3.5 Flash-Lite.
-    # Pinned every boot so a fresh chat can't inherit qwen from a stale session (the
-    # original cause of "why is my agent writing fake code").
-    # gpt-oss-120b sits above Gemini deliberately (2026-08-08): the Gemini free tier here
-    # empties by mid-morning, and a default that 429s on the user's first message is worse
-    # than a slightly different model that answers. gpt-oss runs on Workers AI neurons,
-    # has 128k context, and tool-calls correctly (verified against the live endpoint).
+    # 1c. Pin default model: Claude Haiku > Groq gpt-oss-120b > Cohere > Gemini 3.5 Flash-Lite.
     if ANTHROPIC_KEY:
         default_model = "anthropic:claude-haiku-4-5"
-    elif "cloudflare:@cf/openai/gpt-oss-120b" in picker:
-        default_model = "cloudflare:@cf/openai/gpt-oss-120b"
+    elif GROQ_KEY:
+        default_model = "groq:openai/gpt-oss-120b"
+    elif COHERE_KEY:
+        default_model = "cohere:command-a-03-2025"
     else:
         default_model = "gemini:gemini-3.5-flash-lite"
     _ow_post("/v1/settings/default-model", {"model": default_model})
@@ -4266,10 +4254,6 @@ def main() -> None:
         env["OPENAI_API_KEY"] = OPENAI_KEY
     if COHERE_KEY:
         env["COHERE_API_KEY"] = COHERE_KEY
-    if CLOUDFLARE_TOKEN:
-        env["CLOUDFLARE_API_TOKEN"] = CLOUDFLARE_TOKEN
-    if CLOUDFLARE_ACCOUNT:
-        env["CLOUDFLARE_ACCOUNT_ID"] = CLOUDFLARE_ACCOUNT
     env["CONNECT_AI_API_TOKEN"] = API_TOKEN
     env["COWORKER_API_TOKEN"] = API_TOKEN  # legacy readers (bridges, old scripts)
     # Pin state dir explicitly. Without this, if launch.py is invoked from a

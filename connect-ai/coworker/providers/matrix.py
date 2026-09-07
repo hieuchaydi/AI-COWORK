@@ -90,12 +90,6 @@ MATRIX: dict[str, ModelEntry] = {
     "gemini:gemini-3.1-flash-lite": ModelEntry(
         "Gemini 3.1 Flash-Lite · Google", _AGENTIC_VISION, 1_048_576
     ),
-    "gemini:gemma-4-31b-it": ModelEntry(
-        "Gemma 4 31B · Google", _AGENTIC_VISION_SERIAL, 262_144
-    ),
-    "gemini:gemma-4-26b-a4b-it": ModelEntry(
-        "Gemma 4 26B A4B · Google", _AGENTIC_VISION_SERIAL, 262_144
-    ),
     "gemini:gemini-3.8-flash": ModelEntry(
         "Gemini 3.8 Flash · Google", _AGENTIC_VISION, 1_048_576
     ),
@@ -186,21 +180,6 @@ MATRIX: dict[str, ModelEntry] = {
     ),
     "openrouter:meta-llama/llama-4-maverick": ModelEntry(
         "Llama 4 Maverick · via OpenRouter", _AGENTIC, 1_000_000
-    ),
-    # Cloudflare fronts partner models under `<lab>/<model>` (its own open-weight catalog
-    # keeps the @cf/ prefix). Vision/PDF left off for the same reason as the resellers
-    # above — the OpenAI-compat surface has no inline file part.
-    # Two billing worlds behind one token, verified 2026-08-08: @cf/* run on the account's
-    # Workers AI neuron allocation, partner models need money in the AI Gateway (they
-    # answer 402 "Insufficient balance" otherwise), so don't assume one implies the other.
-    "cloudflare:@cf/openai/gpt-oss-120b": ModelEntry(
-        "GPT-OSS 120B · via Cloudflare", _AGENTIC, 128_000
-    ),
-    "cloudflare:@cf/meta/llama-3.3-70b-instruct-fp8-fast": ModelEntry(
-        "Llama 3.3 70B fast · via Cloudflare", _AGENTIC, 24_000
-    ),
-    "cloudflare:google/gemini-3.6-flash": ModelEntry(
-        "Gemini 3.6 Flash · via Cloudflare", _AGENTIC, 1_048_576
     ),
     # Groq — LPU inference, free tier. 131K context window across models.
     # Tool support: gpt-oss-120b, gpt-oss-20b, qwen3.6-27b support native tool calling.

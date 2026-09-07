@@ -541,8 +541,6 @@ def test_curated_gemini_catalog_contains_general_llms_only():
         "gemini-2.5-pro",
         "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
-        "gemma-4-31b-it",
-        "gemma-4-26b-a4b-it",
     }
     assert expected <= set(models)
     assert not any(
@@ -550,10 +548,6 @@ def test_curated_gemini_catalog_contains_general_llms_only():
         for model in models
         for marker in ("image", "live", "tts", "embedding", "antigravity")
     )
-
-    gemma_caps = capabilities_for("gemini:gemma-4-31b-it")
-    assert gemma_caps.tools and gemma_caps.vision and gemma_caps.streaming
-    assert not gemma_caps.pdf and not gemma_caps.parallel_tool_calls
 
 
 def test_convert_pdf_file_part_to_inline_data():

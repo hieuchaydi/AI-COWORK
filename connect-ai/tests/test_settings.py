@@ -199,5 +199,5 @@ def test_model_picker_only_returns_configured_providers(tmp_path, monkeypatch):
     assert all(model.startswith("gemini:") for model in settings["models"])
     assert set(settings["model_labels"]) <= set(settings["models"])
     assert set(settings["model_context_windows"]) <= set(settings["models"])
-    assert "gemini:gemma-4-31b-it" in settings["models"]
+    assert "gemini:gemini-3.5-flash" in settings["models"]
     assert "gemini:gemini-3.8-flash" in settings["models"]

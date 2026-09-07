@@ -204,45 +204,7 @@ def _openai_compat(vendor: str, default_base_url: str, env_key: Optional[str] = 
     return build
 
 
-CLOUDFLARE_MAX_TOKENS = 8192
 
-
-def _cloudflare_base_url(profile: dict[str, Any]) -> str:
-    """Workers AI is account-scoped — the account id is part of the URL, so we build the
-    endpoint instead of prefilling a static one. An explicit `base_url` still wins (that's
-    how you route through a named AI Gateway instead)."""
-    base = ((profile or {}).get("base_url") or "").strip().rstrip("/")
-    if base:
-        return base
-    account = ((profile or {}).get("account_id") or "").strip() or os.environ.get(
-        "CLOUDFLARE_ACCOUNT_ID", ""
-    ).strip()
-    if not account:
-        raise RuntimeError(
-            "No Cloudflare account id configured — add it in Settings ▸ Models "
-            "(or set CLOUDFLARE_ACCOUNT_ID)."
-        )
-    return f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1"
-
-
-def _build_cloudflare(profile: dict[str, Any], secrets: Any) -> ProviderClient:
-    # Same "own key only" rule as _openai_compat: never fall back to the OpenAI key.
-    api_key = ((profile or {}).get("api_key") or "").strip() or os.environ.get(
-        "CLOUDFLARE_API_TOKEN", ""
-    ).strip()
-    if not api_key:
-        raise RuntimeError(
-            "No Cloudflare API token configured — add it in Settings ▸ Models."
-        )
-    return OpenAIProvider(
-        api_key=api_key,
-        base_url=_cloudflare_base_url(profile),
-        # Workers AI caps output at 256 tokens when the request omits max_tokens, which
-        # a reasoning model like gpt-oss-120b burns entirely on thinking — the turn ends
-        # finish_reason=length with no content and no tool calls. Fits the smallest
-        # Cloudflare context here (llama-3.3-70b-fp8-fast, 24k) with room to spare.
-        default_max_tokens=CLOUDFLARE_MAX_TOKENS,
-    )
 
 
 def _compat(
@@ -613,44 +575,6 @@ DESCRIPTORS: list[ProviderDescriptor] = [
         recommended_model="z-ai/glm-5.2",
         env_key="OPENROUTER_API_KEY",
     ),
-    # Cloudflare: partner models (google/…, openai/…, anthropic/…) and the open-weight
-    # @cf/* catalog behind one Cloudflare token, billed by Cloudflare. Account-scoped URL,
-    # so it gets its own builder instead of _compat's static endpoint.
-    ProviderDescriptor(
-        name="cloudflare",
-        title="Cloudflare Workers AI",
-        needs_key=True,
-        fields=[
-            ProviderField(
-                "api_key",
-                "Cloudflare API token",
-                secret=True,
-                help="Must carry the Workers AI permission — the 'Generate API Token' button "
-                "on the model page in the Cloudflare dashboard mints one. A zone-scoped "
-                "token authenticates fine everywhere else but 401s here.",
-            ),
-            ProviderField(
-                "account_id",
-                "Account ID",
-                placeholder="32 hex characters",
-                help="The id in your dashboard URL (dash.cloudflare.com/<account_id>/…) — "
-                "Workers AI endpoints are per-account.",
-            ),
-            ProviderField(
-                "base_url",
-                "Endpoint",
-                required=False,
-                placeholder="https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1",
-                help="Blank = built from the account id. Override to go through a named AI "
-                "Gateway: https://gateway.ai.cloudflare.com/v1/<account_id>/<gateway>/compat",
-            ),
-        ],
-        build=_build_cloudflare,
-        recommended_model="google/gemini-3.6-flash",
-        env_key="CLOUDFLARE_API_TOKEN",
-        blurb="One Cloudflare token for partner models (Gemini, GPT, Claude) plus the "
-        "open-weight @cf/* catalog, through Workers AI's OpenAI-compatible endpoint.",
-    ),
     ProviderDescriptor(
         name="ollama",
         title="Ollama (local models)",
@@ -933,23 +857,6 @@ def verify_provider_key(
         elif name == "ollama":
             base = _normalize_ollama_url(base_url)
             resp = httpx.get(base.rstrip("/") + "/models", timeout=timeout)
-        elif name == "cloudflare":
-            # Two traps here. (1) There's no prefilled endpoint to fall back on, so the
-            # generic branch would send the Cloudflare token to api.openai.com and call
-            # every key invalid. (2) Cloudflare's compat surface has no GET /models —
-            # it answers 405. So check the Workers AI catalog instead: same account, and
-            # it needs exactly the permission a token must carry to run a model.
-            account = ((fields or {}).get("account_id") or "").strip() or os.environ.get(
-                "CLOUDFLARE_ACCOUNT_ID", ""
-            ).strip()
-            if not account:
-                return {"ok": False, "error": "Enter your Cloudflare account id to test."}
-            resp = httpx.get(
-                f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/models/search",
-                params={"per_page": 1},
-                headers={"Authorization": f"Bearer {key}"},
-                timeout=timeout,
-            )
         else:  # openai + any OpenAI-compatible endpoint (Azure, OpenRouter, vendors, vLLM…)
             default_base = next(
                 (f.default for f in d.fields if f.key == "base_url" and f.default), ""
@@ -975,15 +882,6 @@ def verify_provider_key(
     if resp.status_code in (401, 403):
         if name == "ollama":
             return {"ok": False, "error": "Server rejected the request."}
-        if name == "cloudflare":
-            # Distinct failure worth naming: a Cloudflare token can be valid everywhere
-            # else and still 401 here. Zone-scoped tokens are the usual culprit.
-            return {
-                "ok": False,
-                "error": "Cloudflare rejected the token. It must be an ACCOUNT token with "
-                "the Workers AI permission (My Profile ▸ API Tokens ▸ Create Token ▸ "
-                "Workers AI) — a zone-scoped token verifies fine but 401s here.",
-            }
         return {"ok": False, "error": "Invalid API key."}
     if resp.status_code == 404 and name == "ollama":
         return {

@@ -74,6 +74,7 @@ def test_quota_fails_over_to_next_model(tmp_path):
     engine = _engine(
         tmp_path,
         provider,
+        model="gemini:gemini-3.7-flash",
         fallbacks=["gemini:gemini-3.7-flash", "groq:openai/gpt-oss-120b"],
     )
     events = _collect(engine)

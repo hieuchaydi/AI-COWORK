@@ -91,32 +91,6 @@ def test_verify_ollama_uses_v1_models_no_key(monkeypatch):
     assert "headers" not in cap  # keyless
 
 
-def test_verify_cloudflare_checks_the_workers_ai_catalog(monkeypatch):
-    """Cloudflare's compat surface answers 405 to GET /models, and the descriptor has no
-    prefilled endpoint to fall back on — so verify hits the account's Workers AI catalog
-    instead of drifting onto api.openai.com with a Cloudflare token."""
-    cap: dict = {}
-    _patch_get(monkeypatch, status=200, capture=cap)
-    assert verify_provider_key(
-        "cloudflare", api_key="cf-tok", fields={"account_id": "acc1"}
-    ) == {"ok": True}
-    assert (
-        cap["url"]
-        == "https://api.cloudflare.com/client/v4/accounts/acc1/ai/models/search"
-    )
-    assert cap["headers"]["Authorization"] == "Bearer cf-tok"
-
-    # The permission trap gets its own message, not a generic "invalid key".
-    _patch_get(monkeypatch, status=403)
-    res = verify_provider_key("cloudflare", api_key="cf-tok", fields={"account_id": "acc1"})
-    assert res["ok"] is False
-    assert "Workers AI" in res["error"]
-
-    monkeypatch.delenv("CLOUDFLARE_ACCOUNT_ID", raising=False)
-    missing = verify_provider_key("cloudflare", api_key="cf-tok", fields={})
-    assert missing["ok"] is False and "account id" in missing["error"]
-
-
 def test_verify_network_error_is_clean(monkeypatch):
     _patch_get(monkeypatch, raise_exc=ConnectionError("boom"))
     res = verify_provider_key("openai", api_key="sk-x")

@@ -393,60 +393,6 @@ def test_output_budget_only_fills_a_gap_and_only_when_opted_in():
     assert "max_tokens" not in explicit.chat.completions.calls[1]
 
 
-def test_cloudflare_provider_ships_an_output_budget(monkeypatch):
-    from coworker.providers.registry import CLOUDFLARE_MAX_TOKENS, build_provider_client
-
-    p = build_provider_client("cloudflare", {"api_key": "k", "account_id": "a"}, None)
-    assert p._default_max_tokens == CLOUDFLARE_MAX_TOKENS
-    # Must fit the smallest Cloudflare context in the matrix (llama-3.3-70b-fp8-fast, 24k).
-    assert 1024 <= CLOUDFLARE_MAX_TOKENS <= 16384
-
-
-def test_cloudflare_builder_composes_account_scoped_endpoint(monkeypatch):
-    """Workers AI puts the account id in the URL, so the endpoint is built, not prefilled."""
-    import pytest
-
-    from coworker.providers.registry import build_provider_client, get_descriptor
-    from coworker.server.manager import SessionManager
-
-    monkeypatch.delenv("CLOUDFLARE_API_TOKEN", raising=False)
-    monkeypatch.delenv("CLOUDFLARE_ACCOUNT_ID", raising=False)
-
-    p = build_provider_client("cloudflare", {"api_key": "cf-tok", "account_id": "acc1"}, None)
-    assert p._api_key == "cf-tok"
-    assert p._base_url == "https://api.cloudflare.com/client/v4/accounts/acc1/ai/v1"
-
-    # An explicit endpoint wins — that's how you point at a named AI Gateway.
-    gateway = "https://gateway.ai.cloudflare.com/v1/acc1/default/compat"
-    p2 = build_provider_client(
-        "cloudflare", {"api_key": "cf-tok", "account_id": "acc1", "base_url": gateway}, None
-    )
-    assert p2._base_url == gateway
-
-    # Env fallback for both halves, and a named error when either is missing.
-    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "env-tok")
-    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acc2")
-    p3 = build_provider_client("cloudflare", {}, None)
-    assert p3._api_key == "env-tok"
-    assert p3._base_url.endswith("/accounts/acc2/ai/v1")
-
-    monkeypatch.delenv("CLOUDFLARE_ACCOUNT_ID")
-    with pytest.raises(RuntimeError, match="account id"):
-        build_provider_client("cloudflare", {"api_key": "cf-tok"}, None)
-
-    # A configured OpenAI key must never be sent to Cloudflare's endpoint.
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-real")
-    monkeypatch.delenv("CLOUDFLARE_API_TOKEN")
-    with pytest.raises(RuntimeError, match="Cloudflare"):
-        build_provider_client("cloudflare", {"account_id": "acc1"}, None)
-
-    # set_provider auto-adds the recommended model only if it's a suggested one.
-    d = get_descriptor("cloudflare")
-    assert d.recommended_model in SessionManager._suggested_models(
-        SessionManager.__new__(SessionManager), "cloudflare"
-    )
-
-
 # -- curated model matrix (labels + capabilities by full routed id) -----------------
 
 
@@ -473,13 +419,10 @@ def test_matrix_labels_and_custom_model_fallback():
     # Deliberately small: agent-capable current models only. The ceiling leaves room for
     # the official Gemini 2.5/3.x generations while still catching catalog bloat.
     assert len(MATRIX) < 100
-    assert any(e.caps.tools for e in MATRIX.values())
-    assert labels["gemini:gemma-4-31b-it"] == "Gemma 4 31B · Google"
-    assert labels["gemini:gemma-4-26b-a4b-it"] == "Gemma 4 26B A4B · Google"
     assert labels["gemini:gemini-3.8-flash"] == "Gemini 3.8 Flash · Google"
-    gemma_caps = capabilities_for("gemini:gemma-4-31b-it")
-    assert gemma_caps.tools and gemma_caps.vision and not gemma_caps.pdf
-    assert not gemma_caps.parallel_tool_calls
+    gemini_caps = capabilities_for("gemini:gemini-3.8-flash")
+    assert gemini_caps.tools and gemini_caps.vision and gemini_caps.pdf
+    assert gemini_caps.parallel_tool_calls
     # A custom (unlisted) reseller model falls back to the conservative default — usable,
     # but at the user's own risk (no parallel tool calls assumed).
     caps = capabilities_for("together:some-org/Brand-New-Model")
