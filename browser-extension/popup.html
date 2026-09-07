@@ -12,6 +12,18 @@
     <div id="statusBadge" class="badge disconnected">Disconnected</div>
   </div>
 
+  <div id="resultSection" class="section result-section" style="display: none;">
+    <div class="section-title">Kết quả mới nhất</div>
+    <div id="resultSummary" class="result-summary"></div>
+    <div id="resultActions" class="result-actions">
+      <a id="downloadCsv" class="result-link csv-link" target="_blank" rel="noopener">Tải CSV</a>
+      <a id="downloadZip" class="result-link zip-link" target="_blank" rel="noopener">Tải ZIP ảnh/video</a>
+      <a id="openManifest" class="result-link secondary-link" target="_blank" rel="noopener">Xem manifest</a>
+      <a id="openReport" class="result-link secondary-link" target="_blank" rel="noopener">Xem báo cáo</a>
+    </div>
+    <div id="zipParts" class="zip-parts"></div>
+  </div>
+
   <div class="section">
     <label for="gatewayUrl">Gateway URL</label>
     <div class="input-row">

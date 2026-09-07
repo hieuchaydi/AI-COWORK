@@ -75,6 +75,61 @@ body {
   margin-bottom: 6px;
 }
 
+.result-section {
+  padding: 10px;
+  border: 1px solid #b7dfbf;
+  border-radius: 6px;
+  background: #f2fbf4;
+}
+
+.result-summary {
+  margin-bottom: 8px;
+  color: #137333;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.result-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.result-link {
+  box-sizing: border-box;
+  padding: 7px 8px;
+  border-radius: 4px;
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 600;
+  text-align: center;
+  text-decoration: none;
+}
+
+.result-link.csv-link { background: #188038; }
+.result-link.zip-link { background: #1a73e8; }
+.result-link.secondary-link {
+  background: #e8eaed;
+  color: #3c4043;
+}
+.result-link:hover { filter: brightness(0.94); }
+.result-link.is-hidden { display: none; }
+
+.zip-parts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 7px;
+}
+
+.zip-part-link {
+  color: #1a73e8;
+  font-size: 11px;
+  text-decoration: none;
+}
+
+.zip-part-link:hover { text-decoration: underline; }
+
 label {
   display: block;
   font-size: 11px;

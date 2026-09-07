@@ -37,6 +37,7 @@ let verificationInfo = null;
 let pendingVerificationJobs = new Map();
 let lastVerificationJob = null;
 let connectionConflict = null;
+let lastCompletedResult = null;
 
 function setBadge(text, color = "#1a73e8") {
   chrome.action.setBadgeText({ text: String(text || "") });
@@ -228,6 +229,28 @@ async function uploadIngestResult(body) {
     offset = end;
   }
   return sendIngestRequest({ operation: "complete", uploadId });
+}
+
+async function rememberCompletedResult(job, savedResult) {
+  if (!savedResult || savedResult.ok !== true) return null;
+  const result = {
+    jobId: job?.id || null,
+    source: job?.url || null,
+    completedAt: Date.now(),
+    count: Number(savedResult.count) || 0,
+    csv: savedResult.csv || null,
+    media_dir: savedResult.media_dir || null,
+    manifest: savedResult.manifest || null,
+    zip: savedResult.zip || null,
+    zip_url: savedResult.zip_url || null,
+    zip_parts: Array.isArray(savedResult.zip_parts) ? savedResult.zip_parts : [],
+    zip_urls: Array.isArray(savedResult.zip_urls) ? savedResult.zip_urls : [],
+    report: savedResult.report || null,
+    report_url: savedResult.report_url || null,
+  };
+  lastCompletedResult = result;
+  await chrome.storage.local.set({ lastCompletedResult: result });
+  return result;
 }
 
 function mediaUrl(value, kind = "image") {
@@ -945,7 +968,8 @@ async function runJob(job) {
       outputName,
     });
     await progress({ status: "saving", stage: "upload", message: `Đang lưu ${rows.length} dòng`, rows: rows.length, percent: 95 });
-    await uploadIngestResult({ job: job.id, name: outputName, source: job.url, rows });
+    const savedResult = await uploadIngestResult({ job: job.id, name: outputName, source: job.url, rows });
+    await rememberCompletedResult(job, savedResult);
     await traceJob(job, progress, "upload-complete", {
       itemid,
       shopid: job._targetShopId,
@@ -1142,7 +1166,7 @@ async function handleAction(action, params) {
     case "browser.health":
       return {
         status: "ok",
-        version: "2.2.0",
+        version: chrome.runtime.getManifest?.().version || "2.3.0",
         connected: bridgeSocket ? bridgeSocket.readyState === WebSocket.OPEN : false,
         activeJobsCount: activeJobs.size,
         extensionState,
@@ -2135,6 +2159,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     chrome.storage.local.get([
       "gatewayUrl",
       "lastConnectionError",
+      "lastCompletedResult",
     ], (stored) => {
       const socketConnected = Boolean(
         bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN,
@@ -2150,6 +2175,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         verificationInfo,
         connectionConflict,
         currentJob: activeJobs.size > 0 ? Array.from(activeJobs.values())[0] : null,
+        lastCompletedResult: lastCompletedResult || stored.lastCompletedResult || null,
         reconnectAttempts,
         lastBridgeMessageAt,
       });
@@ -2196,6 +2222,7 @@ if (typeof module !== "undefined" && module.exports) {
     sendCheckpoint,
     clearPendingIngestRequests,
     executeScriptResultWithRetry,
+    rememberCompletedResult,
     knownJobs,
     pendingVerificationJobs,
     notifiedVerificationJobIds,

@@ -107,6 +107,42 @@ test('getStatus reports the live service-worker socket instead of stale storage'
   assert.equal(stored.extensionState, 'disconnected');
 });
 
+test('completed ingest result is persisted for popup download links', async () => {
+  const { context, stored, getMessageListener } = await worker();
+  const result = await vm.runInContext(`rememberCompletedResult(
+    { id: "job-downloads", url: "https://shopee.vn/product/93922606/1546910319" },
+    {
+      ok: true,
+      count: 6789,
+      csv: "outputs/csv/shopee_1546910319_reviews.csv",
+      media_dir: "outputs/media/shopee_1546910319_reviews",
+      manifest: "outputs/media/shopee_1546910319_reviews/manifest.json",
+      zip: "outputs/zips/shopee_1546910319_reviews_media_part01.zip",
+      zip_url: "/outputs/zips/shopee_1546910319_reviews_media_part01.zip",
+      zip_parts: [
+        "outputs/zips/shopee_1546910319_reviews_media_part01.zip",
+        "outputs/zips/shopee_1546910319_reviews_media_part02.zip"
+      ],
+      zip_urls: [
+        "/outputs/zips/shopee_1546910319_reviews_media_part01.zip",
+        "/outputs/zips/shopee_1546910319_reviews_media_part02.zip"
+      ],
+      report_url: "/outputs/text/shopee_1546910319_reviews_report.md",
+      rows: [{ should_not_be_persisted: true }]
+    }
+  )`, context);
+
+  assert.equal(result.count, 6789);
+  assert.equal(result.zip_urls.length, 2);
+  assert.equal(stored.lastCompletedResult.jobId, 'job-downloads');
+  assert.equal(stored.lastCompletedResult.rows, undefined);
+
+  let response;
+  assert.equal(getMessageListener()({ action: 'getStatus' }, {}, value => { response = value; }), true);
+  assert.equal(response.lastCompletedResult.csv, 'outputs/csv/shopee_1546910319_reviews.csv');
+  assert.equal(response.lastCompletedResult.zip_urls.length, 2);
+});
+
 test('starting a new job clears stale Shopee attention from the popup', async () => {
   const { context, stored } = await worker();
   vm.runInContext(`

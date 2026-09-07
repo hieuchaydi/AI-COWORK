@@ -14,6 +14,13 @@ const verificationTargetUrl = document.getElementById("verificationTargetUrl");
 const btnOpenVerificationTab = document.getElementById("btnOpenVerificationTab");
 const btnResumeVerification = document.getElementById("btnResumeVerification");
 const tabList = document.getElementById("tabList");
+const resultSection = document.getElementById("resultSection");
+const resultSummary = document.getElementById("resultSummary");
+const downloadCsv = document.getElementById("downloadCsv");
+const downloadZip = document.getElementById("downloadZip");
+const openManifest = document.getElementById("openManifest");
+const openReport = document.getElementById("openReport");
+const zipParts = document.getElementById("zipParts");
 
 let currentVerification = null;
 
@@ -42,6 +49,63 @@ function gatewayStatusUrl(wsUrl) {
   target.search = "";
   target.hash = "";
   return target.toString();
+}
+
+function outputUrl(path, wsUrl) {
+  if (!path) return "";
+  const value = String(path).trim();
+  if (!value) return "";
+  const base = new URL(gatewayStatusUrl(wsUrl));
+  if (!["127.0.0.1", "localhost", "[::1]"].includes(base.hostname)) return "";
+  if (/^https?:\/\//i.test(value)) {
+    const absolute = new URL(value);
+    return ["127.0.0.1", "localhost", "[::1]"].includes(absolute.hostname) ? absolute.toString() : "";
+  }
+  return new URL(value.startsWith("/") ? value : `/${value}`, base.origin).toString();
+}
+
+function setResultLink(element, path, wsUrl) {
+  const url = outputUrl(path, wsUrl);
+  element.classList.toggle("is-hidden", !url);
+  if (url) element.href = url;
+  else element.removeAttribute("href");
+  return Boolean(url);
+}
+
+function renderCompletedResult(result, wsUrl) {
+  if (!result || !result.count) {
+    resultSection.style.display = "none";
+    return;
+  }
+
+  resultSection.style.display = "block";
+  const completed = result.completedAt ? new Date(result.completedAt).toLocaleString("vi-VN") : "";
+  const count = Number(result.count).toLocaleString("vi-VN");
+  resultSummary.textContent = `Đã lưu ${count} đánh giá${completed ? ` · ${completed}` : ""}`;
+
+  setResultLink(downloadCsv, result.csv, wsUrl);
+  const allZipUrls = Array.isArray(result.zip_urls) && result.zip_urls.length
+    ? result.zip_urls
+    : [result.zip_url || result.zip].filter(Boolean);
+  setResultLink(downloadZip, allZipUrls[0], wsUrl);
+  downloadZip.textContent = allZipUrls.length > 1 ? "Tải ZIP part 01" : "Tải ZIP ảnh/video";
+  setResultLink(openManifest, result.manifest, wsUrl);
+  setResultLink(openReport, result.report_url || result.report, wsUrl);
+
+  zipParts.innerHTML = "";
+  if (allZipUrls.length > 1) {
+    allZipUrls.forEach((path, index) => {
+      const url = outputUrl(path, wsUrl);
+      if (!url) return;
+      const link = document.createElement("a");
+      link.className = "zip-part-link";
+      link.href = url;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = `ZIP part ${String(index + 1).padStart(2, "0")}`;
+      zipParts.appendChild(link);
+    });
+  }
 }
 
 async function readGatewayStatus(wsUrl) {
@@ -166,6 +230,7 @@ async function loadConfig() {
     "verificationInfo",
     "currentJob",
     "lastConnectionError",
+    "lastCompletedResult",
   ]);
   const runtime = await runtimeStatus();
   const gateway = await readGatewayStatus(res.gatewayUrl);
@@ -178,6 +243,7 @@ async function loadConfig() {
   const state = runtime?.extensionState || res.extensionState;
   const verification = runtime?.verificationInfo ?? res.verificationInfo;
   const currentJob = runtime?.currentJob ?? res.currentJob;
+  const completedResult = runtime?.lastCompletedResult ?? res.lastCompletedResult;
   const connectionError = document.getElementById("connectionError");
   if (state === "client_conflict") {
     const ownerId = runtime?.connectionConflict?.owner?.clientId;
@@ -190,6 +256,7 @@ async function loadConfig() {
     connectionError.textContent = runtime?.lastConnectionError || res.lastConnectionError || "";
   }
   renderStatus(state, { verification, currentJob });
+  renderCompletedResult(completedResult, gatewayUrlInput.value);
   loadTabs();
 }
 
