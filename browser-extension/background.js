@@ -100,7 +100,7 @@ function sendIngestRequest(params) {
   return new Promise((resolve, reject) => {
     const started = Date.now();
     const retry = () => {
-      if (Date.now() - started > 300000) {
+      if (Date.now() - started > 30000) {
         clearInterval(timer);
         pendingIngestRequests.delete(id);
         reject(new Error("WebSocket ingest acknowledgement timed out"));
@@ -111,6 +111,21 @@ function sendIngestRequest(params) {
     const timer = setInterval(retry, 5000);
     pendingIngestRequests.set(id, { resolve, reject, timer, message });
     retry();
+  });
+}
+
+function clearPendingIngestRequests(reason = "WebSocket disconnected") {
+  for (const [id, req] of pendingIngestRequests.entries()) {
+    clearInterval(req.timer);
+    pendingIngestRequests.delete(id);
+    try { req.reject(new Error(reason)); } catch {}
+  }
+}
+
+async function sendCheckpoint(params) {
+  return sendIngestRequest({
+    operation: "checkpoint",
+    ...params,
   });
 }
 
@@ -267,6 +282,13 @@ function crawlPercent(rows, total, base, span) {
   return Math.min(95, base + Math.floor((rows / MAX_REVIEWS) * span));
 }
 
+function normalizeShopeeUrl(url) {
+  if (!url) return "";
+  return String(url)
+    .trim()
+    .replace(/^(https?:\/\/)(?:www\.)?shoppe\.vn(\/.*)?$/i, "$1shopee.vn$2");
+}
+
 function isShopeeHostname(hostname) {
   if (!hostname || typeof hostname !== "string") return false;
   const h = hostname.toLowerCase();
@@ -276,7 +298,7 @@ function isShopeeHostname(hostname) {
 function isValidShopeeUrl(urlStr) {
   if (!urlStr || typeof urlStr !== "string") return false;
   try {
-    const u = new URL(urlStr, "https://shopee.vn");
+    const u = new URL(normalizeShopeeUrl(urlStr), "https://shopee.vn");
     return (u.protocol === "http:" || u.protocol === "https:") && isShopeeHostname(u.hostname);
   } catch {
     return false;
@@ -285,7 +307,7 @@ function isValidShopeeUrl(urlStr) {
 
 function extractShopName(url) {
   try {
-    const u = new URL(url, "https://shopee.vn");
+    const u = new URL(normalizeShopeeUrl(url), "https://shopee.vn");
     const reserved = new Set([
       "product", "cart", "user", "buyer", "search", "flash_sale",
       "daily_discover", "m", "portal", "verify", "api", "order",
@@ -301,7 +323,8 @@ function extractShopName(url) {
 
 function idsFrom(url) {
   try {
-    const u = new URL(url, "https://shopee.vn");
+    const normalizedUrl = normalizeShopeeUrl(url);
+    const u = new URL(normalizedUrl, "https://shopee.vn");
     const q = u.searchParams;
     const qItem = q.get("itemid") || q.get("item_id");
     if (qItem) return { shopid: q.get("shopid") || q.get("shop_id") || null, itemid: qItem, shopname: extractShopName(url) };
@@ -477,8 +500,17 @@ async function executeScriptResultWithRetry(options) {
   let lastError = "executeScript returned no result";
   for (let attempt = 0; attempt <= SCRIPT_RETRY_DELAYS_MS.length; attempt++) {
     try {
-      const results = await chrome.scripting.executeScript(options);
-      if (results?.length && results[0] && Object.prototype.hasOwnProperty.call(results[0], "result")) {
+      let timer = null;
+      const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("executeScript timeout")), 20000);
+      });
+      const results = await Promise.race([
+        chrome.scripting.executeScript(options),
+        timeoutPromise,
+      ]).finally(() => {
+        if (timer) clearTimeout(timer);
+      });
+      if (results?.length && results[0] && results[0].result !== undefined && results[0].result !== null) {
         return results[0].result;
       }
       lastError = "executeScript returned no result";
@@ -505,6 +537,8 @@ async function fetchRatingsFromTab(tabId, itemid, shopid, offset, limit, referer
     world: "MAIN",
     func: async (iid, sid, off, lim, ref) => {
       const path = `/api/v2/item/get_ratings?filter=0&flag=1&itemid=${iid}&limit=${lim}&offset=${off}&shopid=${sid}&type=0`;
+      const controller = new AbortController();
+      const tid = setTimeout(() => controller.abort(new Error("TIMEOUT")), 15000);
       try {
         const resp = await fetch(path, {
           credentials: "include",
@@ -516,7 +550,9 @@ async function fetchRatingsFromTab(tabId, itemid, shopid, offset, limit, referer
           },
           referrer: ref,
           referrerPolicy: "strict-origin-when-cross-origin",
+          signal: controller.signal,
         });
+        clearTimeout(tid);
         const text = await resp.text();
         let json = null;
         try { json = JSON.parse(text); } catch {}
@@ -529,7 +565,8 @@ async function fetchRatingsFromTab(tabId, itemid, shopid, offset, limit, referer
           textSample: text.slice(0, 300),
         };
       } catch (err) {
-        return { ok: false, error: err.message };
+        clearTimeout(tid);
+        return { ok: false, error: err.message, isTimeout: err.name === "AbortError" || err.message === "TIMEOUT" };
       }
     },
     args: [itemid, shopid, offset, limit, referer],
@@ -542,6 +579,7 @@ function shopeeLoginState(fetchRes) {
   const url = String(fetchRes?.url || "").toLowerCase();
   const sample = String(fetchRes?.textSample || fetchRes?.error || "").toLowerCase();
 
+  if (json?.is_login === true || data?.is_login === true || sample.includes('"is_login":true') || sample.includes('"is_login": true')) return true;
   if (json?.is_login === false || data?.is_login === false) return false;
   if (json?.is_login === true || data?.is_login === true) return true;
   if (fetchRes?.status === 401 || url.includes("/login")) return false;
@@ -555,6 +593,16 @@ function classifyShopeeFailure(fetchRes) {
   const pageUrl = String(fetchRes?.pageUrl || "").toLowerCase();
   const sample = String(fetchRes?.textSample || fetchRes?.error || "").toLowerCase();
   if (shopeeLoginState(fetchRes) === false) return "login";
+
+  const loginState = shopeeLoginState(fetchRes);
+  if (loginState === true) {
+    const isChallenge = url.includes("/verify/traffic") || pageUrl.includes("/verify/traffic") ||
+                        sample.includes("captcha") ||
+                        sample.includes("challenge") || sample.includes("verify/traffic");
+    if (isChallenge) return "verification";
+    return "api_blocked";
+  }
+  if (loginState === false) return "login";
 
   const isChallenge = url.includes("/verify/traffic") || pageUrl.includes("/verify/traffic") ||
                       sample.includes("captcha") ||
@@ -642,6 +690,7 @@ function evaluatePreflightResult(fetchRes) {
 }
 
 async function extractShopeeReviews(job, progress) {
+  job.url = normalizeShopeeUrl(job.url);
   if (!isValidShopeeUrl(job.url)) {
     throw new Error(`Job URL không thuộc hostname shopee.vn: ${job.url}`);
   }
@@ -724,8 +773,22 @@ async function extractShopeeReviews(job, progress) {
   }
 
   let all = [];
-  let offset = 0;
-  let total = null;
+  let offset = (job.checkpoint && typeof job.checkpoint.next_offset === "number")
+    ? job.checkpoint.next_offset
+    : ((job.checkpoint && typeof job.checkpoint.offset === "number") ? job.checkpoint.offset : 0);
+  let total = (job.checkpoint && typeof job.checkpoint.total === "number") ? job.checkpoint.total : null;
+
+  if (offset === 0) {
+    try {
+      const stored = await chrome.storage.local.get([`checkpoint_${job.id}`]);
+      const chk = stored[`checkpoint_${job.id}`];
+      if (chk && typeof chk.next_offset === "number") {
+        offset = chk.next_offset;
+        if (chk.shopid && !shopid) shopid = chk.shopid;
+        if (chk.total && total === null) total = chk.total;
+      }
+    } catch {}
+  }
 
   while (all.length < MAX_REVIEWS) {
     const requestStarted = Date.now();
@@ -740,7 +803,7 @@ async function extractShopeeReviews(job, progress) {
       requestStart: requestStartIso,
     });
     let fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, tab.url || job.url);
-    if (!fetchRes.ok && fetchRes.retryableTabError) {
+    if (!fetchRes.ok && (fetchRes.retryableTabError || fetchRes.isTimeout)) {
       const recoveredTab = await findOrOpenShopeeTab(job.url, itemid);
       if (recoveredTab?.id) {
         tab = recoveredTab;
@@ -800,7 +863,7 @@ async function extractShopeeReviews(job, progress) {
     const normalised = batch.map(normaliseRating);
     all.push(...normalised);
     if (total === null) total = ratingTotal(json);
-    const pct = crawlPercent(all.length, total, 10, 80);
+    const pct = crawlPercent(all.length + offset, total, 10, 80);
     await traceJob(job, progress, "ratings-batch", {
       itemid,
       shopid,
@@ -809,21 +872,47 @@ async function extractShopeeReviews(job, progress) {
       tabId: tab.id,
       tabUrl: tab.url || "",
       batchSize: batch.length,
-      rowsCount: all.length,
+      rowsCount: all.length + offset,
       totalTarget: total,
     });
     await progress({
       status: "running",
       stage: "fetch",
-      message: `Đã cào ${all.length}${total ? "/" + total : ""} đánh giá`,
-      rows: all.length,
+      message: `Đã cào ${all.length + offset}${total ? "/" + total : ""} đánh giá`,
+      rows: all.length + offset,
       percent: pct,
     });
 
+    const nextOffset = offset + batch.length;
+    try {
+      await sendCheckpoint({
+        job: job.id,
+        offset: nextOffset,
+        next_offset: nextOffset,
+        itemid,
+        shopid,
+        rows: normalised,
+        total,
+      });
+      await chrome.storage.local.set({
+        [`checkpoint_${job.id}`]: {
+          next_offset: nextOffset,
+          itemid,
+          shopid,
+          total,
+          updated_at: Date.now(),
+        },
+      });
+    } catch (chkErr) {
+      console.warn("[bridge] Checkpoint send failed:", chkErr?.message || chkErr);
+    }
+
     if (batch.length < PAGE_SIZE) break;
     offset += PAGE_SIZE;
+    offset = nextOffset;
     await new Promise((s) => setTimeout(s, PACE_MS));
   }
+  try { await chrome.storage.local.remove([`checkpoint_${job.id}`]); } catch {}
   return all;
 }
 
@@ -1768,6 +1857,7 @@ function clearReconnect() {
 }
 
 function closeBridgeSocket({ preserveDetails = false, preserveState = null } = {}) {
+  clearPendingIngestRequests("WebSocket closed");
   if (bridgeHandshakeTimeout) clearTimeout(bridgeHandshakeTimeout);
   bridgeHandshakeTimeout = null;
   if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
@@ -1951,6 +2041,49 @@ async function configureConnection(message) {
 }
 
 // ── WebSocket Job Delivery ─────────────────────────────────────────────────
+// ── Job Queue Executor ─────────────────────────────────────────────────────
+const jobQueue = [];
+let isQueueRunning = false;
+let currentJobExecution = null;
+let queueWaiters = [];
+
+function notifyQueueWaiters() {
+  if (!isQueueRunning && jobQueue.length === 0) {
+    jobChain = Promise.resolve();
+    const waiters = queueWaiters.slice();
+    queueWaiters = [];
+    for (const w of waiters) {
+      try { w(); } catch {}
+    }
+  }
+}
+
+async function processJobQueue() {
+  if (isQueueRunning) return;
+  isQueueRunning = true;
+
+  while (jobQueue.length > 0) {
+    const queueItem = jobQueue.shift();
+    const job = queueItem.job;
+    const abortController = new AbortController();
+    currentJobExecution = { job, abortController, startedAt: Date.now() };
+
+    try {
+      console.log("[bridge] Executor starting job from queue:", job.id);
+      await runJob(job);
+    } catch (err) {
+      console.error("[bridge] Job execution error in queue:", job.id, err?.message || err);
+    } finally {
+      currentJobExecution = null;
+      activeJobs.delete(job.id);
+      if (knownJobs.size > 1000) knownJobs.delete(job.id);
+    }
+  }
+
+  isQueueRunning = false;
+  notifyQueueWaiters();
+}
+
 function enqueueLegacyJob(job) {
   if (!job || !job.id) return;
   bridgeSend({ v: 1, type: "accepted", id: job.id, jobId: job.id });
@@ -1958,21 +2091,34 @@ function enqueueLegacyJob(job) {
 
   // ACK every delivery, including a duplicate replay, so the server can release
   // its queue entry. Only the first non-active delivery is allowed to execute.
-  if (activeJobs.has(job.id)) {
+  if (activeJobs.has(job.id) || (currentJobExecution && currentJobExecution.job && currentJobExecution.job.id === job.id)) {
     console.log("[bridge] Job already active, skipping duplicate enqueue:", job.id);
     return;
   }
+  if (jobQueue.some((item) => item.job && item.job.id === job.id)) {
+    console.log("[bridge] Job already in queue, skipping duplicate enqueue:", job.id);
+    return;
+  }
+
   if (job.retry) {
     knownJobs.delete(job.id);
     notifiedVerificationJobIds.delete(job.id);
   }
   if (knownJobs.has(job.id)) return;
   knownJobs.add(job.id);
-  jobChain = jobChain.then(() => runJob(job)).catch((err) => console.error("[bridge] Job failed:", err))
-    .finally(() => {
-      // Bound completed-job deduplication without evicting queued jobs.
-      if (knownJobs.size > 1000) knownJobs.delete(job.id);
-    });
+
+  jobQueue.push({ job });
+
+  // Maintain jobChain promise for backwards compatibility with tests:
+  jobChain = new Promise((resolve) => {
+    queueWaiters.push(resolve);
+  });
+
+  processJobQueue().catch((err) => {
+    console.error("[bridge] processJobQueue unexpected error:", err);
+    isQueueRunning = false;
+    notifyQueueWaiters();
+  });
 }
 
 // ── Top-Level Listeners (MV3 Requirement) ───────────────────────────────────
@@ -2045,6 +2191,11 @@ if (typeof module !== "undefined" && module.exports) {
     resumeVerification,
     triggerVerificationRequired,
     enqueueLegacyJob,
+    jobQueue,
+    processJobQueue,
+    sendCheckpoint,
+    clearPendingIngestRequests,
+    executeScriptResultWithRetry,
     knownJobs,
     pendingVerificationJobs,
     notifiedVerificationJobIds,

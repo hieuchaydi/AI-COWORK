@@ -887,3 +887,245 @@ def test_preflight_login_required_stops_and_records_trace(server):
     assert "login required" in preflight_entries[0]["error"].lower()
 
 
+def test_job_endpoint_normalizes_shoppe_typo(server):
+    """The common shoppe.vn typo is normalized before the job is queued."""
+    base, _ = server
+    url = "https://shoppe.vn/lengkengvanphongpham/22235967241"
+    res = _get(base, f"/ingest/job?url={urllib.parse.quote(url)}")
+    assert res["ok"] is True
+    assert res["job"]["url"] == "https://shopee.vn/lengkengvanphongpham/22235967241"
+
+
+def test_is_allowed_ingest_media_url_supports_shoppe():
+    import launch
+
+    assert launch._is_allowed_ingest_media_url("https://shopee.vn/img.jpg")
+    assert launch._is_allowed_ingest_media_url("https://shoppe.vn/img.jpg")
+    assert launch._is_allowed_ingest_media_url("https://down-vn.img.susercontent.com/file/123")
+    assert not launch._is_allowed_ingest_media_url("https://evil.com/img.jpg")
+
+
+def test_checkpoint_does_not_create_premature_zip_or_csv(server):
+    base, outputs = server
+    import launch
+
+    queued = _get(base, "/ingest/job?url=https://shopee.vn/product/111/222")
+    job_id = queued["job"]["id"]
+
+    # Extension sends checkpoint with 30 reviews
+    res = launch._save_ingest_checkpoint(
+        job_id,
+        {
+            "next_offset": 30,
+            "itemid": "222",
+            "shopid": "111",
+            "rows": [
+                {"user": f"user_{i}", "sao": 5, "noi_dung": f"review_{i}", "thoi_gian": "2026-09-01 10:00:00"}
+                for i in range(30)
+            ],
+            "total": 100,
+        },
+    )
+    assert res["ok"] is True
+    assert res["next_offset"] == 30
+    assert res["rows_count"] == 30
+
+    # Verify no CSV, no ZIP, and job is still in progress, NOT done
+    csv_files = list((outputs / "csv").glob("*.csv")) if (outputs / "csv").is_dir() else []
+    zip_files = list((outputs / "zips").glob("*.zip")) if (outputs / "zips").is_dir() else []
+    assert len(csv_files) == 0
+    assert len(zip_files) == 0
+
+    prog = _get(base, f"/ingest/progress?id={job_id}")
+    assert prog["ok"] is True
+    assert prog["progress"]["status"] == "running"
+    assert prog["progress"]["rows"] == 30
+
+    # A result inquiry does NOT show premature completion
+    r = _get(base, f"/ingest/result?id={job_id}")
+    assert r["ok"] is False
+
+
+def test_checkpoint_resumes_and_merges_full_dataset(server):
+    base, outputs = server
+    import launch
+
+    queued = _get(base, "/ingest/job?url=https://shopee.vn/product/111/333")
+    job_id = queued["job"]["id"]
+
+    # 1. Checkpoint at offset 30 with 30 reviews
+    launch._save_ingest_checkpoint(
+        job_id,
+        {
+            "next_offset": 30,
+            "itemid": "333",
+            "shopid": "111",
+            "rows": [
+                {"user": f"u_{i}", "sao": 5, "noi_dung": f"comment_{i}", "thoi_gian": f"2026-09-01 10:{i:02d}:00"}
+                for i in range(30)
+            ],
+            "total": 50,
+        },
+    )
+
+    # 2. Complete crawl at offset 50 with 20 more reviews
+    final_rows = [
+        {"user": f"u_{i}", "sao": 5, "noi_dung": f"comment_{i}", "thoi_gian": f"2026-09-01 11:{i-30:02d}:00"}
+        for i in range(30, 50)
+    ]
+    status, out = _post(
+        base,
+        "/ingest",
+        {
+            "job": job_id,
+            "source": "https://shopee.vn/product/111/333",
+            "rows": final_rows,
+        },
+    )
+    assert status == 200 and out["ok"]
+    assert out["count"] == 50  # 30 from checkpoint + 20 from final batch = 50 total!
+
+    csv_path = outputs / "csv" / "shopee_333_reviews.csv"
+    assert csv_path.is_file()
+    lines = csv_path.read_text(encoding="utf-8-sig").splitlines()
+    assert len(lines) == 51  # 1 header + 50 reviews
+
+    # Checkpoint should now be cleared
+    assert job_id not in launch._INGEST_CHECKPOINTS
+
+
+def test_browser_reload_releases_inflight_and_requeues(server):
+    base, _ = server
+    import launch
+
+    # Queue a job
+    queued = _get(base, "/ingest/job?url=https://shopee.vn/product/555/666")
+    job_id = queued["job"]["id"]
+
+    # Extension ACKs
+    launch._ack_ingest_job(job_id)
+    status_before = _get(base, "/browser/status")
+    assert status_before["inFlightJobs"] >= 1
+
+    # Extension reloads via /browser/reload
+    _post(base, "/browser/reload", {})
+
+    # Inflight must be released!
+    status_after = _get(base, "/browser/status")
+    assert status_after["inFlightJobs"] == 0
+
+    # Job is back in _INGEST_JOBS to resume upon reconnect
+    assert any(j["id"] == job_id for j in launch._INGEST_JOBS)
+
+
+def test_login_detection_not_reported_when_is_login_true(server):
+    """Shopee error 90309999 with is_login=true is api_blocked, never login_required."""
+    base, _ = server
+    import launch
+
+    queued = _get(base, "/ingest/job?url=https://shopee.vn/product/777/888")
+    job_id = queued["job"]["id"]
+
+    status, out = launch._store_ingest_payload({
+        "job": job_id,
+        "error": "Shopee reviews API access denied (HTTP 403) — error=90309999, is_login=true",
+        "api_blocked": True,
+        "is_login": True,
+        "login_required": False,
+    })
+
+    assert status == 200
+    assert out["ok"] is False
+    assert out["login_required"] is False
+    assert out["api_blocked"] is True
+    assert out["status"] == "error"
+    assert out["stage"] == "api_blocked"
+
+    prog = _get(base, f"/ingest/progress?id={job_id}")
+    assert prog["progress"]["login_required"] is False
+    assert prog["progress"]["api_blocked"] is True
+
+
+def test_e2e_ingest_job_to_csv_media_and_zip_complete(server, monkeypatch):
+    """Full E2E: /ingest/job -> checkpoint -> complete -> CSV, media, manifest, ZIP, report without bookmarklet."""
+    base, outputs = server
+    import launch
+
+    # Mock media download
+    def fake_download(url: str, target_without_ext: Path) -> str:
+        target = target_without_ext.with_suffix(".jpg")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"e2e_fake_media")
+        return f"outputs/{target.relative_to(outputs).as_posix()}"
+
+    monkeypatch.setattr(launch, "_download_ingest_media", fake_download)
+
+    # 1. Step 1: Queue job via /ingest/job
+    q = _get(base, "/ingest/job?url=https://shopee.vn/product/101/202")
+    assert q["ok"] is True
+    job_id = q["job"]["id"]
+
+    # 2. Extension claims / receives job and sends checkpoint
+    launch._save_ingest_checkpoint(
+        job_id,
+        {
+            "next_offset": 6,
+            "itemid": "202",
+            "shopid": "101",
+            "rows": [
+                {
+                    "user": "buyer_1",
+                    "sao": 5,
+                    "noi_dung": "chất lượng tuyệt vời",
+                    "thoi_gian": "2026-09-05 08:00:00",
+                    "anh_urls": "https://down-vn.img.susercontent.com/file/img1",
+                }
+            ],
+            "total": 12,
+        },
+    )
+
+    # 3. Extension finishes crawling and uploads complete payload
+    status, res = _post(
+        base,
+        "/ingest",
+        {
+            "job": job_id,
+            "name": "shopee_202_reviews",
+            "source": "https://shopee.vn/product/101/202",
+            "rows": [
+                {
+                    "user": "buyer_2",
+                    "sao": 5,
+                    "noi_dung": "đóng gói cẩn thận",
+                    "thoi_gian": "2026-09-05 09:00:00",
+                    "anh_urls": "https://down-vn.img.susercontent.com/file/img2",
+                }
+            ],
+        },
+    )
+
+    assert status == 200
+    assert res["ok"] is True
+    assert res["count"] == 2  # Combined checkpoint + final batch
+
+    # 4. Check result via /ingest/result
+    result_resp = _get(base, f"/ingest/result?id={job_id}")
+    assert result_resp["ok"] is True
+    assert result_resp["progress"]["status"] == "done"
+
+    # 5. Check all deliverables exist on disk: CSV UTF-8 BOM, ZIP, manifest, report
+    csv_file = outputs / "csv" / "shopee_202_reviews.csv"
+    assert csv_file.is_file()
+    assert csv_file.read_bytes()[:3] == b"\xef\xbb\xbf"  # UTF-8 BOM!
+
+    zip_file = outputs / "zips" / "shopee_202_reviews_media.zip"
+    assert zip_file.is_file()
+
+    manifest_file = outputs / "media" / "shopee_202_reviews" / "manifest.json"
+    assert manifest_file.is_file()
+
+    report_file = outputs / "text" / "shopee_202_reviews_report.md"
+    assert report_file.is_file()
+
+

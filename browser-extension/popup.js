@@ -212,12 +212,14 @@ async function loadTabs() {
           if (tab.windowId) await chrome.windows.update(tab.windowId, { focused: true });
         } catch {}
       });
-      title.textContent = (tab.title || tab.url || `Tab ${tab.id}`).slice(0, 32);
-      title.title = tab.url || "";
+      const titleSpan = document.createElement("span");
+      titleSpan.className = "tab-title";
+      titleSpan.textContent = (tab.title || tab.url || `Tab ${tab.id}`).slice(0, 32);
+      titleSpan.title = tab.url || "";
       const idSpan = document.createElement("span");
       idSpan.className = "text-muted";
       idSpan.textContent = `id:${tab.id}`;
-      li.appendChild(title);
+      li.appendChild(titleSpan);
       li.appendChild(idSpan);
       tabList.appendChild(li);
     });

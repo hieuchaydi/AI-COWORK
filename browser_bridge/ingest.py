@@ -9,10 +9,11 @@ from concurrent.futures import ThreadPoolExecutor
 class IngestRPC:
     """Deduplicate retries and keep file/media work off the socket receive loop."""
 
-    def __init__(self, send, store, progress):
+    def __init__(self, send, store, progress, checkpoint=None):
         self.send = send
         self.store = store
         self.progress = progress
+        self.checkpoint = checkpoint
         self.lock = threading.RLock()
         self.requests = {}
         self.uploads = {}
@@ -57,6 +58,13 @@ class IngestRPC:
             if not isinstance(job, str) or not job or not isinstance(patch, dict):
                 raise ValueError("job and progress are required")
             return self.progress(job, patch)
+        if operation == "checkpoint":
+            job = params.get("job") or params.get("jobId") or params.get("job_id")
+            if not isinstance(job, str) or not job:
+                raise ValueError("job is required for checkpoint")
+            if self.checkpoint is None:
+                raise ValueError("checkpoint handler not configured")
+            return self.checkpoint(job, params)
         if operation == "chunk":
             upload_id = params.get("uploadId") or params.get("upload_id")
             index, chunk = params.get("index"), params.get("chunk")

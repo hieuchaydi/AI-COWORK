@@ -162,6 +162,8 @@ _INGEST_PROGRESS: dict[str, dict] = {}
 _INGEST_PROGRESS_LOCK = threading.Lock()
 _INGEST_TRACES: dict[str, list[dict]] = {}
 _INGEST_TRACES_LOCK = threading.Lock()
+_INGEST_CHECKPOINTS: dict[str, dict] = {}
+_INGEST_CHECKPOINTS_LOCK = threading.Lock()
 
 
 def _sanitize_trace_url(url: object) -> str | None:
@@ -253,6 +255,17 @@ def _record_shopee_trace(entry: dict) -> dict:
     return clean_entry
 
 
+def _serialize_checkpoints() -> dict:
+    with _INGEST_CHECKPOINTS_LOCK:
+        out = {}
+        for jid, chk in _INGEST_CHECKPOINTS.items():
+            entry = dict(chk)
+            if "seen_keys" in entry and isinstance(entry["seen_keys"], (set, list)):
+                entry["seen_keys"] = [list(k) if isinstance(k, (list, tuple)) else k for k in entry["seen_keys"]]
+            out[jid] = entry
+        return out
+
+
 def _persist_ingest_state() -> None:
     try:
         f = _outputs_root() / ".ingest_jobs_state.json"
@@ -260,6 +273,7 @@ def _persist_ingest_state() -> None:
             "all_jobs": _INGEST_ALL_JOBS,
             "progress": _INGEST_PROGRESS,
             "results": _INGEST_RESULTS,
+            "checkpoints": _serialize_checkpoints(),
         }
         f.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
@@ -277,11 +291,106 @@ def _load_ingest_state() -> None:
                     _INGEST_RESULTS.update(data.get("results") or {})
                 with _INGEST_PROGRESS_LOCK:
                     _INGEST_PROGRESS.update(data.get("progress") or {})
+                if "checkpoints" in data and isinstance(data["checkpoints"], dict):
+                    with _INGEST_CHECKPOINTS_LOCK:
+                        for jid, chk in data["checkpoints"].items():
+                            if isinstance(chk, dict):
+                                entry = dict(chk)
+                                entry["seen_keys"] = {tuple(k) if isinstance(k, list) else k for k in entry.get("seen_keys", [])}
+                                _INGEST_CHECKPOINTS[jid] = entry
     except Exception:
         pass
 
 
 _load_ingest_state()
+
+
+def _save_ingest_checkpoint(job_id: str, params: dict) -> dict:
+    if not job_id:
+        raise ValueError("job_id is required for checkpoint")
+    with _INGEST_CHECKPOINTS_LOCK:
+        chk = _INGEST_CHECKPOINTS.setdefault(job_id, {
+            "job_id": job_id,
+            "rows": [],
+            "seen_keys": set(),
+            "next_offset": 0,
+            "itemid": None,
+            "shopid": None,
+            "total": None,
+        })
+        new_rows = params.get("rows") or []
+        if isinstance(new_rows, list):
+            for r in new_rows:
+                if not isinstance(r, dict):
+                    continue
+                key = (
+                    str(r.get("user") or "").strip(),
+                    str(r.get("thoi_gian") or r.get("time") or "").strip(),
+                    str(r.get("noi_dung") or r.get("comment") or "").strip(),
+                )
+                if key != ("", "", ""):
+                    if key in chk["seen_keys"]:
+                        continue
+                    chk["seen_keys"].add(key)
+                chk["rows"].append(r)
+
+        offset = params.get("next_offset")
+        if offset is None:
+            offset = params.get("offset")
+        if offset is not None:
+            chk["next_offset"] = _safe_int(offset)
+        if params.get("itemid"):
+            chk["itemid"] = str(params["itemid"])
+        if params.get("shopid"):
+            chk["shopid"] = str(params["shopid"])
+        if params.get("total") is not None:
+            chk["total"] = _safe_int(params["total"])
+        chk["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        current_rows_count = len(chk["rows"])
+        next_offset = chk["next_offset"]
+        total = chk.get("total")
+        itemid = chk.get("itemid")
+        shopid = chk.get("shopid")
+
+    _update_ingest_progress(
+        job_id,
+        {
+            "status": "running",
+            "stage": "fetch",
+            "message": f"Đã lấy {current_rows_count}" + (f"/{total}" if total else "") + " đánh giá (checkpoint)",
+            "rows": current_rows_count,
+            "offset": next_offset,
+            "checkpoint": {
+                "next_offset": next_offset,
+                "rows_count": current_rows_count,
+                "itemid": itemid,
+                "shopid": shopid,
+                "total": total,
+            },
+        },
+    )
+    _persist_ingest_state()
+    return {
+        "ok": True,
+        "job": job_id,
+        "next_offset": next_offset,
+        "rows_count": current_rows_count,
+    }
+
+
+def _release_inflight_jobs(requeue: bool = True) -> None:
+    with _INGEST_JOBS_LOCK:
+        if not _INGEST_INFLIGHT:
+            return
+        for jid, job in list(_INGEST_INFLIGHT.items()):
+            if requeue and jid not in _INGEST_RESULTS:
+                if not any(j.get("id") == jid for j in _INGEST_JOBS):
+                    _INGEST_JOBS.append(job)
+        _INGEST_INFLIGHT.clear()
+        if requeue and _INGEST_JOBS:
+            _INGEST_JOB_EVENT.set()
+    _persist_ingest_state()
 
 
 # Chrome extension control channel. The token is persisted to outputs/.bridge_token
@@ -521,6 +630,12 @@ def _generate_shopee_report(
 
 
 def _queue_ingest_job(url: str, kind: str) -> dict:
+    url = re.sub(
+        r"^https?://(?:www\.)?shoppe\.vn",
+        "https://shopee.vn",
+        url.strip(),
+        flags=re.IGNORECASE,
+    )
     itemid = _extract_shopee_itemid(url)
     job = {
         "id": f"job-{secrets.token_hex(12)}",
@@ -558,7 +673,19 @@ def _queue_ingest_job(url: str, kind: str) -> dict:
     _INGEST_JOB_EVENT.set()
     if _BROWSER_WS.connected:
         try:
-            _BROWSER_WS.send({"type": "ingest.job", "job": job})
+            job_msg = dict(job)
+            with _INGEST_CHECKPOINTS_LOCK:
+                chk = _INGEST_CHECKPOINTS.get(job["id"])
+                if chk:
+                    job_msg["checkpoint"] = {
+                        "next_offset": chk.get("next_offset", 0),
+                        "offset": chk.get("next_offset", 0),
+                        "itemid": chk.get("itemid"),
+                        "shopid": chk.get("shopid"),
+                        "total": chk.get("total"),
+                        "rows_count": len(chk.get("rows", [])),
+                    }
+            _BROWSER_WS.send({"type": "ingest.job", "job": job_msg})
         except Exception as exc:
             print(f"[ingest] failed to push job to websocket: {exc}", file=sys.stderr)
     print(f"[ingest] job queued: {kind} {url}", file=sys.stderr)
@@ -581,6 +708,9 @@ def _update_ingest_progress(job_id: str, patch: dict) -> dict | None:
         current["updated_at"] = now
         _INGEST_PROGRESS[job_id] = current
         _persist_ingest_state()
+        if patch.get("status") in ("done", "error", "login_required", "api_blocked", "failed"):
+            with _INGEST_JOBS_LOCK:
+                _INGEST_INFLIGHT.pop(job_id, None)
         return dict(current)
 
 
@@ -630,7 +760,20 @@ def _on_browser_ws_connect() -> None:
     with _INGEST_JOBS_LOCK:
         pending = list(_INGEST_JOBS) + list(_INGEST_INFLIGHT.values())
     for job in pending:
-        if not _BROWSER_WS.send({"type": "ingest.job", "job": job}):
+        job_msg = dict(job)
+        with _INGEST_CHECKPOINTS_LOCK:
+            chk = _INGEST_CHECKPOINTS.get(job.get("id"))
+            if chk:
+                job_msg["checkpoint"] = {
+                    "next_offset": chk.get("next_offset", 0),
+                    "offset": chk.get("next_offset", 0),
+                    "itemid": chk.get("itemid"),
+                    "shopid": chk.get("shopid"),
+                    "total": chk.get("total"),
+                    "rows_count": len(chk.get("rows", [])),
+                }
+        payload = job_msg if "checkpoint" in job_msg else job
+        if not _BROWSER_WS.send({"type": "ingest.job", "job": payload}):
             break
 
 
@@ -679,6 +822,7 @@ _INGEST_RPC = IngestRPC(
     send=lambda message: _BROWSER_WS.send(message),
     store=lambda body: _store_ingest_payload(body),
     progress=lambda job_id, patch: _update_ingest_progress(job_id, patch),
+    checkpoint=lambda job_id, params: _save_ingest_checkpoint(job_id, params),
 )
 
 
@@ -703,14 +847,24 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
     if isinstance(body, dict) and (body.get("error") or body.get("verification_required") or body.get("login_required") or body.get("api_blocked")):
         err_msg = str(body.get("error") or "Shopee yêu cầu đăng nhập hoặc xác minh")[:500]
         lowered = err_msg.lower()
-        # 1. Login required
-        is_login = bool(
-            body.get("login_required")
-            or "login required" in lowered
-            or "is_login=false" in lowered
-            or ("is_login" in lowered and "false" in lowered)
-            or "90309999" in lowered
+        # 1. Login required (never true if is_login is true)
+        explicit_is_login = bool(
+            body.get("is_login") is True
+            or (isinstance(body.get("json"), dict) and body["json"].get("is_login") is True)
+            or (isinstance(body.get("debug"), dict) and body["debug"].get("is_login") is True)
+            or '"is_login": true' in lowered
+            or '"is_login":true' in lowered
+            or "is_login=true" in lowered
         )
+        if explicit_is_login:
+            is_login = False
+        else:
+            is_login = bool(
+                body.get("login_required")
+                or "login required" in lowered
+                or "is_login=false" in lowered
+                or ("is_login" in lowered and "false" in lowered)
+            )
 
         # 2. API Blocked (HTTP 403 / Access Denied without CAPTCHA or Login)
         explicit_api_blocked = bool(
@@ -797,6 +951,28 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
     if not isinstance(rows, list):
         return 400, {"ok": False, "error": "expected {rows: [...]} or a JSON array"}
 
+    chk = None
+    if job_id:
+        with _INGEST_CHECKPOINTS_LOCK:
+            chk = _INGEST_CHECKPOINTS.get(job_id)
+            if chk and chk.get("rows"):
+                combined_rows = []
+                seen = set()
+                for r in chk["rows"] + rows:
+                    if not isinstance(r, dict):
+                        continue
+                    key = (
+                        str(r.get("user") or "").strip(),
+                        str(r.get("thoi_gian") or r.get("time") or "").strip(),
+                        str(r.get("noi_dung") or r.get("comment") or "").strip(),
+                    )
+                    if key != ("", "", ""):
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                    combined_rows.append(r)
+                rows = combined_rows
+
     if len(rows) == 0:
         err_msg = "Không có đánh giá nào được tìm thấy hoặc quyền truy cập bị hạn chế"
         if job_id:
@@ -822,6 +998,15 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
     # Check if we should resolve name according to itemid (Requirement 3)
     # Check if we should resolve name according to itemid (Requirement 8)
     itemid = _extract_shopee_itemid(raw) or _extract_shopee_itemid(source_text)
+    itemid = (
+        (body.get("itemid") if isinstance(body, dict) else None)
+        or (chk.get("itemid") if isinstance(chk, dict) else None)
+        or (job_obj.get("itemid") if isinstance(job_obj, dict) else None)
+        or _extract_shopee_itemid(raw)
+        or _extract_shopee_itemid(source_text)
+    )
+    if itemid:
+        itemid = str(itemid).strip()
     if itemid:
         name = f"shopee_{itemid}_reviews.json"
         stem = f"shopee_{itemid}_reviews"
@@ -841,7 +1026,7 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
 
     media_dir = None
     zip_rel = None
-    if name.lower().startswith("shopee_") or "shopee.vn" in source_text.lower():
+    if name.lower().startswith("shopee_") or "shopee.vn" in source_text.lower() or "shoppe.vn" in source_text.lower():
         if job_id:
             _update_ingest_progress(
                 job_id,
@@ -898,7 +1083,7 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
         zip_rel=zip_rel or "",
         zip_parts=zip_parts,
         manifest_rel=manifest_rel or "",
-    ) if (name.lower().startswith("shopee_") or "shopee.vn" in source_text.lower()) else None
+    ) if (name.lower().startswith("shopee_") or "shopee.vn" in source_text.lower() or "shoppe.vn" in source_text.lower()) else None
 
     print(f"[ingest] {len(rows)} rows → {target}", file=sys.stderr)
     result = {
@@ -920,6 +1105,8 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
         _INGEST_RESULTS[job_id] = result
         with _INGEST_JOBS_LOCK:
             _INGEST_INFLIGHT.pop(job_id, None)
+        with _INGEST_CHECKPOINTS_LOCK:
+            _INGEST_CHECKPOINTS.pop(job_id, None)
         _update_ingest_progress(
             job_id,
             {
@@ -1055,7 +1242,7 @@ def _is_allowed_ingest_media_url(url: str) -> bool:
     if parsed.scheme not in {"http", "https"}:
         return False
     host = (parsed.hostname or "").lower()
-    return "shopee" in host or host.endswith("susercontent.com")
+    return "shopee" in host or "shoppe" in host or host.endswith("susercontent.com")
 
 
 def _media_extension(url: str, content_type: str = "") -> str:
@@ -1478,35 +1665,89 @@ _INGEST_BOOKMARKLET_JS = r"""
     };
     const asList = value => Array.isArray(value) ? value : (value ? [value] : []);
     const rows = [];
-    for (let off = 0; off < 20000; off += 50) {
+    const PAGE_SIZE = 6;
+    const PACE_MS = 1200;
+    const fetchBatchWithRetry = async (url, maxAttempts = 3) => {
+      let lastErr = null;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const controller = new AbortController();
+        const tid = setTimeout(() => controller.abort(new Error('TIMEOUT')), 15000);
+        try {
+          const r = await fetch(url, {
+            credentials: 'include',
+            headers: {
+              'x-requested-with': 'XMLHttpRequest',
+              'x-api-source': 'pc',
+              'x-shopee-language': 'vi',
+              'accept': 'application/json, text/plain, */*'
+            },
+            signal: controller.signal
+          });
+          clearTimeout(tid);
+          const text = await r.text();
+          let json = null;
+          try { json = JSON.parse(text); } catch {}
+          return { ok: r.ok, status: r.status, url: r.url, text, json };
+        } catch (e) {
+          clearTimeout(tid);
+          lastErr = e;
+          if (attempt < maxAttempts - 1) {
+            await new Promise(res => setTimeout(res, 1000 * Math.pow(2, attempt)));
+          }
+        }
+      }
+      return { ok: false, status: 0, error: (lastErr && lastErr.message) || 'Network error' };
+    };
+
+    for (let off = 0; off < 20000; off += PAGE_SIZE) {
       say('Dang lay... ' + rows.length + ' danh gia');
-      const r = await fetch('/api/v2/item/get_ratings?itemid=' + itemid + '&shopid=' + shopid
-        + '&type=0&filter=0&limit=50&offset=' + off, { headers: { 'x-requested-with': 'XMLHttpRequest' } });
-      if (!r.ok) { say('HTTP ' + r.status + ' — dung lai o ' + rows.length); break; }
-      const j = await r.json();
+      const url = '/api/v2/item/get_ratings?itemid=' + itemid + '&shopid=' + shopid
+        + '&type=0&filter=0&limit=' + PAGE_SIZE + '&offset=' + off;
+      const res = await fetchBatchWithRetry(url);
+      if (!res.ok) {
+        const textSample = (res.text || res.error || '').toLowerCase();
+        let failKind = 'HTTP ' + res.status;
+        if (res.status === 401 || textSample.includes('is_login=false') || (res.json && (res.json.is_login === false || (res.json.data && res.json.data.is_login === false)))) {
+          failKind = 'Shopee yeu cau dang nhap (login_required)';
+        } else if (textSample.includes('/verify/traffic') || textSample.includes('captcha') || textSample.includes('challenge')) {
+          failKind = 'Shopee yeu cau xac minh CAPTCHA (verification_required)';
+        } else if (res.status === 403 || textSample.includes('403') || textSample.includes('90309999') || textSample.includes('access denied')) {
+          failKind = 'Shopee chan API (api_blocked)';
+        }
+        say(failKind + ' — dung lai o ' + rows.length);
+        break;
+      }
+      const j = res.json || {};
+      if (j.error || j.is_login === false || (j.data && j.data.is_login === false)) {
+        let failKind = 'Loi API ' + j.error;
+        if (j.is_login === false || (j.data && j.data.is_login === false)) failKind = 'Shopee yeu cau dang nhap (login_required)';
+        else if (j.error === 90309999) failKind = 'Shopee chan API (api_blocked)';
+        say(failKind + ' — dung lai o ' + rows.length);
+        break;
+      }
       const batch = (j.data && j.data.ratings) || [];
       for (const x of batch) {
         const images = asList(x.images).map(mediaUrl).filter(Boolean);
         const videos = asList(x.videos || x.video).map(mediaUrl).filter(Boolean);
         const media = images.concat(videos);
         rows.push({
-        user: x.author_username || '',
-        sao: x.rating_star,
-        noi_dung: (x.comment || '').replace(/\s+/g, ' ').trim(),
-        thoi_gian: new Date((x.ctime || 0) * 1000).toISOString().slice(0, 19).replace('T', ' '),
-        phan_loai: (x.product_items || []).map(p => p.model_name).join('|'),
-        anh: images.length ? 1 : 0,
-        so_anh: images.length,
-        anh_urls: images.join('|'),
-        video: videos.length ? 1 : 0,
-        so_video: videos.length,
-        video_urls: videos.join('|'),
-        media_urls: media.join('|'),
-        huu_ich: x.like_count || 0
-      });
+          user: x.author_username || '',
+          sao: x.rating_star,
+          noi_dung: (x.comment || '').replace(/\s+/g, ' ').trim(),
+          thoi_gian: new Date((x.ctime || 0) * 1000).toISOString().slice(0, 19).replace('T', ' '),
+          phan_loai: (x.product_items || []).map(p => p.model_name).join('|'),
+          anh: images.length ? 1 : 0,
+          so_anh: images.length,
+          anh_urls: images.join('|'),
+          video: videos.length ? 1 : 0,
+          so_video: videos.length,
+          video_urls: videos.join('|'),
+          media_urls: media.join('|'),
+          huu_ich: x.like_count || 0
+        });
       }
-      if (batch.length < 50) break;
-      await new Promise(s => setTimeout(s, 700));
+      if (batch.length < PAGE_SIZE) break;
+      await new Promise(s => setTimeout(s, PACE_MS));
     }
     if (!rows.length) return finish('Khong co danh gia nao');
     try {
@@ -2330,6 +2571,7 @@ class _HelperHandler(BaseHTTPRequestHandler):
             return
 
         if self.path.split("?", 1)[0] == "/browser/reload":
+            _release_inflight_jobs(requeue=True)
             sent = False
             if _BROWSER_WS.connected:
                 sent = _BROWSER_WS.send({"v": 1, "type": "extension.reload", "id": f"reload-{int(time.time()*1000)}"})
@@ -2851,6 +3093,16 @@ class _HelperHandler(BaseHTTPRequestHandler):
             self._cors()
             self.end_headers()
             self.wfile.write(data)
+
+        if path_only == "/browser/reload":
+            _release_inflight_jobs(requeue=True)
+            sent = False
+            if _BROWSER_WS.connected:
+                sent = _BROWSER_WS.send({"v": 1, "type": "extension.reload", "id": f"reload-{int(time.time()*1000)}"})
+            else:
+                _ensure_chrome_with_extension()
+            _reply(200, {"ok": True, "reloaded": True, "sent": sent})
+            return
 
         if path_only == "/browser/command":
             from browser_bridge.protocol import MAX_MESSAGE_BYTES, MessageEnvelope

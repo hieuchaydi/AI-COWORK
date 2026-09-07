@@ -27,7 +27,9 @@
       "matches": [
         "http://127.0.0.1:8766/*",
         "https://*.shopee.vn/*",
-        "https://shopee.vn/*"
+        "https://shopee.vn/*",
+        "https://*.shoppe.vn/*",
+        "https://shoppe.vn/*"
       ],
       "js": ["content.js"],
       "run_at": "document_start"

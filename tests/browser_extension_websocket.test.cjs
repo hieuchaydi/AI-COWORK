@@ -515,4 +515,130 @@ test('extractShopeeReviews reports api_blocked when Shopee confirms login on a 4
   });
 });
 
+test('Job cu bi treo/loi khong khoa job moi trong queue executor', async () => {
+  const { context } = await worker();
+  vm.runInContext(`
+    globalThis.executedJobs = [];
+    runJob = async (job) => {
+      if (job.id === "job-hang") {
+        throw new Error("Simulated job failure / timeout");
+      }
+      executedJobs.push(job.id);
+    };
+    enqueueLegacyJob({ id: "job-hang" });
+    enqueueLegacyJob({ id: "job-next" });
+  `, context);
+
+  await vm.runInContext('jobChain', context);
+  const executed = Array.from(vm.runInContext('globalThis.executedJobs', context));
+  assert.deepEqual(executed, ['job-next']);
+  assert.equal(vm.runInContext('activeJobs.size', context), 0);
+  assert.equal(vm.runInContext('jobQueue.length', context), 0);
+});
+
+test('executeScript tra rong lan dau, lan sau thanh cong qua retry', async () => {
+  const { context, timeouts } = await worker();
+  vm.runInContext(`
+    let attempts = 0;
+    chrome.scripting = {
+      executeScript: async () => {
+        attempts++;
+        if (attempts === 1) {
+          return []; // empty result from Chrome when tab is navigating
+        }
+        return [{ result: { ok: true, data: "crawled_data", attempts } }];
+      }
+    };
+  `, context);
+
+  const pending = vm.runInContext(`
+    executeScriptResultWithRetry({ target: { tabId: 99 } })
+  `, context);
+
+  await new Promise(resolve => setImmediate(resolve));
+  const retryTimer = [...timeouts.values()].find(entry => entry.ms === 250);
+  assert.ok(retryTimer);
+  retryTimer.fn();
+
+  const res = await pending;
+  assert.equal(res.ok, true);
+  assert.equal(res.data, "crawled_data");
+  assert.equal(res.attempts, 2);
+});
+
+test('WAF hoac timeout khong lam fetchRatingsFromTab treo vo han', async () => {
+  const { context, timeouts } = await worker();
+  vm.runInContext(`
+    chrome.scripting = {
+      executeScript: async (options) => {
+        const res = await options.func("123", "456", 0, 6, "https://shopee.vn");
+        return [{ result: res }];
+      }
+    };
+    globalThis.fetch = async (url, opts) => {
+      return new Promise((resolve, reject) => {
+        if (opts && opts.signal) {
+          opts.signal.addEventListener('abort', () => {
+            const err = new Error("The user aborted a request.");
+            err.name = "AbortError";
+            reject(err);
+          });
+        }
+      });
+    };
+  `, context);
+
+  const pending = vm.runInContext(`
+    fetchRatingsFromTab(1, "123", "456", 0, 6, "https://shopee.vn")
+  `, context);
+
+  await new Promise(resolve => setImmediate(resolve));
+  const abortTimer = [...timeouts.values()].find(entry => entry.ms === 15000);
+  assert.ok(abortTimer, "AbortController timeout timer expected");
+  abortTimer.fn();
+
+  const res = await pending;
+  assert.equal(res.ok, false);
+  assert.equal(res.isTimeout, true);
+});
+
+test('service worker restart resume dung offset tu checkpoint', async () => {
+  const { context } = await worker();
+  vm.runInContext(`
+    globalThis.recordedOffsets = [];
+    chrome.tabs = {
+      query: async () => [{ id: 42, url: "https://shopee.vn/product/111/222" }],
+      create: async () => ({ id: 42, url: "https://shopee.vn/product/111/222" }),
+      get: async () => ({ id: 42, url: "https://shopee.vn/product/111/222" }),
+      onUpdated: { addListener() {}, removeListener() {} },
+    };
+    chrome.scripting = {
+      executeScript: async (opts) => {
+        const off = opts.args ? opts.args[2] : null;
+        if (typeof off === 'number') recordedOffsets.push(off);
+        return [{
+          result: {
+            ok: true,
+            status: 200,
+            url: "https://shopee.vn/api/v2/item/get_ratings",
+            json: { data: { ratings: [] } },
+          }
+        }];
+      }
+    };
+  `, context);
+
+  await vm.runInContext(`
+    extractShopeeReviews({
+      id: "job-chk-resume",
+      url: "https://shopee.vn/product/111/222",
+      checkpoint: { next_offset: 3000, shopid: "111", total: 5000 }
+    }, () => {})
+  `, context);
+
+  const offsets = Array.from(vm.runInContext('globalThis.recordedOffsets', context));
+  assert.ok(offsets.includes(3000), "Should start crawling at offset 3000");
+  assert.ok(!offsets.includes(0), "Should not crawl offset 0");
+});
+
 
