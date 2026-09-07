@@ -1523,6 +1523,7 @@ class SessionManager:
         "qwen": ["qwen3-max", "qwen3-coder-plus", "qwen-plus"],
         "xai": ["grok-4.3", "grok-4"],
         "mistral": ["mistral-large-latest", "mistral-small-latest"],
+        "cohere": ["command-r-plus", "command-r", "command-r7b-12-2024"],
     }
 
     def _suggested_models(self, name: str) -> list[str]:
