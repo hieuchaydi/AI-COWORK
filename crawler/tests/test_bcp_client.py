@@ -81,3 +81,63 @@ def test_bcp_page_api():
         assert data == b"mock_png_bytes"
 
     asyncio.run(_test())
+
+
+def test_browser_fetcher_with_target_id():
+    from crawler.fetcher import BrowserFetcher
+    from crawler.models import Task, Source
+
+    async def _test():
+        class MockBcpTransport(IBrowserTransport):
+            def __init__(self):
+                self.calls = []
+
+            async def connect(self, endpoint: str = "", token: str = "") -> dict:
+                return {"protocolVersion": "1.0"}
+
+            async def call(self, method: str, params: dict, timeout_ms: int = 30000) -> dict:
+                self.calls.append((method, params))
+                if method == "target.create":
+                    return {"targetId": "target_abc_123"}
+                elif method == "page.content":
+                    return {"content": "<html><body>Fetched with targetId</body></html>"}
+                elif method == "runtime.evaluate":
+                    return {"result": "https://example.com/final"}
+                elif method == "target.close":
+                    return {"ok": True}
+                return {}
+
+            def on(self, event: str, handler):
+                return lambda: None
+
+            @property
+            def capabilities(self) -> set[str]:
+                return set()
+
+            async def close(self):
+                pass
+
+        transport = MockBcpTransport()
+        fetcher = BrowserFetcher(transport=transport)
+        from crawler.models import Task, Source, IdentityConfig
+
+        task = Task(source_id="test_src", url="https://example.com/article", dedup_key="art_1")
+        res = await fetcher.fetch(task, Source(source_id="test_src", identity=IdentityConfig(id_regex=r"/(\d+)")))
+        assert res.status == 200
+        assert b"Fetched with targetId" in res.body
+        assert res.final_url == "https://example.com/final"
+
+        # Verify targetId was passed in calls
+        methods_called = [c[0] for c in transport.calls]
+        assert "target.create" in methods_called
+        assert "page.navigate" in methods_called
+        assert "page.content" in methods_called
+        assert "runtime.evaluate" in methods_called
+        assert "target.close" in methods_called
+
+        for m, p in transport.calls:
+            if m in ("page.navigate", "page.content", "runtime.evaluate", "target.close"):
+                assert p.get("targetId") == "target_abc_123"
+
+    asyncio.run(_test())
+

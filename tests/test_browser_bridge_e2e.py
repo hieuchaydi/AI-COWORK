@@ -15,6 +15,7 @@ import socket
 import sys
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -43,10 +44,19 @@ class SimpleWebSocketTestClient:
         self,
         path: str = "/browser/v1/ws",
         token: Optional[str] = None,
-        origin: str = "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+        origin: Optional[str] = "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+        client_id: Optional[str] = None,
+        takeover: bool = False,
     ) -> int:
         self.sock.connect((self.host, self.port))
-        query = f"?token={token}" if token else ""
+        query_params = {}
+        if token:
+            query_params["token"] = token
+        if client_id:
+            query_params["client_id"] = client_id
+        if takeover:
+            query_params["takeover"] = "1"
+        query = f"?{urllib.parse.urlencode(query_params)}" if query_params else ""
         sec_key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
 
         req = (
@@ -56,8 +66,10 @@ class SimpleWebSocketTestClient:
             "Connection: Upgrade\r\n"
             f"Sec-WebSocket-Key: {sec_key}\r\n"
             "Sec-WebSocket-Version: 13\r\n"
-            f"Origin: {origin}\r\n\r\n"
         )
+        if origin is not None:
+            req += f"Origin: {origin}\r\n"
+        req += "\r\n"
         self.sock.sendall(req.encode("ascii"))
 
         resp = bytearray()
@@ -194,6 +206,17 @@ def test_e2e_rejection_on_web_origin(gateway_server):
         client.close()
 
 
+def test_e2e_allows_originless_extension_websocket_with_valid_token(gateway_server):
+    _, port, token = gateway_server
+    client = SimpleWebSocketTestClient("127.0.0.1", port)
+    try:
+        status = client.connect(token=token, origin=None)
+        assert status == 101
+        assert client.recv_json()["type"] == "hello"
+    finally:
+        client.close()
+
+
 def test_e2e_command_dispatch_and_result(gateway_server):
     server, port, token = gateway_server
     client = SimpleWebSocketTestClient("127.0.0.1", port)
@@ -276,22 +299,34 @@ def test_e2e_human_verification_and_resume_flow(gateway_server):
         client.close()
 
 
-def test_e2e_reconnect_does_not_corrupt_active_state(gateway_server):
+def test_e2e_duplicate_client_is_rejected_and_takeover_is_explicit(gateway_server):
     server, port, token = gateway_server
     client1 = SimpleWebSocketTestClient("127.0.0.1", port)
     client2 = SimpleWebSocketTestClient("127.0.0.1", port)
+    client3 = SimpleWebSocketTestClient("127.0.0.1", port)
     try:
         # Client 1 connects
-        s1 = client1.connect(token=token)
+        s1 = client1.connect(token=token, client_id="owner-1")
         assert s1 == 101
         _ = client1.recv_json()
         assert server.is_connected is True
 
-        # Client 2 connects (replaces client 1 as active connection)
-        s2 = client2.connect(token=token)
+        # Client 2 cannot silently replace the single active owner.
+        s2 = client2.connect(token=token, client_id="owner-2")
         assert s2 == 101
-        _ = client2.recv_json()
+        rejection = client2.recv_json()
+        assert rejection["type"] == "error"
+        assert rejection["error"]["code"] == "CLIENT_ALREADY_CONNECTED"
         assert server.is_connected is True
+        assert server.active_connection_info()["clientId"] == "owner-1"
+        client2.close()
+
+        # A user-initiated takeover is the only way to transfer ownership.
+        s3 = client3.connect(token=token, client_id="owner-3", takeover=True)
+        assert s3 == 101
+        _ = client3.recv_json()
+        assert server.is_connected is True
+        assert server.active_connection_info()["clientId"] == "owner-3"
 
         # Client 1 closes its socket
         client1.close()
@@ -301,7 +336,7 @@ def test_e2e_reconnect_does_not_corrupt_active_state(gateway_server):
         assert server.is_connected is True
         assert server.transport.get_state() == ExtensionState.CONNECTED
 
-        # Can still execute command via client 2
+        # Can still execute command via the explicit takeover owner.
         result_container = []
 
         def execute_worker():
@@ -314,11 +349,11 @@ def test_e2e_reconnect_does_not_corrupt_active_state(gateway_server):
         t = threading.Thread(target=execute_worker)
         t.start()
 
-        cmd = client2.recv_json(timeout=3.0)
+        cmd = client3.recv_json(timeout=3.0)
         assert cmd is not None
         assert cmd.get("action") == "tab.list"
 
-        client2.send_json({
+        client3.send_json({
             "v": 1,
             "type": "result",
             "id": cmd.get("id"),
@@ -333,6 +368,7 @@ def test_e2e_reconnect_does_not_corrupt_active_state(gateway_server):
     finally:
         client1.close()
         client2.close()
+        client3.close()
 
 
 def test_e2e_pipelined_handshake_frame_buffering(gateway_server):
@@ -519,3 +555,254 @@ def test_e2e_control_frame_payload_limit(gateway_server):
         client.close()
 
 
+
+
+def test_e2e_ingest_progress_chunks_and_result_over_websocket(gateway_server, monkeypatch, tmp_path):
+    import launch
+    from browser_bridge.ingest import IngestRPC
+
+    server, port, token = gateway_server
+    monkeypatch.setenv("COWORKER_OUTPUT_DIR", str(tmp_path))
+    stores = []
+
+    def store(body):
+        stores.append(body)
+        return launch._store_ingest_payload(body)
+
+    rpc = IngestRPC(server.broadcast_or_send, store, launch._update_ingest_progress)
+    server.on_message = lambda message: rpc.submit(message) if message.get("type") == "ingest.rpc" else None
+    client = SimpleWebSocketTestClient("127.0.0.1", port)
+    try:
+        assert client.connect(token=token) == 101
+        assert client.recv_json()["type"] == "hello"
+
+        def call(request_id, **params):
+            client.send_json({"v": 1, "type": "ingest.rpc", "id": request_id, "params": params})
+            reply = client.recv_json(timeout=3)
+            assert reply["type"] == "ingest.reply" and reply["id"] == request_id
+            return reply
+
+        assert call("progress-1", operation="progress", job="ws-job", progress={"percent": 50})["ok"]
+        assert launch._INGEST_PROGRESS["ws-job"]["percent"] == 50
+        payload = json.dumps({"job": "ws-job", "name": "ws-result", "rows": [{"text": "Tiếng Việt"}]}, ensure_ascii=False)
+        for index, chunk in enumerate([payload[:20], payload[20:]]):
+            assert call(f"chunk-{index}", operation="chunk", uploadId="upload-1", index=index, chunk=chunk)["ok"]
+        reply = call("complete-1", operation="complete", uploadId="upload-1")
+        assert reply["ok"] and reply["result"]["count"] == 1
+        assert (tmp_path / "csv" / "ws-result.csv").read_bytes().startswith(b"\xef\xbb\xbf")
+        assert call("complete-1", operation="complete", uploadId="upload-1") == reply
+        assert len(stores) == 1  # A lost acknowledgement must not save/download twice.
+        assert not call("bad-chunk", operation="chunk", uploadId="bad", index=3, chunk="x")["ok"]
+    finally:
+        client.close()
+        rpc.executor.shutdown(wait=True)
+
+
+def test_helper_http_websocket_upgrade_and_reconnect(monkeypatch):
+    import launch
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    gateway = BrowserGatewayServer(token="helper-test-token")
+    monkeypatch.setattr(launch, "_BROWSER_WS", gateway)
+    helper = ThreadingHTTPServer(("127.0.0.1", 0), launch._HelperHandler)
+    thread = threading.Thread(target=helper.serve_forever, daemon=True)
+    thread.start()
+    try:
+        request = urllib.request.Request(f"http://127.0.0.1:{helper.server_port}/browser/pair")
+        with urllib.request.urlopen(request, timeout=3) as response:
+            pairing = json.load(response)
+        hinted_request = urllib.request.Request(
+            f"http://127.0.0.1:{helper.server_port}/browser/pair",
+            headers={"X-Bridge-Client": launch.BRIDGE_CLIENT_HEADER},
+        )
+        with urllib.request.urlopen(hinted_request, timeout=3) as response:
+            hinted_pairing = json.load(response)
+        assert hinted_pairing["token"] == pairing["token"]
+        for _ in range(3):
+            client = SimpleWebSocketTestClient("127.0.0.1", helper.server_port)
+            try:
+                assert client.connect(token=pairing["token"]) == 101
+                assert client.recv_json()["type"] == "hello"
+                client.send_json({"v": 1, "type": "ping", "id": "heartbeat"})
+                assert client.recv_json()["type"] == "pong"
+            finally:
+                client.close()
+    finally:
+        gateway.stop()
+        helper.shutdown()
+        helper.server_close()
+        thread.join(timeout=2)
+
+
+def test_socket_disconnect_releases_pending_command(gateway_server):
+    server, port, token = gateway_server
+    client = SimpleWebSocketTestClient("127.0.0.1", port)
+    assert client.connect(token=token) == 101
+    assert client.recv_json()["type"] == "hello"
+    results = []
+    thread = threading.Thread(target=lambda: results.append(server.transport.execute_command("tab.list", deadline_ms=30000)))
+    thread.start()
+    assert client.recv_json()["type"] == "command"
+    client.close()
+    thread.join(timeout=2)
+    assert not thread.is_alive(), "Socket loss must release the caller immediately"
+    assert not results[0][0]
+    assert "disconnected" in results[0][2].message.lower()
+
+
+def test_e2e_full_7_step_websocket_ingest_flow(gateway_server, monkeypatch, tmp_path):
+    """End-to-end verification of all 7 WebSocket ingest steps between server and extension."""
+    import launch
+    from browser_bridge.ingest import IngestRPC
+
+    server, port, token = gateway_server
+    monkeypatch.setenv("COWORKER_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(launch, "_BROWSER_WS", server)
+
+    # Initialize IngestRPC attached to server
+    rpc = IngestRPC(
+        send=server.broadcast_or_send,
+        store=launch._store_ingest_payload,
+        progress=launch._update_ingest_progress,
+    )
+    monkeypatch.setattr(launch, "_INGEST_RPC", rpc)
+
+    # Wire up server callbacks to launch handlers
+    server.on_connect = launch._on_browser_ws_connect
+    server.on_message = launch._on_browser_ws_message
+
+    # Reset in-memory state
+    with launch._INGEST_JOBS_LOCK:
+        launch._INGEST_JOBS.clear()
+        launch._INGEST_INFLIGHT.clear()
+        launch._INGEST_ALL_JOBS.clear()
+    with launch._INGEST_PROGRESS_LOCK:
+        launch._INGEST_PROGRESS.clear()
+    launch._INGEST_RESULTS.clear()
+
+    client = SimpleWebSocketTestClient("127.0.0.1", port)
+    try:
+        assert client.connect(token=token) == 101
+        hello = client.recv_json()
+        assert hello["type"] == "hello"
+        time.sleep(0.1)
+
+        # Step 1: Server tạo job
+        test_url = "https://shopee.vn/product/123456/25018847315"
+        job = launch._queue_ingest_job(test_url, "shopee-reviews")
+        job_id = job["id"]
+        assert job_id.startswith("job-")
+        assert launch._INGEST_PROGRESS[job_id]["status"] == "queued"
+
+        # Step 2: Server gửi ingest.job qua WebSocket
+        msg = client.recv_json(timeout=3)
+        assert msg["type"] == "ingest.job"
+        assert msg["job"]["id"] == job_id
+        assert msg["job"]["url"] == test_url
+
+        # Step 3: Extension nhận job và trả accepted
+        client.send_json({"v": 1, "type": "accepted", "id": job_id, "jobId": job_id})
+        time.sleep(0.1)
+
+        # Verify Step 3: Server nhận accepted và đưa job vào inflight
+        with launch._INGEST_JOBS_LOCK:
+            assert job_id not in [j["id"] for j in launch._INGEST_JOBS]
+            assert job_id in launch._INGEST_INFLIGHT
+
+        # Step 4: Extension gửi ingest.rpc (progress)
+        req_id_progress = "rpc-progress-1"
+        client.send_json({
+            "v": 1,
+            "type": "ingest.rpc",
+            "id": req_id_progress,
+            "params": {
+                "operation": "progress",
+                "job": job_id,
+                "progress": {"status": "running", "stage": "crawling", "percent": 45, "message": "Đang cào dữ liệu"},
+            },
+        })
+
+        # Step 5: Server trả ingest.reply đúng correlation id cho progress
+        reply_progress = client.recv_json(timeout=3)
+        assert reply_progress["type"] == "ingest.reply"
+        assert reply_progress["id"] == req_id_progress
+        assert reply_progress["ok"] is True
+        assert launch._INGEST_PROGRESS[job_id]["percent"] == 45
+        assert launch._INGEST_PROGRESS[job_id]["status"] == "running"
+
+        # Step 6: Progress/chunk/complete
+        payload_body = {
+            "job": job_id,
+            "name": "shopee_25018847315_reviews",
+            "source": test_url,
+            "rows": [
+                {
+                    "user": "test_buyer",
+                    "sao": 5,
+                    "noi_dung": "Dép đi rất êm và bền",
+                    "thoi_gian": "2026-09-06 20:00:00",
+                    "anh": 0,
+                    "video": 0,
+                }
+            ],
+        }
+        chunk_str = json.dumps(payload_body, ensure_ascii=False)
+        req_id_chunk = "rpc-chunk-0"
+        upload_id = "upload-test-123"
+        client.send_json({
+            "v": 1,
+            "type": "ingest.rpc",
+            "id": req_id_chunk,
+            "params": {
+                "operation": "chunk",
+                "uploadId": upload_id,
+                "index": 0,
+                "chunk": chunk_str,
+            },
+        })
+        reply_chunk = client.recv_json(timeout=3)
+        assert reply_chunk["type"] == "ingest.reply"
+        assert reply_chunk["id"] == req_id_chunk
+        assert reply_chunk["ok"] is True
+        assert reply_chunk["result"]["index"] == 0
+
+        # Complete operation
+        req_id_complete = "rpc-complete-1"
+        client.send_json({
+            "v": 1,
+            "type": "ingest.rpc",
+            "id": req_id_complete,
+            "params": {
+                "operation": "complete",
+                "uploadId": upload_id,
+            },
+        })
+        reply_complete = client.recv_json(timeout=5)
+        assert reply_complete["type"] == "ingest.reply"
+        assert reply_complete["id"] == req_id_complete
+        assert reply_complete["ok"] is True
+        assert reply_complete["result"]["count"] == 1
+
+        # Step 7: Server ghi kết quả cuối
+        assert job_id in launch._INGEST_RESULTS
+        res = launch._INGEST_RESULTS[job_id]
+        assert res["ok"] is True
+        assert res["count"] == 1
+        assert "shopee_25018847315_reviews.csv" in res["csv"]
+        assert (tmp_path / "csv" / "shopee_25018847315_reviews.csv").exists()
+        assert launch._INGEST_PROGRESS[job_id]["status"] == "done"
+        assert launch._INGEST_PROGRESS[job_id]["percent"] == 100
+
+        # Inflight queue should be cleaned up
+        with launch._INGEST_JOBS_LOCK:
+            assert job_id not in launch._INGEST_INFLIGHT
+
+        # State persistence file exists
+        state_file = tmp_path / ".ingest_jobs_state.json"
+        assert state_file.exists()
+        state_data = json.loads(state_file.read_text(encoding="utf-8"))
+        assert job_id in state_data["results"]
+    finally:
+        client.close()
+        rpc.executor.shutdown(wait=True)

@@ -1030,6 +1030,34 @@ def _crawl_and_export_bundle(
     )
 
 
+def _download_media_from_csv(
+    csv_path: str,
+    url_columns: list[str] | None = None,
+    job_name: str = "",
+    zip_filename: str = "",
+    output_dir: str = "",
+    max_zip_mb: int | float = 0,
+    max_files: int = 500,
+    max_mb_per_file: int = 25,
+) -> dict[str, Any]:
+    """Read an existing CSV file, detect or filter image/video URL columns,
+    download all media files, deduplicate identical files by SHA-256 hash,
+    generate a manifest.json, package unique media into a .zip archive
+    (splitting if exceeding max_zip_mb), and generate a summary Markdown report."""
+    from .media_pipeline import download_media_from_csv
+
+    return download_media_from_csv(
+        csv_path=csv_path,
+        url_columns=url_columns,
+        job_name=job_name,
+        zip_filename=zip_filename,
+        output_dir=output_dir,
+        max_zip_mb=max_zip_mb,
+        max_files=max_files,
+        max_mb_per_file=max_mb_per_file,
+    )
+
+
 # ─── Factory ─────────────────────────────────────────────────────────────────
 
 def make_crawl_tools() -> list[Callable[..., Any]]:
@@ -1216,6 +1244,29 @@ def make_crawl_tools() -> list[Callable[..., Any]]:
             "max_zip_mb": {"type": "integer", "description": "Dung lượng tối đa mỗi file zip MB, tự chia thành part01, part02... nếu vượt quá"},
         },
         ["rows"],
+        risk="low",
+    )
+
+    _add(
+        _download_media_from_csv, "download_media_from_csv",
+        "Đọc file CSV có sẵn, tự động tìm hoặc lọc theo các cột chứa URL ảnh/video, "
+        "tải toàn bộ media về outputs/media/<job_name>/, chống trùng bằng SHA-256, "
+        "tạo manifest.json, đóng gói file ZIP (hoặc chia part nếu vượt max_zip_mb) "
+        "và tạo báo cáo Markdown tổng kết.",
+        {
+            "csv_path": {"type": "string", "description": "Đường dẫn file CSV (tuyệt đối hoặc tương đối hoặc trong outputs/csv/)"},
+            "url_columns": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Tên các cột chứa URL ảnh/video (nếu để trống sẽ tự động quét mọi cột)",
+            },
+            "job_name": {"type": "string", "description": "Tên job xuất ra (mặc định lấy theo tên file CSV)"},
+            "zip_filename": {"type": "string", "description": "Tên file ZIP xuất ra"},
+            "output_dir": {"type": "string", "description": "Thư mục lưu tùy chỉnh (để trống nếu dùng mặc định outputs/)"},
+            "max_zip_mb": {"type": "integer", "description": "Dung lượng tối đa mỗi file zip MB, tự chia part nếu vượt quá"},
+            "max_files": {"type": "integer", "description": "Số lượng media tối đa (mặc định 500)"},
+        },
+        ["csv_path"],
         risk="low",
     )
 

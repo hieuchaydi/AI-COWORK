@@ -123,11 +123,13 @@ def _read_frame(source: socket.socket | _BufferedSocketReader, max_bytes: int = 
 class GatewayClientConnection:
     """Manages an individual connected extension client socket."""
 
-    def __init__(self, sock: socket.socket, extension_id: str):
+    def __init__(self, sock: socket.socket, extension_id: str, client_id: str = "unknown"):
         self.sock = sock
         self.extension_id = extension_id
+        self.client_id = client_id or "unknown"
         self.send_lock = threading.Lock()
         self.closed = False
+        self.close_sent = False
 
     def send(self, payload: Dict[str, Any] | MessageEnvelope) -> None:
         if hasattr(payload, "to_dict"):
@@ -136,24 +138,34 @@ class GatewayClientConnection:
         if len(raw) > MAX_MESSAGE_BYTES:
             raise ValueError(f"Outbound payload {len(raw)} exceeds {MAX_MESSAGE_BYTES}")
         with self.send_lock:
-            if self.closed:
+            if self.closed or self.close_sent:
                 raise ConnectionError("Connection is closed")
             self.sock.sendall(_encode_frame(raw))
 
     def send_control(self, opcode: int, payload: bytes = b"") -> None:
         with self.send_lock:
-            if not self.closed:
+            if self.closed:
+                return
+            if opcode == 0x8:
+                if self.close_sent:
+                    return
+                self.close_sent = True
+            try:
                 self.sock.sendall(_encode_frame(payload[:125], opcode=opcode))
+            except OSError:
+                pass
 
     def close(self) -> None:
         with self.send_lock:
             if self.closed:
                 return
             self.closed = True
-            try:
-                self.sock.sendall(_encode_frame(b"", opcode=0x8))
-            except OSError:
-                pass
+            if not self.close_sent:
+                self.close_sent = True
+                try:
+                    self.sock.sendall(_encode_frame(b"", opcode=0x8))
+                except OSError:
+                    pass
             try:
                 self.sock.shutdown(socket.SHUT_RDWR)
             except OSError:
@@ -188,6 +200,7 @@ class BrowserGatewayServer:
         self.audit = AuditLogger()
 
         self._active_conn: Optional[GatewayClientConnection] = None
+        self._active_since: Optional[float] = None
         self._lock = threading.RLock()
         self._server: Optional[socketserver.ThreadingTCPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -206,6 +219,8 @@ class BrowserGatewayServer:
             self.token = new_token
             conn = self._active_conn
             self._active_conn = None
+            self._active_since = None
+            self.transport.reset_pending("Gateway stopped")
         if conn:
             conn.close()
         logger.info("Rotated pairing token to %s", mask_token(new_token))
@@ -217,6 +232,7 @@ class BrowserGatewayServer:
             self.token = ""
             conn = self._active_conn
             self._active_conn = None
+            self._active_since = None
         if conn:
             conn.close()
         logger.info("Revoked pairing token")
@@ -231,6 +247,15 @@ class BrowserGatewayServer:
     def is_connected(self) -> bool:
         with self._lock:
             return self._active_conn is not None and not self._active_conn.closed
+
+    @property
+    def connected(self) -> bool:
+        return self.is_connected
+
+    def send(self, payload: Dict[str, Any] | MessageEnvelope) -> bool:
+        if hasattr(payload, "to_dict"):
+            payload = payload.to_dict()
+        return self.broadcast_or_send(payload)
 
     @property
     def port(self) -> Optional[int]:
@@ -271,6 +296,7 @@ class BrowserGatewayServer:
         with self._lock:
             conn = self._active_conn
             self._active_conn = None
+            self._active_since = None
         if conn:
             conn.close()
         if server:
@@ -295,15 +321,63 @@ class BrowserGatewayServer:
             self._unregister(conn)
             return False
 
-    def _register(self, conn: GatewayClientConnection) -> None:
+    def _connection_info_locked(self, conn: GatewayClientConnection) -> Dict[str, Any]:
+        return {
+            "extensionId": conn.extension_id,
+            "clientId": conn.client_id,
+            "connectedAt": self._active_since,
+        }
+
+    def active_connection_info(self) -> Optional[Dict[str, Any]]:
+        """Return non-sensitive metadata for the single active extension owner."""
+        with self._lock:
+            conn = self._active_conn
+            if not conn or conn.closed:
+                return None
+            return self._connection_info_locked(conn)
+
+    def _register(
+        self,
+        conn: GatewayClientConnection,
+        *,
+        takeover: bool = False,
+    ) -> tuple[bool, Optional[Dict[str, Any]]]:
+        rejected_owner: Optional[Dict[str, Any]] = None
         with self._lock:
             prev = self._active_conn
-            self._active_conn = conn
+            if prev and not prev.closed and not takeover:
+                rejected_owner = self._connection_info_locked(prev)
+            else:
+                self._active_conn = conn
+                self._active_since = time.time()
+                if prev and prev is not conn:
+                    self.transport.reset_pending("Extension connection replaced by explicit takeover")
+                self.transport.set_state(ExtensionState.CONNECTED)
+
+        if rejected_owner:
+            logger.info(
+                "Rejected duplicate extension connection client_id=%s; owner=%s",
+                conn.client_id,
+                rejected_owner.get("clientId"),
+            )
+            self.audit.record(
+                "client.rejected",
+                details={
+                    "reason": "client_already_connected",
+                    "extension_id": conn.extension_id,
+                    "client_id": conn.client_id,
+                    "owner_client_id": rejected_owner.get("clientId"),
+                },
+            )
+            return False, rejected_owner
+
         if prev and prev is not conn:
             prev.close()
 
-        self.transport.set_state(ExtensionState.CONNECTED)
-        self.audit.record("client.connected", details={"extension_id": conn.extension_id})
+        self.audit.record(
+            "client.connected",
+            details={"extension_id": conn.extension_id, "client_id": conn.client_id, "takeover": takeover},
+        )
 
         # Send greeting envelope
         hello_env = MessageEnvelope(
@@ -313,6 +387,8 @@ class BrowserGatewayServer:
                 "protocolVersion": "1.0",
                 "heartbeatMs": 20000,
                 "maxPayloadBytes": MAX_MESSAGE_BYTES,
+                "connectionPolicy": "exclusive",
+                "clientId": conn.client_id,
             },
         )
         conn.send(hello_env.to_dict())
@@ -321,22 +397,65 @@ class BrowserGatewayServer:
                 self.on_connect()
             except Exception as e:
                 logger.warning("on_connect callback raised: %s", e)
+        return True, None
 
     def _unregister(self, conn: GatewayClientConnection) -> None:
         was_active = False
         with self._lock:
             if self._active_conn is conn:
                 self._active_conn = None
+                self._active_since = None
                 was_active = True
+                self.transport.set_state(ExtensionState.DISCONNECTED)
+                self.transport.reset_pending("Extension disconnected")
         conn.close()
         if was_active:
-            self.transport.set_state(ExtensionState.DISCONNECTED)
             self.audit.record("client.disconnected", details={"extension_id": conn.extension_id})
             if self.on_disconnect:
                 try:
                     self.on_disconnect()
                 except Exception as e:
                     logger.warning("on_disconnect callback raised: %s", e)
+
+    def _upgrade_and_register(
+        self,
+        sock: socket.socket,
+        sec_key: str,
+        extension_id: str,
+        client_id: str,
+        takeover: bool,
+        initial_data: bytes = b"",
+    ) -> None:
+        accept = base64.b64encode(hashlib.sha1((sec_key + _WS_MAGIC).encode("ascii")).digest()).decode("ascii")
+        sock.sendall(
+            (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+            ).encode("ascii")
+        )
+
+        conn = GatewayClientConnection(sock, extension_id=extension_id, client_id=client_id)
+        registered, owner = self._register(conn, takeover=takeover)
+        if not registered:
+            try:
+                conn.send(
+                    MessageEnvelope(
+                        type=MessageType.ERROR,
+                        error=BridgeError.create(
+                            ErrorCode.CLIENT_ALREADY_CONNECTED,
+                            "Gateway đang được một extension client khác sử dụng",
+                            retryable=False,
+                            details={"owner": owner, "policy": "exclusive"},
+                        ),
+                    ).to_dict()
+                )
+            finally:
+                conn.close()
+            return
+
+        self._run_frame_loop(sock, conn, initial_data=initial_data)
 
     def upgrade_http_connection(
         self,
@@ -348,7 +467,10 @@ class BrowserGatewayServer:
     ) -> None:
         """Upgrades an already-parsed HTTP connection on an existing server to WebSocket."""
         sock.settimeout(60.0)
-        supplied_token = urllib.parse.parse_qs(query).get("token", [""])[0]
+        query_params = urllib.parse.parse_qs(query)
+        supplied_token = query_params.get("token", [""])[0]
+        client_id = query_params.get("client_id", [""])[0][:128] or "unknown"
+        takeover = query_params.get("takeover", ["0"])[0] == "1"
         origin = headers.get("origin", "")
         if not origin and headers.get("referer", "").startswith("chrome-extension://"):
             parts = headers.get("referer", "").split("/", 3)
@@ -356,13 +478,14 @@ class BrowserGatewayServer:
                 origin = f"chrome-extension://{parts[2]}"
 
         valid_origin, ext_id = validate_extension_origin(origin, self.allowlisted_extension_ids)
-        if not valid_origin:
+        token_valid = verify_pairing_token(supplied_token, self.token)
+        if not valid_origin and (origin or not token_valid):
             logger.warning("Rejected WebSocket connection with unauthorized origin: %s", origin)
             self.audit.record("auth.rejected", details={"reason": "origin_forbidden", "origin": origin})
             self._reject(sock, 403, "Forbidden: Invalid Extension Origin")
             return
 
-        if not verify_pairing_token(supplied_token, self.token):
+        if not token_valid:
             logger.warning("Rejected WebSocket connection with invalid token: %s", mask_token(supplied_token))
             self.audit.record("auth.rejected", details={"reason": "token_mismatch", "ext_id": ext_id})
             self._reject(sock, 401, "Unauthorized: Invalid Pairing Token")
@@ -383,19 +506,14 @@ class BrowserGatewayServer:
             self._reject(sock, 400, "Bad Request: Missing sec-websocket-key or Upgrade websocket")
             return
 
-        accept = base64.b64encode(hashlib.sha1((sec_key + _WS_MAGIC).encode("ascii")).digest()).decode("ascii")
-        sock.sendall(
-            (
-                "HTTP/1.1 101 Switching Protocols\r\n"
-                "Upgrade: websocket\r\n"
-                "Connection: Upgrade\r\n"
-                f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
-            ).encode("ascii")
+        self._upgrade_and_register(
+            sock,
+            sec_key,
+            ext_id or "unknown",
+            client_id,
+            takeover,
+            initial_data,
         )
-
-        conn = GatewayClientConnection(sock, extension_id=ext_id or "unknown")
-        self._register(conn)
-        self._run_frame_loop(sock, conn, initial_data=initial_data)
 
     def _run_frame_loop(
         self,
@@ -408,10 +526,11 @@ class BrowserGatewayServer:
             while True:
                 opcode, raw = _read_frame(reader)
                 if opcode == 0x8:  # Close
-                    try:
-                        conn.send_control(0x8, raw[:125])
-                    except Exception:
-                        pass
+                    if not conn.close_sent:
+                        try:
+                            conn.send_control(0x8, raw[:125])
+                        except Exception:
+                            pass
                     break
                 elif opcode == 0x9:  # Ping
                     conn.send_control(0xA, raw)
@@ -459,7 +578,10 @@ class BrowserGatewayServer:
             request_line, headers, leftover = self._read_http_handshake(sock)
             method, target, _ = request_line.split(" ", 2)
             parsed = urllib.parse.urlsplit(target)
-            supplied_token = urllib.parse.parse_qs(parsed.query).get("token", [""])[0]
+            query_params = urllib.parse.parse_qs(parsed.query)
+            supplied_token = query_params.get("token", [""])[0]
+            client_id = query_params.get("client_id", [""])[0][:128] or "unknown"
+            takeover = query_params.get("takeover", ["0"])[0] == "1"
             origin = headers.get("origin", "")
             if not origin and headers.get("referer", "").startswith("chrome-extension://"):
                 parts = headers.get("referer", "").split("/", 3)
@@ -473,14 +595,15 @@ class BrowserGatewayServer:
 
             # Origin check
             valid_origin, ext_id = validate_extension_origin(origin, self.allowlisted_extension_ids)
-            if not valid_origin:
+            token_valid = verify_pairing_token(supplied_token, self.token)
+            if not valid_origin and (origin or not token_valid):
                 logger.warning("Rejected WebSocket connection with unauthorized origin: %s", origin)
                 self.audit.record("auth.rejected", details={"reason": "origin_forbidden", "origin": origin})
                 self._reject(sock, 403, "Forbidden: Invalid Extension Origin")
                 return
 
             # Token check
-            if not verify_pairing_token(supplied_token, self.token):
+            if not token_valid:
                 logger.warning("Rejected WebSocket connection with invalid token: %s", mask_token(supplied_token))
                 self.audit.record("auth.rejected", details={"reason": "token_mismatch", "ext_id": ext_id})
                 self._reject(sock, 401, "Unauthorized: Invalid Pairing Token")
@@ -502,20 +625,14 @@ class BrowserGatewayServer:
                 self._reject(sock, 400, "Bad Request: Missing sec-websocket-key or Upgrade websocket")
                 return
 
-            # Accept handshake
-            accept = base64.b64encode(hashlib.sha1((sec_key + _WS_MAGIC).encode("ascii")).digest()).decode("ascii")
-            sock.sendall(
-                (
-                    "HTTP/1.1 101 Switching Protocols\r\n"
-                    "Upgrade: websocket\r\n"
-                    "Connection: Upgrade\r\n"
-                    f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
-                ).encode("ascii")
+            self._upgrade_and_register(
+                sock,
+                sec_key,
+                ext_id or "unknown",
+                client_id,
+                takeover,
+                leftover,
             )
-
-            conn = GatewayClientConnection(sock, extension_id=ext_id or "unknown")
-            self._register(conn)
-            self._run_frame_loop(sock, conn, initial_data=leftover)
         except (ConnectionError, OSError, WebSocketProtocolError, ValueError) as exc:
             logger.debug("Client socket terminated: %s", exc)
         finally:

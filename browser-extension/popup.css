@@ -51,6 +51,17 @@ body {
   color: #b06000;
 }
 
+.badge.warning {
+  background: #fef7e0;
+  color: #ea8600;
+}
+
+.badge.error,
+.badge.blocked {
+  background: #fce8e6;
+  color: #d93025;
+}
+
 .section {
   margin-bottom: 12px;
 }
@@ -150,6 +161,24 @@ button {
   border-radius: 4px;
   padding: 8px;
   margin-top: 6px;
+}
+
+.alert-box.login-box {
+  background: #fff8e1;
+  border-color: #ea8600;
+}
+
+.alert-box.login-box .alert-title {
+  color: #ea8600;
+}
+
+.alert-box.blocked-box {
+  background: #fce8e6;
+  border-color: #d93025;
+}
+
+.alert-box.blocked-box .alert-title {
+  color: #d93025;
 }
 
 .alert-title {

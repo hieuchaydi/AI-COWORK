@@ -557,15 +557,37 @@ def test_groq_trims_tools_to_cap_keeping_important():
     provider.complete(model="llama-3.3-70b-versatile", messages=[], tools=_fat_tool_list())
     sent = client.chat.completions.calls[0]["tools"]
     names = [t["function"]["name"] for t in sent]
-    assert len(sent) == 128  # Groq's hard cap — no 400
+    assert len(sent) == 32  # Groq's default 32 cap (prevents timeouts and 429 TPM errors)
     # Built-ins and utility bridges survive in full; bulky telegram is trimmed first.
+    assert all(not n.startswith("mcp__telegram_bot__") for n in names)
+    original = [t["function"]["name"] for t in _fat_tool_list()]
+    assert names == [n for n in original if n in set(names)]
+
+
+def test_groq_cap_overridable_via_env(monkeypatch):
+    monkeypatch.setenv("COWORKER_GROQ_TOOL_CAP", "128")
+    client = _FakeClient(_response(content="ok"))
+    provider = OpenAIProvider(client=client, base_url="https://api.groq.com/openai/v1")
+    provider.complete(model="llama-3.3-70b-versatile", messages=[], tools=_fat_tool_list())
+    sent = client.chat.completions.calls[0]["tools"]
+    names = [t["function"]["name"] for t in sent]
+    assert len(sent) == 128
     assert sum(not n.startswith("mcp__") for n in names) == 40
     assert sum(n.startswith("mcp__skills__") for n in names) == 28
     assert sum(n.startswith("mcp__filesystem__") for n in names) == 45
     assert sum(n.startswith("mcp__telegram_bot__") for n in names) == 15
-    # Original order preserved among survivors.
-    original = [t["function"]["name"] for t in _fat_tool_list()]
-    assert names == [n for n in original if n in set(names)]
+
+
+def test_groq_context_aware_tool_promotion():
+    client = _FakeClient(_response(content="ok"))
+    provider = OpenAIProvider(client=client, base_url="https://api.groq.com/openai/v1")
+    messages = [{"role": "user", "content": "Gửi tin nhắn Telegram cho bạn tôi"}]
+    provider.complete(model="llama-3.3-70b-versatile", messages=messages, tools=_fat_tool_list())
+    sent = client.chat.completions.calls[0]["tools"]
+    names = [t["function"]["name"] for t in sent]
+    assert len(sent) == 32
+    # Telegram tools survived because query explicitly asked for Telegram
+    assert any(n.startswith("mcp__telegram_bot__") for n in names)
 
 
 def test_uncapped_provider_sends_all_tools():

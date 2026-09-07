@@ -80,10 +80,13 @@ def test_shopee_ingest_adds_local_media_paths(tmp_path, monkeypatch):
 
     def fake_download(url: str, target_without_ext: Path) -> str:
         suffix = ".mp4" if url.endswith(".mp4") else ".jpg"
-        return f"outputs/{target_without_ext.with_suffix(suffix).relative_to(tmp_path).as_posix()}"
+        target = target_without_ext.with_suffix(suffix)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"fake_content")
+        return f"outputs/{target.relative_to(tmp_path).as_posix()}"
 
     monkeypatch.setattr(launch, "_download_ingest_media", fake_download)
-    rows, media_dir = launch._prepare_shopee_review_rows(
+    rows, media_dir, zip_rel = launch._prepare_shopee_review_rows(
         "shopee_123.json",
         [
             {
@@ -94,10 +97,15 @@ def test_shopee_ingest_adds_local_media_paths(tmp_path, monkeypatch):
         ],
     )
 
-    assert media_dir == "shopee_reviews/shopee_123/media"
+    assert media_dir == "media/shopee_123"
     assert rows[0]["image_files"].endswith("review_00001_image_01.jpg")
+    assert rows[0]["image_names"] == "review_00001_image_01.jpg"
     assert rows[0]["video_files"].endswith("review_00001_video_01.mp4")
-    assert rows[0]["media_dir"] == "outputs/shopee_reviews/shopee_123/media"
+    assert rows[0]["video_names"] == "review_00001_video_01.mp4"
+    assert rows[0]["media_names"] == "review_00001_image_01.jpg|review_00001_video_01.mp4"
+    assert rows[0]["media_dir"] == "outputs/media/shopee_123"
+    assert zip_rel == "outputs/zips/shopee_123_media.zip"
+    assert (tmp_path / "zips" / "shopee_123_media.zip").is_file()
 
 
 def test_ingest_csv_aligns_ragged_rows_under_a_union_header(server):
@@ -232,18 +240,19 @@ def test_job_round_trip_agent_queues_extension_delivers(server):
 
     done = _get(base, f"/ingest/result?id={job_id}")
     assert done["ok"] and done["result"]["count"] == 1
-    assert done["result"]["csv"] == "outputs/csv/shopee_27429880257.csv"
+    assert done["result"]["csv"] == "outputs/csv/shopee_27429880257_reviews.csv"
     assert done["progress"]["status"] == "done"
     assert done["progress"]["stage"] == "saved"
     assert done["progress"]["rows"] == 1
-    assert (outputs / "csv" / "shopee_27429880257.csv").is_file()
-    csv_text = (outputs / "csv" / "shopee_27429880257.csv").read_bytes().decode("utf-8-sig")
+    assert (outputs / "csv" / "shopee_27429880257_reviews.csv").is_file()
+    csv_text = (outputs / "csv" / "shopee_27429880257_reviews.csv").read_bytes().decode("utf-8-sig")
     assert csv_text.splitlines()[0].endswith(",anh")
     assert csv_text.splitlines()[1].endswith(",1")
 
 
 def test_failed_job_is_recorded_so_the_agent_stops_waiting(server):
     base, _ = server
+    # 1. Login required switches to status="login_required", stage="login_required"
     job_id = _get(base, "/ingest/job?url=https://shopee.vn/product/1/2")["job"]["id"]
     _get(base, "/ingest/jobs?wait=1")
     _post(base, "/ingest", {"job": job_id, "error": "Shopee error 90309999 (is_login=false)"})
@@ -251,8 +260,106 @@ def test_failed_job_is_recorded_so_the_agent_stops_waiting(server):
     done = _get(base, f"/ingest/result?id={job_id}")
     assert done["ok"] and done["result"]["ok"] is False
     assert "90309999" in done["result"]["error"]
-    assert done["progress"]["status"] == "error"
-    assert done["progress"]["stage"] == "failed"
+    assert done["progress"]["status"] == "login_required"
+    assert done["progress"]["stage"] == "login_required"
+    assert done["result"]["verification_required"] is False
+    assert done["result"]["login_required"] is True
+
+    # Calling resume on a login_required job is rejected with HTTP 400
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(base, f"/browser/resume?id={job_id}")
+    assert exc.value.code == 400
+    err_body = json.loads(exc.value.read().decode())
+    assert err_body["login_required"] is True
+
+    # 2. General non-verification failure records error
+    job_id2 = _get(base, "/ingest/job?url=https://shopee.vn/product/3/4")["job"]["id"]
+    _get(base, "/ingest/jobs?wait=1")
+    _post(base, "/ingest", {"job": job_id2, "error": "Connection timed out"})
+    done2 = _get(base, f"/ingest/result?id={job_id2}")
+    assert done2["ok"] and done2["result"]["ok"] is False
+    assert done2["result"]["verification_required"] is False
+    assert done2["progress"]["status"] == "error"
+    assert done2["progress"]["stage"] == "failed"
+
+
+def test_shopee_classification_api_blocked_vs_login_vs_captcha(server):
+    """Test distinct handling for:
+    1. login_required (90309999 / is_login=false) -> status='login_required', stage='login_required', resume rejected.
+    2. verification_required (/verify/traffic / captcha) -> status='awaiting_user_verification', stage='verification_required', resume accepted.
+    3. api_blocked (HTTP 403 without captcha or login) -> status='error', stage='api_blocked', resume rejected.
+    4. general failure (timeout) -> status='error', stage='failed'.
+    """
+    base, _ = server
+
+    # 1. Login required
+    job_1 = _get(base, "/ingest/job?url=https://shopee.vn/product/10/20")["job"]["id"]
+    _get(base, "/ingest/jobs?wait=1")
+    _post(base, "/ingest", {"job": job_1, "error": "Shopee error 90309999, is_login=false"})
+    res1 = _get(base, f"/ingest/result?id={job_1}")
+    assert res1["ok"] is True
+    assert res1["result"]["ok"] is False
+    assert res1["result"]["login_required"] is True
+    assert res1["result"]["verification_required"] is False
+    assert res1["result"]["api_blocked"] is False
+    assert res1["progress"]["status"] == "login_required"
+    assert res1["progress"]["stage"] == "login_required"
+    # Resume rejected
+    with pytest.raises(urllib.error.HTTPError) as exc1:
+        _get(base, f"/browser/resume?id={job_1}")
+    assert exc1.value.code == 400
+    assert json.loads(exc1.value.read().decode())["login_required"] is True
+
+    # 2. Verification / CAPTCHA challenge
+    job_2 = _get(base, "/ingest/job?url=https://shopee.vn/product/30/40")["job"]["id"]
+    _get(base, "/ingest/jobs?wait=1")
+    _post(base, "/ingest", {"job": job_2, "error": "Shopee challenge at https://shopee.vn/verify/traffic"})
+    res2 = _get(base, f"/ingest/result?id={job_2}")
+    assert res2["ok"] is True
+    assert res2["result"]["ok"] is False
+    assert res2["result"]["login_required"] is False
+    assert res2["result"]["verification_required"] is True
+    assert res2["result"]["api_blocked"] is False
+    assert res2["progress"]["status"] == "awaiting_user_verification"
+    assert res2["progress"]["stage"] == "verification_required"
+    # Resume accepted
+    resumed2 = _get(base, f"/browser/resume?id={job_2}")
+    assert resumed2["ok"] is True
+    assert resumed2["resumed"] is True
+
+    # 3. API Blocked (HTTP 403 Access Denied)
+    job_3 = _get(base, "/ingest/job?url=https://shopee.vn/product/50/60")["job"]["id"]
+    _get(base, "/ingest/jobs?wait=1")
+    _post(base, "/ingest", {
+        "job": job_3,
+        "error": "Shopee reviews API access denied (HTTP 403) — không thấy CAPTCHA trên tab; endpoint=https://shopee.vn/api/v2/item/get_ratings; response={\"error\":\"access denied\"}",
+    })
+    res3 = _get(base, f"/ingest/result?id={job_3}")
+    assert res3["ok"] is True
+    assert res3["result"]["ok"] is False
+    assert res3["result"]["login_required"] is False
+    assert res3["result"]["verification_required"] is False
+    assert res3["result"]["api_blocked"] is True
+    assert res3["progress"]["status"] == "error"
+    assert res3["progress"]["stage"] == "api_blocked"
+    # Resume rejected
+    with pytest.raises(urllib.error.HTTPError) as exc3:
+        _get(base, f"/browser/resume?id={job_3}")
+    assert exc3.value.code == 400
+    assert json.loads(exc3.value.read().decode())["api_blocked"] is True
+
+    # 4. General failure
+    job_4 = _get(base, "/ingest/job?url=https://shopee.vn/product/70/80")["job"]["id"]
+    _get(base, "/ingest/jobs?wait=1")
+    _post(base, "/ingest", {"job": job_4, "error": "WebSocket connection lost"})
+    res4 = _get(base, f"/ingest/result?id={job_4}")
+    assert res4["ok"] is True
+    assert res4["result"]["ok"] is False
+    assert res4["result"]["login_required"] is False
+    assert res4["result"]["verification_required"] is False
+    assert res4["result"]["api_blocked"] is False
+    assert res4["progress"]["status"] == "error"
+    assert res4["progress"]["stage"] == "failed"
 
 
 def test_job_endpoint_rejects_a_non_http_url(server):
@@ -282,3 +389,450 @@ def test_ingested_file_is_served_back_for_the_agent_to_read(server):
     with urllib.request.urlopen(base + "/outputs/inbox/shopee_123.json", timeout=5) as r:
         assert r.status == 200
         assert "tốt" in json.loads(r.read())["rows"][0]["noi_dung"]
+
+
+def test_shopee_ingest_e2e_zip_and_csv(server, monkeypatch):
+    base, outputs = server
+    import launch
+
+    def fake_download(url: str, target_without_ext: Path) -> str:
+        target = target_without_ext.with_suffix(".jpg")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"img_bytes_123")
+        return f"outputs/{target.relative_to(outputs).as_posix()}"
+
+    monkeypatch.setattr(launch, "_download_ingest_media", fake_download)
+
+    job_id = _get(base, "/ingest/job?url=https://shopee.vn/product/11/22")["job"]["id"]
+    _get(base, "/ingest/jobs?wait=1")
+    status, out = _post(
+        base,
+        "/ingest",
+        {
+            "job": job_id,
+            "name": "shopee_22",
+            "source": "https://shopee.vn/product/11/22",
+            "rows": [
+                {
+                    "user": "tester",
+                    "sao": 5,
+                    "noi_dung": "dep lam",
+                    "anh_urls": "https://down-vn.img.susercontent.com/file/pic1",
+                    "thoi_gian": "2026-09-01 10:00:00",
+                }
+            ],
+        },
+    )
+
+    assert status == 200 and out["ok"]
+    assert out["zip"] == "outputs/zips/shopee_22_media.zip"
+    assert out["zip_url"] == "/outputs/zips/shopee_22_media.zip"
+    assert (outputs / "zips" / "shopee_22_media.zip").is_file()
+
+    # Check zip contents
+    import zipfile
+    with zipfile.ZipFile(outputs / "zips" / "shopee_22_media.zip") as zf:
+        namelist = zf.namelist()
+        assert "review_00001_image_01.jpg" in namelist
+
+    # Check CSV contents
+    csv_text = (outputs / "csv" / "shopee_22.csv").read_bytes().decode("utf-8-sig")
+    assert "image_names" in csv_text
+    assert "review_00001_image_01.jpg" in csv_text
+
+
+def test_vanity_url_extracts_itemid_and_names_outputs(server):
+    """URL vanity https://shopee.vn/depnhaphuong/25018847315 must output as shopee_25018847315, not job.id."""
+    """URL vanity https://shopee.vn/depnhaphuong/25018847315 must output as shopee_25018847315_reviews."""
+    base, outputs = server
+
+    queued = _get(base, "/ingest/job?url=https://shopee.vn/depnhaphuong/25018847315")
+    assert queued["ok"]
+    job = queued["job"]
+    assert job["itemid"] == "25018847315"
+    assert job["name"] == "shopee_25018847315_reviews"
+    job_id = job["id"]
+
+    _get(base, "/ingest/jobs?wait=1")
+    status, out = _post(
+        base,
+        "/ingest",
+        {
+            "job": job_id,
+            "source": "https://shopee.vn/depnhaphuong/25018847315",
+            "rows": [
+                {"user": "u1", "sao": 5, "noi_dung": "dép đẹp", "thoi_gian": "2026-09-01 12:00:00"}
+            ],
+        },
+    )
+    assert status == 200 and out["ok"]
+    assert out["path"] == "outputs/inbox/shopee_25018847315_reviews.json"
+    assert out["csv"] == "outputs/csv/shopee_25018847315_reviews.csv"
+    assert (outputs / "csv" / "shopee_25018847315_reviews.csv").is_file()
+    assert (outputs / "inbox" / "shopee_25018847315_reviews.json").is_file()
+    assert (outputs / "text" / "shopee_25018847315_reviews_report.md").is_file()
+
+
+def test_shopee_manifest_and_zip_dedup(server, monkeypatch):
+    """Manifest.json tracks url, kind, hash, size, and duplicate_of; ZIP contains unique media + manifest."""
+    base, outputs = server
+    import hashlib
+    import zipfile
+    import launch
+
+    content_a = b"binary_image_content_A_12345"
+    content_b = b"binary_image_content_B_67890"
+    sha_a = hashlib.sha256(content_a).hexdigest()
+    sha_b = hashlib.sha256(content_b).hexdigest()
+
+    def fake_download_with_dedup(url: str, target_without_ext: Path) -> str:
+        target = target_without_ext.with_suffix(".jpg")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if "dup" in url or "pic1" in url:
+            target.write_bytes(content_a)
+        else:
+            target.write_bytes(content_b)
+        return f"outputs/{target.relative_to(outputs).as_posix()}"
+
+    monkeypatch.setattr(launch, "_download_ingest_media", fake_download_with_dedup)
+
+    job_id = _get(base, "/ingest/job?url=https://shopee.vn/depnhaphuong/25018847315")["job"]["id"]
+    _get(base, "/ingest/jobs?wait=1")
+
+    status, out = _post(
+        base,
+        "/ingest",
+        {
+            "job": job_id,
+            "source": "https://shopee.vn/depnhaphuong/25018847315",
+            "rows": [
+                {
+                    "user": "tester1",
+                    "sao": 5,
+                    "noi_dung": "ảnh 1",
+                    "anh_urls": "https://down-vn.img.susercontent.com/file/pic1",
+                    "thoi_gian": "2026-09-01 10:00:00",
+                },
+                {
+                    "user": "tester2",
+                    "sao": 5,
+                    "noi_dung": "ảnh duplicate content",
+                    "anh_urls": "https://down-vn.img.susercontent.com/file/pic_dup",
+                    "thoi_gian": "2026-09-02 10:00:00",
+                },
+                {
+                    "user": "tester3",
+                    "sao": 4,
+                    "noi_dung": "ảnh độc nhất",
+                    "anh_urls": "https://down-vn.img.susercontent.com/file/pic_unique",
+                    "thoi_gian": "2026-09-03 10:00:00",
+                },
+            ],
+        },
+    )
+
+    assert status == 200 and out["ok"]
+    media_dir = outputs / "shopee_reviews" / "shopee_25018847315" / "media"
+    media_dir = outputs / "media" / "shopee_25018847315_reviews"
+    assert media_dir.is_dir()
+
+    manifest_file = media_dir / "manifest.json"
+    assert manifest_file.is_file()
+    manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+
+    assert manifest["total_urls"] == 3
+    assert manifest["unique_count"] == 2
+    assert manifest["duplicate_count"] == 1
+    assert manifest["failed_count"] == 0
+
+    files = manifest["files"]
+    # Reviews are sorted newest-first, so the unique third row is written first.
+    assert files[0]["sha256"] == sha_b
+    assert files[0]["duplicate_of"] is None
+    primary_name = files[0]["filename"]
+
+    assert files[1]["sha256"] == sha_a
+    assert files[1]["duplicate_of"] is None
+    primary_name = files[1]["filename"]
+
+    assert files[2]["sha256"] == sha_a
+    assert files[2]["duplicate_of"] == primary_name
+
+    # Duplicate file must have been deleted from disk so media_root has only unique files
+    assert (media_dir / primary_name).is_file()
+    assert (media_dir / files[2]["filename"]).is_file()
+    # 2 unique media files + manifest.json = 3 files on disk
+    disk_files = {p.name for p in media_dir.iterdir() if p.is_file()}
+    assert len(disk_files) == 3
+    assert "manifest.json" in disk_files
+
+    # Check ZIP archive contents
+    zip_path = outputs / "zips" / "shopee_25018847315_media.zip"
+    zip_path = outputs / "zips" / "shopee_25018847315_reviews_media.zip"
+    assert zip_path.is_file()
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zip_names = zf.namelist()
+        assert "manifest.json" in zip_names
+        assert primary_name in zip_names
+        assert files[2]["filename"] in zip_names
+        assert "shopee_25018847315_reviews.csv" in zip_names
+        assert len(zip_names) == 4
+
+
+def test_verification_failure_no_fake_success_and_retry(server):
+    """Verification failure must report ok=False, and /browser/resume or /ingest/retry must re-enqueue the job."""
+    base, _ = server
+    base, outputs = server
+
+    queued = _get(base, "/ingest/job?url=https://shopee.vn/depnhaphuong/25018847315")
+    job_id = queued["job"]["id"]
+    _get(base, "/ingest/jobs?wait=1")
+
+    # Extension reports verification challenge
+    _post(base, "/ingest", {"job": job_id, "error": "Shopee challenge / verification required"})
+
+    done = _get(base, f"/ingest/result?id={job_id}")
+    assert done["ok"] is True
+    assert done["result"]["ok"] is False  # Never fake success!
+    assert done["result"]["verification_required"] is True
+    assert done["progress"]["status"] == "awaiting_user_verification"
+    assert done["progress"]["status"] == "awaiting_user_verification"
+    assert done["progress"]["stage"] == "verification_required"
+
+    # /browser/status reflects awaiting_user_verification
+    st = _get(base, "/browser/status")
+    assert st["ok"] is True
+    assert st["state"] == "awaiting_user_verification"
+    assert st["verification_required"] is True
+    assert st["pending_verification"]["job_id"] == job_id
+
+    # No empty CSV or ZIP generated
+    assert not (outputs / "csv" / "shopee_25018847315_reviews.csv").exists()
+    assert not (outputs / "zips" / "shopee_25018847315_reviews_media.zip").exists()
+
+    # Empty rows test (Requirement 9): must not fake success count: 0
+    status_empty, out_empty = _post(base, "/ingest", {"job": job_id, "rows": []})
+    assert status_empty == 200
+    assert out_empty["ok"] is False
+    assert out_empty["count"] == 0
+    assert not (outputs / "csv" / "shopee_25018847315_reviews.csv").exists()
+
+    # Persistence test (Requirement 5): state saved to disk
+    state_file = outputs / ".ingest_jobs_state.json"
+    assert state_file.is_file()
+    saved = json.loads(state_file.read_text(encoding="utf-8"))
+    assert job_id in saved["all_jobs"]
+
+    # Agent calls /browser/resume
+    resumed = _get(base, f"/browser/resume?id={job_id}")
+    assert resumed["ok"] is True
+    assert resumed["resumed"] is True
+    assert resumed["retried"] is True
+
+    # Progress should be reset to queued/resumed without error
+    progress = _get(base, f"/ingest/progress?id={job_id}")["progress"]
+    assert progress["status"] == "queued"
+    assert progress["stage"] == "resumed"
+
+    # Job is re-claimed by extension
+    claimed = _get(base, "/ingest/jobs?wait=1")["jobs"]
+    assert len(claimed) == 1
+    assert claimed[0]["id"] == job_id
+
+    # Also test explicit retry via /ingest/retry
+    retried = _get(base, f"/ingest/retry?id={job_id}")
+    assert retried["ok"] is True
+    assert retried["retried"] == job_id
+
+
+def test_shopee_structured_trace_lifecycle(server):
+    base, outputs = server
+    import launch
+
+    # 1. Server queues a job -> triggers job-dispatch trace with sanitized url
+    q = _get(base, "/ingest/job?url=https://shopee.vn/product/999/888888?token=secret_token_123")
+    assert q["ok"]
+    job_id = q["job"]["id"]
+
+    # 2. Ack job -> triggers job-accepted trace
+    launch._ack_ingest_job(job_id)
+
+    # 3. Simulate extension reporting traces via _update_ingest_progress
+    trace_tab_ready = {
+        "jobId": job_id,
+        "itemid": "888888",
+        "shopid": "999",
+        "tabId": 101,
+        "tabUrl": "https://shopee.vn/product/999/888888?auth=secret_auth",
+        "event": "tab-ready",
+    }
+    launch._update_ingest_progress(job_id, {"stage": "trace", "trace": trace_tab_ready})
+
+    trace_shop_resolved = {
+        "jobId": job_id,
+        "itemid": "888888",
+        "shopid": "999",
+        "tabId": 101,
+        "tabUrl": "https://shopee.vn/product/999/888888",
+        "event": "shop-resolved",
+    }
+    launch._update_ingest_progress(job_id, {"stage": "trace", "trace": trace_shop_resolved})
+
+    trace_req = {
+        "jobId": job_id,
+        "itemid": "888888",
+        "shopid": "999",
+        "tabId": 101,
+        "tabUrl": "https://shopee.vn/product/999/888888",
+        "event": "ratings-request",
+        "offset": 0,
+        "limit": 50,
+        "requestStart": "2026-09-06T12:00:00Z",
+    }
+    launch._update_ingest_progress(job_id, {"stage": "trace", "trace": trace_req})
+
+    trace_resp = {
+        "jobId": job_id,
+        "itemid": "888888",
+        "shopid": "999",
+        "tabId": 101,
+        "tabUrl": "https://shopee.vn/product/999/888888",
+        "event": "ratings-response",
+        "offset": 0,
+        "limit": 50,
+        "requestStart": "2026-09-06T12:00:00Z",
+        "requestEnd": "2026-09-06T12:00:00.350Z",
+        "httpStatus": 200,
+        "responseUrl": "https://shopee.vn/api/v2/item/get_ratings?itemid=888888&shopid=999&session=super_secret",
+        "elapsedMs": 350,
+        "error": None,
+    }
+    launch._update_ingest_progress(job_id, {"stage": "trace", "trace": trace_resp})
+
+    trace_up_start = {
+        "jobId": job_id,
+        "itemid": "888888",
+        "shopid": "999",
+        "tabId": 101,
+        "tabUrl": "https://shopee.vn/product/999/888888",
+        "event": "upload-start",
+        "rowsCount": 1,
+    }
+    launch._update_ingest_progress(job_id, {"stage": "trace", "trace": trace_up_start})
+
+    # Complete job payload
+    rows = [{"user": "test_user", "sao": 5, "noi_dung": "tot", "thoi_gian": "2026-01-01"}]
+    _post(base, "/ingest", {"job": job_id, "source": "https://shopee.vn/product/999/888888", "rows": rows})
+
+    trace_up_complete = {
+        "jobId": job_id,
+        "itemid": "888888",
+        "shopid": "999",
+        "tabId": 101,
+        "tabUrl": "https://shopee.vn/product/999/888888",
+        "event": "upload-complete",
+        "rowsCount": 1,
+    }
+    launch._update_ingest_progress(job_id, {"stage": "trace", "trace": trace_up_complete})
+
+    # 4. Check /ingest/traces?id=job_id endpoint
+    traces_res = _get(base, f"/ingest/traces?id={job_id}")
+    assert traces_res["ok"] is True
+    assert traces_res["jobId"] == job_id
+    traces = traces_res["traces"]
+    assert len(traces) >= 7
+
+    events = [t["event"] for t in traces]
+    for required_event in [
+        "job-dispatch",
+        "job-accepted",
+        "tab-ready",
+        "shop-resolved",
+        "ratings-request",
+        "ratings-response",
+        "upload-start",
+        "upload-complete",
+    ]:
+        assert required_event in events
+
+    # Check 13 required fields for every trace
+    required_fields = [
+        "jobId", "itemid", "shopid", "tabId", "tabUrl", "event",
+        "offset", "limit", "requestStart", "requestEnd", "httpStatus",
+        "responseUrl", "elapsedMs", "error",
+    ]
+    for t in traces:
+        for rf in required_fields:
+            assert rf in t, f"Trace {t.get('event')} missing field {rf}"
+        # Security sanitization checks: never leak token/cookie/auth
+        if t.get("tabUrl"):
+            assert "secret_token_123" not in t["tabUrl"]
+            assert "secret_auth" not in t["tabUrl"]
+        if t.get("responseUrl"):
+            assert "super_secret" not in t["responseUrl"]
+            assert "[REDACTED]" in t["responseUrl"]
+
+    # 5. Check /ingest/result has traces included
+    res = _get(base, f"/ingest/result?id={job_id}")
+    assert res["ok"] is True
+    assert "traces" in res
+    assert res["traces_count"] == len(traces)
+
+    # 6. Check log file outputs/logs/shopee_jobs.jsonl
+    log_file = outputs / "logs" / "shopee_jobs.jsonl"
+    assert log_file.is_file()
+    lines = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    log_job_events = [line["event"] for line in lines if line.get("jobId") == job_id]
+    for ev in ["job-dispatch", "job-accepted", "ratings-response"]:
+        assert ev in log_job_events
+
+
+def test_preflight_login_required_stops_and_records_trace(server):
+    base, outputs = server
+    import launch
+
+    # 1. Queue job
+    q = _get(base, "/ingest/job?url=https://shopee.vn/product/123/456")
+    job_id = q["job"]["id"]
+
+    # 2. Extension runs preflight and detects is_login == False
+    preflight_trace = {
+        "jobId": job_id,
+        "itemid": "456",
+        "shopid": "123",
+        "tabId": 12,
+        "tabUrl": "https://shopee.vn/product/123/456",
+        "event": "tab-preflight",
+        "httpStatus": 200,
+        "error": "Shopee login required (error 90309999, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome",
+        "is_login": False,
+        "responseUrl": "https://shopee.vn/api/v2/item/get_ratings",
+    }
+    launch._update_ingest_progress(job_id, {"stage": "trace", "trace": preflight_trace})
+
+    # Extension reports login_required status
+    status, res = _post(base, "/ingest", {
+        "job": job_id,
+        "error": "Shopee login required (error 90309999, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome",
+        "login_required": True,
+    })
+    assert status == 200
+    assert res["ok"] is False
+    assert res["login_required"] is True
+    assert res["status"] == "login_required"
+
+    # Verify result endpoint
+    r = _get(base, f"/ingest/result?id={job_id}")
+    assert r["ok"] is True
+    assert r["result"]["login_required"] is True
+    assert r["progress"]["status"] == "login_required"
+
+    # Verify trace endpoint has tab-preflight trace with is_login == False
+    traces_res = _get(base, f"/ingest/traces?id={job_id}")
+    assert traces_res["ok"] is True
+    preflight_entries = [t for t in traces_res["traces"] if t["event"] == "tab-preflight"]
+    assert len(preflight_entries) == 1
+    assert preflight_entries[0]["is_login"] is False
+    assert "login required" in preflight_entries[0]["error"].lower()
+
+

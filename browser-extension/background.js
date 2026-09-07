@@ -9,7 +9,7 @@
 // 3. Same-origin fetch enforcement in tab context.
 // 4. Verification & Captcha detection with graceful workflow pause/resume.
 // 5. Exponential backoff reconnect with random jitter and 20s keepalive heartbeats.
-// 6. Backward-compatible Shopee reviews extraction and HTTP long-poll fallback.
+// 6. Backward-compatible Shopee reviews extraction and acknowledged WebSocket result uploads.
 
 const HELPER = "http://127.0.0.1:8766";
 const PAGE_SIZE = 50;
@@ -22,11 +22,19 @@ let bridgeConnecting = null;
 let bridgeHeartbeat = null;
 let bridgeReconnectTimeout = null;
 let reconnectAttempts = 0;
+let connectionGeneration = 0;
+let connectionEnabled = true;
+let bridgeHandshakeTimeout = null;
+let lastBridgeMessageAt = 0;
+let pairingController = null;
 let jobChain = Promise.resolve();
 let extensionState = "disconnected";
 let activeJobs = new Map();
 let inFlightCommands = new Map();
 let verificationInfo = null;
+let pendingVerificationJobs = new Map();
+let lastVerificationJob = null;
+let connectionConflict = null;
 
 function setBadge(text, color = "#1a73e8") {
   chrome.action.setBadgeText({ text: String(text || "") });
@@ -35,9 +43,16 @@ function setBadge(text, color = "#1a73e8") {
 
 function updateState(newState, details = null) {
   extensionState = newState;
+  if (newState !== "client_conflict") connectionConflict = null;
   if (newState === "awaiting_user_verification") {
     verificationInfo = details;
     setBadge("PAUS", "#f9ab00");
+  } else if (newState === "login_required") {
+    verificationInfo = details;
+    setBadge("LOGN", "#ea8600");
+  } else if (newState === "api_blocked") {
+    verificationInfo = details;
+    setBadge("BLCK", "#d93025");
   } else if (newState === "connected") {
     if (!verificationInfo) {
       setBadge("OK", "#137333");
@@ -46,6 +61,9 @@ function updateState(newState, details = null) {
     }
   } else if (newState === "busy") {
     setBadge("BUSY", "#1a73e8");
+  } else if (newState === "client_conflict") {
+    connectionConflict = details || connectionConflict;
+    setBadge("LOCK", "#ea8600");
   } else {
     // disconnected
     if (!verificationInfo) {
@@ -55,28 +73,140 @@ function updateState(newState, details = null) {
   chrome.storage.local.set({
     extensionState: verificationInfo ? "awaiting_user_verification" : extensionState,
     verificationInfo,
+    connectionConflict,
     currentJob: activeJobs.size > 0 ? Array.from(activeJobs.values())[0] : null,
   });
 }
 
+function stateForVerification(details) {
+  if (details?.kind === "login") return "login_required";
+  if (details?.kind === "api_blocked") return "api_blocked";
+  return "awaiting_user_verification";
+}
+
 // ── Ingest & Progress Helpers ────────────────────────────────────────────────
+const pendingIngestRequests = new Map();
+const knownJobs = new Set();
+
+function sendIngestRequest(params) {
+  const id = crypto.randomUUID();
+  const message = { v: 1, type: "ingest.rpc", id, params };
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const retry = () => {
+      if (Date.now() - started > 300000) {
+        clearInterval(timer);
+        pendingIngestRequests.delete(id);
+        reject(new Error("WebSocket ingest acknowledgement timed out"));
+        return;
+      }
+      bridgeSend(message);
+    };
+    const timer = setInterval(retry, 5000);
+    pendingIngestRequests.set(id, { resolve, reject, timer, message });
+    retry();
+  });
+}
+
 async function reportProgress(job, progress) {
-  if (!job || !job.id) return;
+  if (job && job.id) await sendIngestRequest({ operation: "progress", job: job.id, progress });
+}
+
+function sanitizeUrlForTrace(url) {
+  if (!url || typeof url !== "string") return null;
   try {
-    await fetch(`${HELPER}/ingest/progress`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job: job.id, progress }),
-    });
-  } catch (e) {
-    console.warn("[bridge] progress report failed:", e.message);
+    let clean = url.split("#")[0];
+    clean = clean.replace(/([?&][^=]*(?:token|auth|session|cookie|sig|signature|sp_atk|password|key|passkey)[^=]*=)[^&#]+/gi, "$1[REDACTED]");
+    return clean;
+  } catch {
+    return null;
   }
 }
 
-function startKeepalive() {
-  return setInterval(() => {
-    fetch(`${HELPER}/ping`).catch(() => {});
-  }, 20_000);
+function sanitizeErrorForTrace(err) {
+  if (!err) return null;
+  const raw = typeof err === "object" ? (err.message || String(err)) : String(err);
+  return raw
+    .replace(/<[^>]*>/g, " ")
+    .replace(/([^=&\s]*(?:token|cookie|auth|session)[^=&\s]*)=[^\s,;&]+/gi, "$1=[REDACTED]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 400);
+}
+
+function buildTraceEntry(job, event, details = {}) {
+  const itemid = details.itemid ?? job?.itemid ?? (job?.url ? idsFrom(job.url).itemid : null) ?? null;
+  const shopid = details.shopid ?? job?._targetShopId ?? job?.shopid ?? (job?.url ? idsFrom(job.url).shopid : null) ?? null;
+  const tabId = details.tabId ?? job?._targetTabId ?? null;
+  const tabUrl = sanitizeUrlForTrace(details.tabUrl ?? job?._targetTabUrl ?? job?.url ?? null);
+
+  const reqStart = details.requestStart
+    ? (typeof details.requestStart === "number" ? new Date(details.requestStart).toISOString() : String(details.requestStart))
+    : null;
+  const reqEnd = details.requestEnd
+    ? (typeof details.requestEnd === "number" ? new Date(details.requestEnd).toISOString() : String(details.requestEnd))
+    : null;
+
+  const httpStatus = typeof details.httpStatus === "number"
+    ? details.httpStatus
+    : (typeof details.status === "number" ? details.status : null);
+
+  const isLogin = typeof details.isLogin === "boolean"
+    ? details.isLogin
+    : (typeof details.is_login === "boolean" ? details.is_login : null);
+
+  const entry = {
+    jobId: job?.id || details.jobId || null,
+    itemid: itemid !== null && itemid !== undefined ? String(itemid) : null,
+    shopid: shopid !== null && shopid !== undefined ? String(shopid) : null,
+    tabId: typeof tabId === "number" ? tabId : null,
+    tabUrl,
+    event: String(event),
+    offset: typeof details.offset === "number" ? details.offset : null,
+    limit: typeof details.limit === "number" ? details.limit : null,
+    requestStart: reqStart,
+    requestEnd: reqEnd,
+    httpStatus,
+    responseUrl: sanitizeUrlForTrace(details.responseUrl ?? null),
+    elapsedMs: typeof details.elapsedMs === "number" ? details.elapsedMs : null,
+    error: details.error ? sanitizeErrorForTrace(details.error) : null,
+    is_login: isLogin,
+    at: new Date().toISOString(),
+  };
+
+  if (typeof details.rowsCount === "number") entry.rowsCount = details.rowsCount;
+  if (typeof details.batchSize === "number") entry.batchSize = details.batchSize;
+  if (typeof details.totalTarget === "number") entry.totalTarget = details.totalTarget;
+
+  return entry;
+}
+
+async function traceJob(job, progress, event, details = {}) {
+  const entry = buildTraceEntry(job, event, details);
+  // Keep this structured and omit review text, cookies, and media URLs.
+  console.log("[bridge][job-trace]", JSON.stringify(entry));
+  if (progress && entry.jobId) {
+    try {
+      await progress({ stage: "trace", trace: entry, message: `[${event}]` });
+    } catch (error) {
+      console.warn("[bridge][job-trace] progress upload failed:", error?.message || error);
+    }
+  }
+  return entry;
+}
+
+async function uploadIngestResult(body) {
+  const uploadId = crypto.randomUUID();
+  const payload = JSON.stringify(body);
+  // Every frame stays below the gateway's 8 MiB limit, even after JSON escaping.
+  for (let offset = 0, index = 0; offset < payload.length; index++) {
+    let end = Math.min(offset + 65536, payload.length);
+    const lastCode = payload.charCodeAt(end - 1);
+    if (end < payload.length && lastCode >= 0xD800 && lastCode <= 0xDBFF) end--;
+    await sendIngestRequest({ operation: "chunk", uploadId, index, chunk: payload.slice(offset, end) });
+    offset = end;
+  }
+  return sendIngestRequest({ operation: "complete", uploadId });
 }
 
 function mediaUrl(value, kind = "image") {
@@ -131,471 +261,429 @@ function crawlPercent(rows, total, base, span) {
   return Math.min(95, base + Math.floor((rows / MAX_REVIEWS) * span));
 }
 
-function idsFrom(url) {
-  const u = new URL(url);
-  const q = u.searchParams;
-  const qItem = q.get("itemid") || q.get("item_id");
-  if (qItem) return { shopid: q.get("shopid") || q.get("shop_id") || null, itemid: qItem };
-  let m = u.pathname.match(/^\/product\/(\d+)\/(\d+)/) || u.href.match(/i\.(\d+)\.(\d+)/);
-  if (m) return { shopid: m[1], itemid: m[2] };
-  const tail = u.pathname.match(/\/(\d{6,})\/?$/);
-  if (tail) return { shopid: null, itemid: tail[1] };
-  const any = u.href.match(/[.\-/](\d{8,})(?:[?&#/]|$)/);
-  return any ? { shopid: null, itemid: any[1] } : {};
+function isShopeeHostname(hostname) {
+  if (!hostname || typeof hostname !== "string") return false;
+  const h = hostname.toLowerCase();
+  return h === "shopee.vn" || h.endsWith(".shopee.vn");
 }
 
-async function resolveShopId(itemid, originalUrl, progress) {
-  if (progress) await progress({ stage: "resolve-shop", message: "Đang tìm shopid", itemid, percent: 10 });
-  function scrape(text) {
-    const m = text.match(/"shopid"\s*:\s*"?(\d+)/) || text.match(/"shop_id"\s*:\s*"?(\d+)/);
-    return m ? m[1] : null;
-  }
+function isValidShopeeUrl(urlStr) {
+  if (!urlStr || typeof urlStr !== "string") return false;
   try {
-    const r = await fetch(originalUrl, { headers: { "User-Agent": navigator.userAgent } });
-    const s = scrape(await r.text());
-    if (s) return s;
+    const u = new URL(urlStr, "https://shopee.vn");
+    return (u.protocol === "http:" || u.protocol === "https:") && isShopeeHostname(u.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function extractShopName(url) {
+  try {
+    const u = new URL(url, "https://shopee.vn");
+    const reserved = new Set([
+      "product", "cart", "user", "buyer", "search", "flash_sale",
+      "daily_discover", "m", "portal", "verify", "api", "order",
+      "checkout", "help", "seller", "affiliate"
+    ]);
+    const parts = u.pathname.split("/").filter(Boolean);
+    if (parts.length >= 2 && !reserved.has(parts[0].toLowerCase())) {
+      return parts[0];
+    }
   } catch {}
   return null;
 }
 
-// Function injected and executed in the shopee.vn page context
-async function inTabExtractShopeeRatings(itemid, shopid, offset, limit) {
-  const url = `/api/v2/item/get_ratings?filter=0&flag=1&itemid=${itemid}&limit=${limit}&offset=${offset}&shopid=${shopid}&type=0`;
+function idsFrom(url) {
   try {
-    const res = await fetch(url, {
-      headers: {
-        "x-requested-with": "XMLHttpRequest",
-        "accept": "application/json"
-      },
-      credentials: "include"
+    const u = new URL(url, "https://shopee.vn");
+    const q = u.searchParams;
+    const qItem = q.get("itemid") || q.get("item_id");
+    if (qItem) return { shopid: q.get("shopid") || q.get("shop_id") || null, itemid: qItem, shopname: extractShopName(url) };
+    let m = u.pathname.match(/^\/product\/(\d+)\/(\d+)/) || u.href.match(/i\.(\d+)\.(\d+)/);
+    if (m) return { shopid: m[1], itemid: m[2], shopname: null };
+    const tail = u.pathname.match(/\/(\d{6,})\/?$/);
+    if (tail) return { shopid: null, itemid: tail[1], shopname: extractShopName(url) };
+    const any = u.href.match(/[.\-/](\d{8,})(?:[?&#/]|$)/);
+    return any ? { shopid: null, itemid: any[1], shopname: extractShopName(url) } : {};
+  } catch {
+    return {};
+  }
+}
+
+async function findOrOpenShopeeTab(targetUrl, itemid) {
+  if (!isValidShopeeUrl(targetUrl)) {
+    throw new Error(`Target URL không thuộc hostname shopee.vn: ${targetUrl}`);
+  }
+  const tabs = await chrome.tabs.query({});
+  // 1. Prefer a tab already displaying this item on shopee.vn
+  let tab = tabs.find((t) => t.url && isValidShopeeUrl(t.url) && itemid && t.url.includes(String(itemid)));
+  // 2. Or create a new tab if none exists with this item
+  if (!tab) {
+    tab = await chrome.tabs.create({ url: targetUrl, active: false });
+    await new Promise((resolve) => {
+      let timer = null;
+      const listener = (tid, changeInfo) => {
+        if (tid === tab.id && changeInfo.status === "complete") {
+          cleanup();
+          resolve();
+        }
+      };
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(listener);
+      };
+      chrome.tabs.onUpdated.addListener(listener);
+      timer = setTimeout(() => {
+        cleanup();
+        resolve();
+      }, 15000);
     });
-    if (!res.ok) {
-      if (res.status === 403 || res.url.includes("/verify/traffic")) {
-        return { ok: false, verificationRequired: true, status: res.status };
-      }
-      return { ok: false, status: res.status, error: "HTTP " + res.status };
+    try {
+      const updated = await chrome.tabs.get(tab.id);
+      if (updated) tab = updated;
+    } catch {}
+  }
+
+  if (!tab || !tab.id || !tab.url) {
+    throw new Error("Không thể tìm hoặc mở tab Shopee trên trình duyệt");
+  }
+
+  try {
+    const tabHost = new URL(tab.url).hostname;
+    if (!isShopeeHostname(tabHost)) {
+      throw new Error(`Tab không thuộc hostname shopee.vn (hostname: ${tabHost})`);
     }
-    const json = await res.json();
-    if (json.error === 90309999 || (json.data && json.data.is_login === false)) {
-      return { ok: false, verificationRequired: true, is_login: false, error: "Shopee verification / login required" };
-    }
-    return { ok: true, data: json.data };
   } catch (err) {
-    return { ok: false, error: err.message };
+    throw new Error(`Tab URL không hợp lệ: ${tab.url} (${err.message})`);
   }
+
+  const tabIds = idsFrom(tab.url);
+  if (tabIds.itemid && String(tabIds.itemid) !== String(itemid)) {
+    throw new Error(`Tab URL trỏ đến itemid khác (${tabIds.itemid}) so với itemid cần crawl (${itemid})`);
+  }
+
+  return tab;
 }
 
-// Function injected into the Shopee tab page context to scrape reviews from DOM
-function inTabScrapeShopeePage() {
-  const cardElements = Array.from(document.querySelectorAll(
-    '.shopee-product-rating, [class*="shopee-product-rating__main"], .product-rating-overview ~ div .shopee-product-rating'
-  ));
-  
-  const rawReviews = [];
-  for (const item of cardElements) {
-    if (item.closest('.product-rating-overview')) continue;
-
-    // Tác giả
-    const authorEl = item.querySelector('.shopee-product-rating__author-name') 
-      || item.querySelector('[class*="author-name"]')
-      || item.querySelector('a[href*="/shop/"]')
-      || item.querySelector('a');
-    const author = authorEl ? authorEl.textContent.trim() : "Khách hàng";
-
-    // Số sao
-    let stars = item.querySelectorAll('svg.icon-rating-solid, .icon-rating-solid, svg[class*="icon-rating-solid"]').length;
-    if (!stars) {
-      stars = item.querySelectorAll('svg[style*="fill: rgb(238, 77, 45)"], svg[fill="#ee4d2d"], svg[style*="fill:#ee4d2d"]').length;
-    }
-    if (!stars) {
-      const ratingBox = item.querySelector('.shopee-product-rating__rating') || item.querySelector('[class*="rating__rating"]');
-      if (ratingBox) stars = ratingBox.querySelectorAll('svg').length;
-    }
-    if (!stars || stars > 5) stars = 5;
-
-    // Thời gian & phân loại
-    const timeEl = item.querySelector('.shopee-product-rating__time') 
-      || item.querySelector('[class*="rating__time"]')
-      || item.querySelector('div[style*="color: rgba(0, 0, 0, 0.54)"]');
-    const timeText = timeEl ? timeEl.textContent.trim() : "";
-    
-    let ctime = "";
-    let variation = "";
-    if (timeText) {
-      const parts = timeText.split("|");
-      ctime = parts[0].trim();
-      if (parts.length > 1) {
-        variation = parts.slice(1).join("|").replace(/Phân loại hàng:\s*/i, "").trim();
-      }
-    }
-
-    // Nội dung bình luận
-    const contentEl = item.querySelector('.shopee-product-rating__content') 
-      || item.querySelector('div[style*="word-break"]')
-      || item.querySelector('div[style*="pre-wrap"]');
-    const comment = contentEl ? contentEl.textContent.replace(/\s+/g, ' ').trim() : "";
-
-    // Ảnh đính kèm
-    const imgEls = Array.from(item.querySelectorAll('.shopee-rating-image-list img, img[src*="susercontent"], img[class*="rating-image"]'));
-    const imageUrls = [];
-    for (const img of imgEls) {
-      let src = img.getAttribute('src') || img.src || "";
-      if (src && !src.startsWith("data:") && (src.includes("susercontent") || src.includes("shopee"))) {
-        src = src.replace(/_tn$/, '').replace(/_tn\./, '.');
-        if (!imageUrls.includes(src)) imageUrls.push(src);
-      }
-    }
-
-    // Video đính kèm
-    const videoEls = Array.from(item.querySelectorAll('video source[src], video[src]'));
-    const videoUrls = [];
-    for (const vid of videoEls) {
-      const vsrc = vid.getAttribute('src') || vid.src || "";
-      if (vsrc && !videoUrls.includes(vsrc)) videoUrls.push(vsrc);
-    }
-
-    if (author || comment || imageUrls.length) {
-      rawReviews.push({
-        author,
-        stars,
-        comment,
-        ctime,
-        variation,
-        imageUrls,
-        videoUrls,
-      });
-    }
+async function resolveShopId(itemid, originalUrl, tab, progress) {
+  // Support both (itemid, originalUrl, tab, progress) and (itemid, originalUrl, progress)
+  if (typeof tab === "function" && progress === undefined) {
+    progress = tab;
+    tab = null;
   }
+  if (progress) await progress({ stage: "resolve-shop", message: "Đang tìm shopid", itemid, percent: 10 });
 
-  // Tìm nút Next page
-  const nextBtn = document.querySelector('button.shopee-icon-button--right')
-    || document.querySelector('.shopee-page-controller button:last-child')
-    || document.querySelector('.shopee-pagination button:last-child')
-    || document.querySelector('button[aria-label="Next page"]')
-    || document.querySelector('button[aria-label="Trang tiếp"]');
+  const shopname = extractShopName(originalUrl);
 
-  let hasNext = false;
-  if (nextBtn) {
-    const isDisabled = nextBtn.disabled 
-      || nextBtn.getAttribute('disabled') !== null 
-      || nextBtn.classList.contains('shopee-button-solid--disabled')
-      || nextBtn.getAttribute('aria-disabled') === 'true';
-    if (!isDisabled) {
-      hasNext = true;
-      nextBtn.scrollIntoView({ block: 'center', behavior: 'instant' });
-      nextBtn.click();
-    }
-  }
-
-  return { reviews: rawReviews, hasNext };
-}
-
-async function inTabExtractShopeeDOM(tabId, maxReviews, progress) {
-  try {
-    await chrome.tabs.update(tabId, { active: true });
-  } catch {}
-
-  if (progress) {
-    await progress({
-      stage: "dom-scroll",
-      message: "Đang cuộn trang đến phần đánh giá sản phẩm...",
-      percent: 20,
-    });
-  }
-
-  // Step 1: Click the "Đánh Giá" (rating) tab button to ensure review section is active
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        // Find rating tab button — look for buttons containing "Đánh Giá" text
-        const allButtons = document.querySelectorAll('div.flex > button, button[role="tab"], .product-tab button');
-        for (const btn of allButtons) {
-          const text = (btn.textContent || "").trim();
-          if (/đánh giá/i.test(text) || /rating/i.test(text)) {
-            btn.scrollIntoView({ block: 'center', behavior: 'instant' });
-            btn.click();
-            return { clicked: true, text };
-          }
-        }
-        return { clicked: false };
-      },
-    });
-  } catch {}
-
-  await new Promise((r) => setTimeout(r, 1500));
-
-  // Step 2: Progressive scrolling to trigger IntersectionObserver lazy-loading
-  const scrollSteps = [0.25, 0.45, 0.65, 0.80, 0.95];
-  for (const fraction of scrollSteps) {
+  function extractShopIdFromUrl(urlStr) {
+    if (!urlStr || typeof urlStr !== "string") return null;
     try {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        func: (frac) => {
-          window.scrollTo({ top: document.body.scrollHeight * frac, behavior: 'smooth' });
+      const u = new URL(urlStr, "https://shopee.vn");
+      const q = u.searchParams.get("shopid") || u.searchParams.get("shop_id");
+      if (q) return q;
+      const m = u.pathname.match(/^\/product\/(\d+)\//) || u.href.match(/i\.(\d+)\./);
+      if (m) return m[1];
+    } catch {}
+    return null;
+  }
+
+  // 1. Try URL regex from current tab URL (might have redirected to /product/<shopid>/<itemid>)
+  if (tab && tab.url) {
+    const sid = extractShopIdFromUrl(tab.url);
+    if (sid) return sid;
+  }
+
+  // 2. Scrape from DOM / canonical / same-origin in tab context (chỉ trong tab, KHÔNG dùng background fetch)
+  if (tab && tab.id) {
+    try {
+      const res = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: async (sname, iid) => {
+          // 2a. Check current location URL
+          const fromLoc = location.pathname.match(/^\/product\/(\d+)\//) || location.href.match(/i\.(\d+)\./);
+          if (fromLoc) return fromLoc[1];
+
+          // 2b. Check canonical or og:url meta tags
+          const canonical = document.querySelector('link[rel="canonical"]')?.href || "";
+          const ogUrl = document.querySelector('meta[property="og:url"]')?.content || "";
+          for (const u of [canonical, ogUrl]) {
+            const m = u.match(/\/product\/(\d+)\//) || u.match(/i\.(\d+)\./);
+            if (m) return m[1];
+          }
+
+          // 2c. Scrape from DOM in tab context
+          const html = document.documentElement.innerHTML;
+          const s = html.match(/"shopid"\s*:\s*"?(\d+)/i) ||
+                    html.match(/"shop_id"\s*:\s*"?(\d+)/i) ||
+                    html.match(/"shopId"\s*:\s*"?(\d+)/);
+          if (s) return s[1];
+
+          // 2d. For vanity URL /<shopname>/<itemid>, resolve shopid via same-origin tab fetch
+          if (sname) {
+            try {
+              const resp = await fetch(`/api/v4/shop/get_shop_detail?username=${encodeURIComponent(sname)}`, {
+                credentials: "include",
+                headers: { "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" },
+              });
+              if (resp.ok) {
+                const j = await resp.json();
+                const sid = j?.data?.shopid || j?.data?.shop_id;
+                if (sid) return String(sid);
+              }
+            } catch {}
+          }
+
+          // 2e. Try PDP API from tab
+          if (iid) {
+            try {
+              const resp = await fetch(`/api/v4/pdp/get_pc?item_id=${iid}`, {
+                credentials: "include",
+                headers: { "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" },
+              });
+              if (resp.ok) {
+                const j = await resp.json();
+                const sid = j?.data?.item?.shopid || j?.data?.item?.shop_id || j?.data?.shop_id;
+                if (sid) return String(sid);
+              }
+            } catch {}
+          }
+
+          return null;
         },
-        args: [fraction],
+        args: [shopname, itemid],
       });
+      const sid = res[0]?.result;
+      if (sid) return sid;
     } catch {}
-    await new Promise((r) => setTimeout(r, 800));
   }
 
-  // Step 3: Scroll to review section specifically
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        // Find the "ĐÁNH GIÁ SẢN PHẨM" heading or review container
-        const selectors = [
-          '.product-ratings-comments-view',
-          '.product-ratings',
-          '.shopee-product-rating',
-          '[class*="product-rating"]',
-        ];
-        for (const sel of selectors) {
-          const el = document.querySelector(sel);
-          if (el) {
-            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            return { found: sel };
-          }
-        }
-        // Fallback: find heading containing "ĐÁNH GIÁ"
-        const headings = document.querySelectorAll('h2, h3, div[class*="heading"], div[class*="title"]');
-        for (const h of headings) {
-          if (/đánh giá sản phẩm/i.test(h.textContent)) {
-            h.scrollIntoView({ behavior: 'smooth', block: 'start' });
-            return { found: 'heading' };
-          }
-        }
-        window.scrollTo({ top: document.body.scrollHeight * 0.6, behavior: 'smooth' });
-        return { found: 'fallback-scroll' };
-      },
-    });
-  } catch {}
+  // 3. Fallback: Try URL regex from original URL
+  const fromOrig = extractShopIdFromUrl(originalUrl);
+  if (fromOrig) return fromOrig;
 
-  await new Promise((r) => setTimeout(r, 3000));
+  // TUYỆT ĐỐI KHÔNG dùng background fetch thay cho request trong tab (đã gỡ bỏ fallback background fetch)
+  return null;
+}
 
-  // Step 4: Wait for review cards to appear
-  let cardsFound = false;
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try {
-      const [checkRes] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => document.querySelectorAll('.shopee-product-rating').length,
-      });
-      if (checkRes && checkRes.result > 0) {
-        cardsFound = true;
-        break;
-      }
-    } catch {}
-    // Scroll down a bit more and wait
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => window.scrollBy({ top: 400, behavior: 'smooth' }),
-      });
-    } catch {}
-    await new Promise((r) => setTimeout(r, 2000));
-  }
-
-  if (progress) {
-    await progress({
-      stage: "dom-crawl",
-      message: cardsFound ? "Tìm thấy đánh giá, đang cào..." : "Đang tìm đánh giá trên trang...",
-      percent: 30,
-    });
-  }
-
-  const all = [];
-  const seenKeys = new Set();
-  let page = 1;
-  const maxPages = Math.min(100, Math.ceil(maxReviews / 6));
-
-  while (all.length < maxReviews && page <= maxPages) {
-    let res = null;
-    try {
-      const [scriptRes] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: inTabScrapeShopeePage,
-      });
-      res = scriptRes && scriptRes.result;
-    } catch (err) {
-      console.warn("[bridge] inTabScrapeShopeePage execution error:", err.message);
-      break;
-    }
-
-    if (!res || !res.reviews || res.reviews.length === 0) {
-      if (page === 1) {
-        // Retry: scroll down more and try again
-        await chrome.scripting.executeScript({
-          target: { tabId },
-          func: () => window.scrollBy({ top: 500, behavior: 'smooth' }),
+async function fetchRatingsFromTab(tabId, itemid, shopid, offset, limit, referer) {
+  const res = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: async (iid, sid, off, lim, ref) => {
+      const path = `/api/v2/item/get_ratings?filter=0&flag=1&itemid=${iid}&limit=${lim}&offset=${off}&shopid=${sid}&type=0`;
+      try {
+        const resp = await fetch(path, {
+          credentials: "include",
+          headers: {
+            "Accept": "application/json, text/plain, */*",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-Api-Source": "pc",
+            "X-Shopee-Language": "vi",
+          },
+          referrer: ref,
+          referrerPolicy: "strict-origin-when-cross-origin",
         });
-        await new Promise((r) => setTimeout(r, 3000));
-        try {
-          const [retryRes] = await chrome.scripting.executeScript({
-            target: { tabId },
-            func: inTabScrapeShopeePage,
-          });
-          res = retryRes && retryRes.result;
-        } catch {}
+        const text = await resp.text();
+        let json = null;
+        try { json = JSON.parse(text); } catch {}
+        return {
+          ok: resp.ok,
+          status: resp.status,
+          url: resp.url,
+          pageUrl: location.href,
+          json,
+          textSample: text.slice(0, 300),
+        };
+      } catch (err) {
+        return { ok: false, error: err.message };
       }
-      if (!res || !res.reviews || res.reviews.length === 0) {
-        break;
+    },
+    args: [itemid, shopid, offset, limit, referer],
+  });
+  return res[0]?.result || { ok: false, error: "executeScript returned no result" };
+}
+
+function classifyShopeeFailure(fetchRes) {
+  const json = fetchRes?.json || {};
+  const data = json?.data || {};
+  const url = String(fetchRes?.url || "").toLowerCase();
+  const sample = String(fetchRes?.textSample || fetchRes?.error || "").toLowerCase();
+  const isLogin = json?.error === 90309999 || json?.is_login === false || data?.is_login === false ||
+                  url.includes("/login") || sample.includes("is_login") || sample.includes("90309999");
+  if (isLogin) return "login";
+
+  const isChallenge = url.includes("/verify/traffic") || sample.includes("captcha") ||
+                      sample.includes("challenge") || sample.includes("verify/traffic");
+  if (isChallenge) return "verification";
+
+  if (fetchRes?.status === 403 || sample.includes("403") || sample.includes("access denied") || sample.includes("api_blocked")) {
+    return "api_blocked";
+  }
+  return "other";
+}
+
+function formatShopeeFailure(fetchRes) {
+  const kind = classifyShopeeFailure(fetchRes);
+  const status = fetchRes?.status ?? "unknown";
+  const endpoint = fetchRes?.url || "unknown endpoint";
+  const page = fetchRes?.pageUrl || "unknown tab";
+  const sample = String(fetchRes?.textSample || "").replace(/\s+/g, " ").slice(0, 240);
+  if (kind === "login") {
+    return `Shopee login required (HTTP ${status}, error=${fetchRes?.json?.error ?? "unknown"}, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome`;
+  }
+  if (kind === "verification") {
+    return `Shopee verification required (HTTP ${status}) — response=${endpoint}`;
+  }
+  return `Shopee reviews API access denied (HTTP ${status}) — không thấy CAPTCHA trên tab; endpoint=${endpoint}; tab=${page}; response=${sample || "empty"}`;
+}
+
+async function preflightRatingsInTab(tabId, itemid, shopid, referer) {
+  const res = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: async (iid, sid, ref) => {
+      const path = `/api/v2/item/get_ratings?filter=0&flag=1&itemid=${iid}&limit=1&offset=0&shopid=${sid}&type=0`;
+      try {
+        const resp = await fetch(path, {
+          credentials: "include",
+          headers: {
+            "Accept": "application/json, text/plain, */*",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-Api-Source": "pc",
+            "X-Shopee-Language": "vi",
+          },
+          referrer: ref,
+          referrerPolicy: "strict-origin-when-cross-origin",
+        });
+        const text = await resp.text();
+        let json = null;
+        try { json = JSON.parse(text); } catch {}
+        return {
+          ok: resp.ok,
+          status: resp.status,
+          url: resp.url,
+          pageUrl: location.href,
+          json,
+          textSample: text.slice(0, 300),
+        };
+      } catch (err) {
+        return { ok: false, error: err.message, pageUrl: location.href };
       }
-    }
+    },
+    args: [itemid, shopid, referer],
+  });
+  return res[0]?.result || { ok: false, error: "executeScript returned no result" };
+}
 
-    let addedCount = 0;
-    for (const r of res.reviews) {
-      const key = `${r.author}_${r.ctime}_${r.comment.slice(0, 30)}`;
-      if (seenKeys.has(key)) continue;
-      seenKeys.add(key);
+function evaluatePreflightResult(fetchRes) {
+  const status = typeof fetchRes?.status === "number" ? fetchRes.status : (fetchRes?.ok ? 200 : null);
+  const json = fetchRes?.json || {};
+  const data = json?.data || {};
+  const url = String(fetchRes?.url || "").toLowerCase();
+  const sample = String(fetchRes?.textSample || fetchRes?.error || "").toLowerCase();
 
-      all.push({
-        user: r.author || "Khách hàng",
-        sao: r.stars || 5,
-        noi_dung: (r.comment || "").replace(/\s+/g, " ").trim(),
-        thoi_gian: r.ctime || new Date().toISOString().slice(0, 19).replace("T", " "),
-        phan_loai: r.variation || "",
-        anh: r.imageUrls.length ? 1 : 0,
-        so_anh: r.imageUrls.length,
-        anh_urls: r.imageUrls.join("|"),
-        video: r.videoUrls.length ? 1 : 0,
-        so_video: r.videoUrls.length,
-        video_urls: r.videoUrls.join("|"),
-        media_urls: [...r.imageUrls, ...r.videoUrls].join("|"),
-        huu_ich: 0,
-      });
-      addedCount++;
-    }
+  const isLoginRequired =
+    status === 401 ||
+    json?.error === 90309999 ||
+    json?.is_login === false ||
+    data?.is_login === false ||
+    url.includes("/login") ||
+    sample.includes("is_login") ||
+    sample.includes("90309999");
 
-    if (progress) {
-      const pct = total => total > 0
-        ? Math.min(90, 30 + Math.floor((all.length / total) * 60))
-        : Math.min(90, 30 + page * 2);
-      await progress({
-        stage: "dom-crawl",
-        message: `Đang cào trang ${page} (đã thu thập ${all.length} đánh giá)`,
-        rows: all.length,
-        percent: pct(maxReviews),
-      });
-    }
-
-    if (!res.hasNext || addedCount === 0) {
-      break;
-    }
-
-    page++;
-    await new Promise((r) => setTimeout(r, 2500));
+  const isLogin = Boolean(fetchRes?.ok && !isLoginRequired);
+  let error = null;
+  if (isLoginRequired) {
+    error = `Shopee login required (HTTP ${status ?? "unknown"}, error=${json?.error ?? "unknown"}, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome`;
+  } else if (!fetchRes?.ok) {
+    error = fetchRes?.error ? `Shopee API request failed: ${fetchRes.error}` : formatShopeeFailure(fetchRes);
   }
 
-  return all;
+  return {
+    status,
+    isLogin,
+    error,
+    responseUrl: fetchRes?.url || null,
+  };
 }
 
 async function extractShopeeReviews(job, progress) {
+  if (!isValidShopeeUrl(job.url)) {
+    throw new Error(`Job URL không thuộc hostname shopee.vn: ${job.url}`);
+  }
+
   const parsed = idsFrom(job.url);
   let itemid = parsed.itemid;
   let shopid = parsed.shopid;
   if (!itemid) throw new Error(`Không đọc được itemid từ URL: ${job.url}`);
+  job.itemid = itemid;
 
-  // 1. Check for open Shopee tab
-  let targetTab = null;
-  try {
-    const tabs = await chrome.tabs.query({});
-    targetTab = tabs.find((t) => t.url && (t.url.includes(itemid) || (shopid && t.url.includes(shopid))));
-    if (!targetTab) {
-      targetTab = tabs.find((t) => t.url && t.url.includes("shopee.vn"));
-    }
-  } catch (err) {
-    console.warn("[bridge] Error querying tabs:", err.message);
+  // 1. Tìm hoặc mở tab Shopee đúng itemid
+  const tab = await findOrOpenShopeeTab(job.url, itemid);
+  if (!tab || !tab.id) throw new Error("Không tìm thấy hoặc không mở được tab Shopee trên trình duyệt");
+  job._targetTabId = tab.id;
+  job._targetTabUrl = tab.url || "";
+  await traceJob(job, progress, "tab-ready", {
+    itemid,
+    tabId: tab.id,
+    tabUrl: tab.url || "",
+  });
+
+  // 2. Giải quyết shopid qua in-tab execution (tuyệt đối không dùng background fetch)
+  if (!shopid) shopid = await resolveShopId(itemid, job.url, tab, progress);
+  if (!shopid) throw new Error(`Không tìm thấy shopid cho item ${itemid}`);
+  job._targetShopId = shopid;
+  await traceJob(job, progress, "shop-resolved", {
+    itemid,
+    shopid,
+    tabId: tab.id,
+    tabUrl: tab.url || "",
+  });
+
+  // 3. Kiểm tra URL hiện tại có đúng shopid/itemid không
+  const currentTabIds = idsFrom(tab.url || "");
+  if (currentTabIds.itemid && String(currentTabIds.itemid) !== String(itemid)) {
+    throw new Error(`Tab URL không khớp itemid: URL có itemid=${currentTabIds.itemid}, yêu cầu itemid=${itemid}`);
+  }
+  if (currentTabIds.shopid && String(currentTabIds.shopid) !== String(shopid)) {
+    console.warn(`[bridge] Tab URL shopid (${currentTabIds.shopid}) khác resolved shopid (${shopid})`);
   }
 
-  // 2. If no tab open, open product page in background
-  if (!targetTab) {
-    try {
-      if (progress) await progress({ stage: "open-tab", message: "Đang mở tab Shopee...", percent: 10 });
-      targetTab = await chrome.tabs.create({ url: job.url, active: false });
-      await new Promise((resolve) => {
-        const timer = setTimeout(resolve, 12000);
-        const onUpdated = (tId, info) => {
-          if (tId === targetTab.id && info.status === "complete") {
-            clearTimeout(timer);
-            chrome.tabs.onUpdated.removeListener(onUpdated);
-            resolve();
-          }
-        };
-        chrome.tabs.onUpdated.addListener(onUpdated);
-      });
-      try {
-        targetTab = await chrome.tabs.create({ url: job.url, active: false });
-      } catch (tabErr) {
-        if (tabErr.message.includes("No current window") || tabErr.message.includes("window")) {
-          const win = await chrome.windows.create({ url: job.url, focused: false });
-          targetTab = (win.tabs && win.tabs[0]) || null;
-        } else {
-          throw tabErr;
-        }
-      }
-      if (targetTab && targetTab.id) {
-        await new Promise((resolve) => {
-          const timer = setTimeout(resolve, 12000);
-          const onUpdated = (tId, info) => {
-            if (tId === targetTab.id && info.status === "complete") {
-              clearTimeout(timer);
-              chrome.tabs.onUpdated.removeListener(onUpdated);
-              resolve();
-            }
-          };
-          chrome.tabs.onUpdated.addListener(onUpdated);
-        });
-      }
-    } catch (err) {
-      console.warn("[bridge] Failed to create tab:", err.message);
-    }
+  // 4. Chạy preflight ratings API trong chính tab đó với credentials: "include"
+  const preflightStart = Date.now();
+  const preflightRes = await preflightRatingsInTab(tab.id, itemid, shopid, tab.url || job.url);
+  const preflightEnd = Date.now();
+  const preflightElapsed = preflightEnd - preflightStart;
+  const evalResult = evaluatePreflightResult(preflightRes);
+
+  // 5. Ghi rõ status, error, is_login
+  await traceJob(job, progress, "tab-preflight", {
+    itemid,
+    shopid,
+    tabId: tab.id,
+    tabUrl: tab.url || "",
+    httpStatus: evalResult.status,
+    responseUrl: evalResult.responseUrl,
+    elapsedMs: preflightElapsed,
+    error: evalResult.error,
+    isLogin: evalResult.isLogin,
+    requestStart: new Date(preflightStart).toISOString(),
+    requestEnd: new Date(preflightEnd).toISOString(),
+  });
+
+  // Nếu phiên chưa đăng nhập thì báo login_required và dừng ngay
+  if (!evalResult.isLogin) {
+    const err = new Error(evalResult.error || "Shopee login required (error 90309999, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome");
+    err.failureKind = "login";
+    err.fetchRes = preflightRes;
+    throw err;
   }
 
-  // 3. Resolve shopid: try tab DOM first, then fallback to HTTP resolve
-  if (!shopid && targetTab && targetTab.id) {
-    try {
-      const [res] = await chrome.scripting.executeScript({
-        target: { tabId: targetTab.id },
-        func: () => {
-          let m = location.href.match(/i\.(\d+)\.(\d+)/) || location.pathname.match(/^\/product\/(\d+)\/(\d+)/);
-          if (m) return m[1];
-          const can = document.querySelector('link[rel="canonical"]')?.href || "";
-          m = can.match(/i\.(\d+)\.(\d+)/) || can.match(/\/product\/(\d+)\/(\d+)/);
-          if (m) return m[1];
-          const html = document.documentElement.innerHTML;
-          const m = html.match(/"shopid"\s*:\s*"?(\d+)/) || html.match(/"shop_id"\s*:\s*"?(\d+)/);
-          m = html.match(/"shopid"\s*:\s*"?(\d+)/) || html.match(/"shop_id"\s*:\s*"?(\d+)/);
-          return m ? m[1] : null;
-        },
-      });
-      if (res && res.result) shopid = res.result;
-    } catch {}
-  }
-
-  if (!shopid) shopid = await resolveShopId(itemid, job.url, progress);
-  if (!shopid) {
-    // shopid not found — try DOM extraction directly (doesn't need shopid)
-    if (targetTab && targetTab.id) {
-      if (progress) {
-        await progress({
-          stage: "dom-crawl",
-          message: "Không tìm thấy shopid, thử cào trực tiếp từ DOM...",
-          percent: 25,
-        });
-      }
-      try {
-        const domResults = await inTabExtractShopeeDOM(targetTab.id, MAX_REVIEWS, progress);
-        if (domResults && domResults.length > 0) {
-          return domResults;
-        }
-      } catch (domErr) {
-        console.warn("[bridge] DOM extraction without shopid failed:", domErr.message);
-      }
-    }
-    throw new Error(`Không tìm thấy shopid cho item ${itemid}`);
+  // Nếu preflight bị lỗi khác (như verification hoặc api_blocked)
+  if (!preflightRes.ok) {
+    const failureKind = classifyShopeeFailure(preflightRes);
+    const err = new Error(evalResult.error || formatShopeeFailure(preflightRes));
+    err.failureKind = failureKind;
+    err.fetchRes = preflightRes;
+    throw err;
   }
 
   let all = [];
@@ -603,94 +691,80 @@ async function extractShopeeReviews(job, progress) {
   let total = null;
 
   while (all.length < MAX_REVIEWS) {
-    let result = null;
+    const requestStarted = Date.now();
+    const requestStartIso = new Date(requestStarted).toISOString();
+    await traceJob(job, progress, "ratings-request", {
+      itemid,
+      shopid,
+      offset,
+      limit: PAGE_SIZE,
+      tabId: tab.id,
+      tabUrl: tab.url || "",
+      requestStart: requestStartIso,
+    });
+    const fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, tab.url || job.url);
+    const requestEnded = Date.now();
+    const requestEndIso = new Date(requestEnded).toISOString();
+    const elapsedMs = requestEnded - requestStarted;
+    const httpStatus = typeof fetchRes.status === "number" ? fetchRes.status : (fetchRes.ok ? 200 : 500);
 
-    // A. Preferred path: In-tab fetch with user cookies & anti-bot tokens
-    if (targetTab && targetTab.id) {
-      try {
-        const [execRes] = await chrome.scripting.executeScript({
-          target: { tabId: targetTab.id },
-          func: inTabExtractShopeeRatings,
-          args: [itemid, shopid, offset, PAGE_SIZE],
-        });
-        if (execRes && execRes.result) {
-          result = execRes.result;
-        }
-      } catch (scriptErr) {
-        console.warn("[bridge] In-tab execution failed, trying direct fetch:", scriptErr.message);
-      }
+    await traceJob(job, progress, "ratings-response", {
+      itemid,
+      shopid,
+      offset,
+      limit: PAGE_SIZE,
+      tabId: tab.id,
+      tabUrl: tab.url || "",
+      requestStart: requestStartIso,
+      requestEnd: requestEndIso,
+      elapsedMs,
+      httpStatus,
+      responseUrl: fetchRes.url || null,
+      error: fetchRes.ok ? null : (fetchRes.error || "Shopee API request failed"),
+    });
+
+    if (!fetchRes.ok) {
+      const err = new Error(fetchRes.error ? `Shopee API request failed: ${fetchRes.error}` : formatShopeeFailure(fetchRes));
+      err.failureKind = classifyShopeeFailure(fetchRes);
+      err.fetchRes = fetchRes;
+      throw err;
     }
 
-    // B. Fallback path: Background fetch with proper headers
-    if (!result) {
-      const apiUrl = `https://shopee.vn/api/v2/item/get_ratings?filter=0&flag=1&itemid=${itemid}&limit=${PAGE_SIZE}&offset=${offset}&shopid=${shopid}&type=0`;
-      const res = await fetch(apiUrl, {
-        headers: { "X-Requested-With": "XMLHttpRequest", "Accept": "application/json" },
-      });
-      if (!res.ok) {
-        if (res.status === 403 || res.url.includes("/verify/traffic")) {
-          result = { ok: false, verificationRequired: true, status: res.status };
-        } else {
-          throw new Error(`Shopee API error HTTP ${res.status}`);
-        }
-      } else {
-        const json = await res.json();
-        if (json.error === 90309999 || (json.data && json.data.is_login === false)) {
-          result = { ok: false, verificationRequired: true, error: "Shopee error 90309999 (is_login=false)" };
-        } else {
-          result = { ok: true, data: json.data };
-        }
-      }
+    const json = fetchRes.json;
+    if (json && (json.error === 90309999 || json.is_login === false || (json.data && json.data.is_login === false))) {
+      const err = new Error("Shopee login required (error 90309999, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome");
+      err.failureKind = "login";
+      err.fetchRes = fetchRes;
+      throw err;
     }
 
-    if (!result.ok) {
-      // If API is blocked (e.g. is_login=false, error 90309999, 403), seamlessly fallback to in-tab DOM extraction
-      if (targetTab && targetTab.id) {
-        if (progress) {
-          await progress({
-            stage: "dom-crawl",
-            message: "Shopee API yêu cầu đăng nhập. Tự động chuyển sang cào trực tiếp từ DOM của tab...",
-            percent: 30,
-          });
-        }
-        try {
-          const domResults = await inTabExtractShopeeDOM(targetTab.id, MAX_REVIEWS, progress);
-          if (domResults && domResults.length > 0) {
-            return domResults;
-          }
-        } catch (domErr) {
-          console.warn("[bridge] In-tab DOM extraction failed:", domErr.message);
-        }
-      }
+    const batch = (json && (json.data?.ratings || json.ratings || json.items)) || [];
+    if (!Array.isArray(batch) || batch.length === 0) break;
 
-      if (result.verificationRequired) {
-        // Bring tab to front so user can easily solve challenge or log in
-        if (targetTab && targetTab.id) {
-          try {
-            await chrome.tabs.update(targetTab.id, { active: true });
-            const tabObj = await chrome.tabs.get(targetTab.id);
-            if (tabObj.windowId) await chrome.windows.update(tabObj.windowId, { focused: true });
-          } catch {}
-        }
-        throw new Error("Shopee challenge / verification required");
-      }
-      throw new Error(result.error || `Shopee extraction failed with status ${result.status}`);
-    }
+    const normalised = batch.map(normaliseRating);
+    all.push(...normalised);
+    if (total === null) total = ratingTotal(json);
+    const pct = crawlPercent(all.length, total, 10, 80);
+    await traceJob(job, progress, "ratings-batch", {
+      itemid,
+      shopid,
+      offset,
+      limit: PAGE_SIZE,
+      tabId: tab.id,
+      tabUrl: tab.url || "",
+      batchSize: batch.length,
+      rowsCount: all.length,
+      totalTarget: total,
+    });
+    await progress({
+      status: "running",
+      stage: "fetch",
+      message: `Đã cào ${all.length}${total ? "/" + total : ""} đánh giá`,
+      rows: all.length,
+      percent: pct,
+    });
 
-    const ratings = (result.data && result.data.ratings) || [];
-    if (!ratings.length) break;
-    if (total === null) total = ratingTotal(result);
-
-    for (const r of ratings) all.push(normaliseRating(r));
-    if (progress) {
-      await progress({
-        stage: "fetch",
-        message: `Đã lấy ${all.length} đánh giá`,
-        rows: all.length,
-        percent: crawlPercent(all.length, total, 20, 70),
-      });
-    }
-    if (ratings.length < PAGE_SIZE) break;
+    if (batch.length < PAGE_SIZE) break;
     offset += PAGE_SIZE;
     await new Promise((s) => setTimeout(s, PACE_MS));
   }
@@ -701,44 +775,183 @@ async function runJob(job) {
   console.log("[bridge] ▶ start job", job.id, job.kind, job.url);
   activeJobs.set(job.id, job);
   updateState("busy");
-  const keepalive = startKeepalive();
 
   const progress = (patch) => reportProgress(job, patch);
   try {
+    await traceJob(job, progress, "job-start", {
+      kind: job.kind,
+      sourceUrl: job.url,
+      itemid: job.itemid || (job.url ? idsFrom(job.url).itemid : null),
+    });
     await progress({ status: "running", stage: "init", message: "Bắt đầu cào", percent: 5 });
     let rows = [];
     if (job.kind === "shopee-reviews" || job.url.includes("shopee.vn")) {
       rows = await extractShopeeReviews(job, progress);
     }
+    const parsed = idsFrom(job.url);
+    const itemid = parsed.itemid || job.itemid;
+    const outputName = itemid ? "shopee_" + itemid + "_reviews" : (job.name || "shopee_" + job.id);
+    await traceJob(job, progress, "upload-start", {
+      itemid,
+      shopid: job._targetShopId,
+      tabId: job._targetTabId,
+      tabUrl: job._targetTabUrl,
+      rowsCount: rows.length,
+      outputName,
+    });
     await progress({ status: "saving", stage: "upload", message: `Đang lưu ${rows.length} dòng`, rows: rows.length, percent: 95 });
-    await fetch(`${HELPER}/ingest?name=${encodeURIComponent("shopee_" + job.id)}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job: job.id, source: job.url, rows }),
+    await uploadIngestResult({ job: job.id, name: outputName, source: job.url, rows });
+    await traceJob(job, progress, "upload-complete", {
+      itemid,
+      shopid: job._targetShopId,
+      tabId: job._targetTabId,
+      tabUrl: job._targetTabUrl,
+      rowsCount: rows.length,
+      outputName,
     });
     console.log("[bridge] ✔ job", job.id, "finished:", rows.length, "rows");
   } catch (e) {
     console.error("[bridge] ✘ job", job.id, "failed:", e.message);
-    if (e.message.includes("verification required") || e.message.includes("is_login=false")) {
-      triggerVerificationRequired({ job_id: job.id, url: job.url, reason: e.message });
-    }
-    await progress({ status: "error", stage: "failed", message: String(e.message || e), percent: 100 });
-    await fetch(`${HELPER}/ingest`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job: job.id, error: String(e.message || e) }),
+    await traceJob(job, progress, "job-failed", {
+      itemid: job.itemid || (job.url ? idsFrom(job.url).itemid : null),
+      shopid: job._targetShopId || job.shopid,
+      tabId: job._targetTabId,
+      tabUrl: job._targetTabUrl,
+      error: String(e.message || e),
     });
+    const message = String(e.message || e);
+    const failureKind = e.failureKind || classifyShopeeFailure({ error: message, textSample: message });
+
+    if (failureKind === "login") {
+      // 1. login_required: Dừng đúng lỗi, không bypass, tuyệt đối không gọi resume verification
+      updateState("login_required", {
+        job_id: job.id,
+        url: job.url,
+        tab_id: job._targetTabId || null,
+        reason: message,
+        kind: "login",
+      });
+      await progress({
+        status: "login_required",
+        stage: "login_required",
+        message: "Shopee yêu cầu đăng nhập tài khoản (is_login=false, error=90309999). Vui lòng đăng nhập trên tab Chrome.",
+        error: message,
+        login_required: true,
+        verification_required: false,
+        api_blocked: false,
+        percent: 100,
+      });
+      await uploadIngestResult({
+        job: job.id,
+        error: message,
+        login_required: true,
+        verification_required: false,
+        api_blocked: false,
+        stage: "login_required",
+      });
+    } else if (failureKind === "verification") {
+      // 2. traffic_verification / CAPTCHA: Hỗ trợ pause/resume verification
+      lastVerificationJob = job;
+      pendingVerificationJobs.set(job.id, job);
+      triggerVerificationRequired({
+        job_id: job.id,
+        url: job.url,
+        tab_id: job._targetTabId || null,
+        reason: message,
+        kind: "verification",
+      });
+      await progress({
+        status: "awaiting_user_verification",
+        stage: "verification_required",
+        message: "Shopee yêu cầu xác minh danh tính / giải CAPTCHA. Vui lòng thao tác trên tab Chrome.",
+        error: message,
+        verification_required: true,
+        login_required: false,
+        api_blocked: false,
+        percent: 100,
+      });
+      await uploadIngestResult({
+        job: job.id,
+        error: message,
+        verification_required: true,
+        login_required: false,
+        api_blocked: false,
+        stage: "verification_required",
+      });
+    } else if (failureKind === "api_blocked") {
+      // 3. api_blocked: Shopee chặn API (HTTP 403) nhưng KHÔNG PHẢI CAPTCHA và KHÔNG PHẢI login
+      updateState("api_blocked", {
+        job_id: job.id,
+        url: job.url,
+        tab_id: job._targetTabId || null,
+        reason: message,
+        kind: "api_blocked",
+      });
+      await progress({
+        status: "error",
+        stage: "api_blocked",
+        message: "Shopee chặn API đánh giá (HTTP 403 / API Blocked). Không có CAPTCHA hoặc yêu cầu đăng nhập.",
+        error: message,
+        api_blocked: true,
+        verification_required: false,
+        login_required: false,
+        percent: 100,
+      });
+      await uploadIngestResult({
+        job: job.id,
+        error: message,
+        api_blocked: true,
+        verification_required: false,
+        login_required: false,
+        stage: "api_blocked",
+      });
+    } else {
+      // 4. Lỗi WebSocket / extension / network khác
+      updateState("error", {
+        job_id: job.id,
+        url: job.url,
+        reason: message,
+        kind: "extension_error",
+      });
+      await progress({
+        status: "error",
+        stage: "failed",
+        message,
+        error: message,
+        percent: 100,
+        verification_required: false,
+        login_required: false,
+        api_blocked: false,
+      });
+      await uploadIngestResult({
+        job: job.id,
+        error: message,
+        verification_required: false,
+        login_required: false,
+        api_blocked: false,
+      });
+    }
   } finally {
-    clearInterval(keepalive);
     activeJobs.delete(job.id);
-    updateState(verificationInfo ? "awaiting_user_verification" : (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN ? "connected" : "disconnected"));
+    const fallbackState = verificationInfo
+      ? (verificationInfo.kind === "login" ? "login_required" : (verificationInfo.kind === "api_blocked" ? "api_blocked" : "awaiting_user_verification"))
+      : (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN ? "connected" : "disconnected");
+    updateState(fallbackState, verificationInfo);
   }
 }
 
 // ── Verification Challenge Trigger ──────────────────────────────────────────
+const notifiedVerificationJobIds = new Set();
+
 function triggerVerificationRequired(details) {
   console.warn("[bridge] ⚠️ Verification required:", details);
-  updateState("awaiting_user_verification", details);
+  updateState(stateForVerification(details), details);
+  const jid = details?.job_id;
+  if (jid && notifiedVerificationJobIds.has(jid)) {
+    return; // Đảm bảo gửi một thông báo duy nhất cho người dùng
+  }
+  if (jid) notifiedVerificationJobIds.add(jid);
+
   if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
     bridgeSend({
       v: 1,
@@ -749,17 +962,31 @@ function triggerVerificationRequired(details) {
   }
 }
 
-function resumeVerification() {
-  console.log("[bridge] Resuming verification");
-  verificationInfo = null;
+function resumeVerification(jobId) {
+  if (verificationInfo && (verificationInfo.kind === "login" || verificationInfo.kind === "api_blocked")) {
+    console.warn("[bridge] Không thể resume verification cho job không phải thử thách CAPTCHA:", jobId);
+    return;
+  }
+  console.log("[bridge] Resuming verification, jobId:", jobId);
+  if (jobId) notifiedVerificationJobIds.delete(jobId);
   updateState("connected");
   if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
     bridgeSend({
       v: 1,
       type: "verification.resolved",
       id: "resumed-" + Date.now(),
-      params: { status: "resumed", message: "User confirmed verification in tab" },
+      params: { status: "resumed", message: "User confirmed verification in tab", jobId },
     });
+  }
+  const jobToResume = (jobId && pendingVerificationJobs.get(jobId)) || lastVerificationJob;
+  if (jobToResume) {
+    console.log("[bridge] Retrying job after verification:", jobToResume.id);
+    pendingVerificationJobs.delete(jobToResume.id);
+    if (lastVerificationJob && lastVerificationJob.id === jobToResume.id) {
+      lastVerificationJob = null;
+    }
+    knownJobs.delete(jobToResume.id);
+    enqueueLegacyJob(jobToResume);
   }
 }
 
@@ -1267,6 +1494,39 @@ async function getActiveTabId() {
 async function dispatchEnvelope(envelope) {
   if (!envelope || typeof envelope !== "object") return;
 
+  if (envelope.type === "ingest.reply") {
+    const pending = pendingIngestRequests.get(envelope.id);
+    if (pending) {
+      clearInterval(pending.timer);
+      pendingIngestRequests.delete(envelope.id);
+      if (envelope.ok) pending.resolve(envelope.result);
+      else pending.reject(new Error(envelope.error || "Ingest failed"));
+    }
+    return;
+  }
+
+  if (envelope.type === "error") {
+    const error = envelope.error || {};
+    if (error.code === "CLIENT_ALREADY_CONNECTED") {
+      connectionEnabled = false;
+      clearReconnect();
+      connectionConflict = {
+        ...(error.details || {}),
+        message: error.message || "Gateway đang được client khác sử dụng",
+        at: Date.now(),
+      };
+      chrome.storage.local.set({
+        connectionEnabled: false,
+        connectionConflict,
+        lastConnectionError: "Gateway đang được client khác sử dụng; hãy bấm Connect để takeover có chủ đích",
+      });
+      closeBridgeSocket({ preserveState: "client_conflict" });
+    } else {
+      console.warn("[bridge] Gateway error:", error.code || "UNKNOWN", error.message || "");
+    }
+    return;
+  }
+
   // Handle command envelopes
   if (envelope.type === "command") {
     const cmdId = envelope.id;
@@ -1398,7 +1658,7 @@ async function dispatchEnvelope(envelope) {
 
   // Handle verification resume/resolved
   if (envelope.type === "verification.resolved" || envelope.type === "verification.resume") {
-    resumeVerification();
+    resumeVerification(envelope.params && (envelope.params.jobId || envelope.params.id));
     return;
   }
 
@@ -1415,7 +1675,11 @@ async function dispatchEnvelope(envelope) {
 
   // Backward-compatible ingest.job message
   if (envelope.type === "ingest.job") {
-    enqueueLegacyJob(envelope.job, "websocket");
+    const job = envelope.job ? { ...envelope.job } : {};
+    if (envelope.retry || envelope.job?.retry) job.retry = true;
+    if (!job.id && envelope.id) job.id = envelope.id;
+    traceJob(job, null, "job-dispatch", { sourceUrl: job.url });
+    enqueueLegacyJob(job, "websocket");
     return;
   }
 
@@ -1442,220 +1706,217 @@ function bridgeSend(message) {
   return true;
 }
 
-function closeBridgeSocket() {
+function clearReconnect() {
+  if (bridgeReconnectTimeout) clearTimeout(bridgeReconnectTimeout);
+  bridgeReconnectTimeout = null;
+}
+
+function closeBridgeSocket({ preserveDetails = false, preserveState = null } = {}) {
+  if (bridgeHandshakeTimeout) clearTimeout(bridgeHandshakeTimeout);
+  bridgeHandshakeTimeout = null;
   if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
   bridgeHeartbeat = null;
   if (bridgeSocket) {
     const s = bridgeSocket;
-    bridgeSocket = null;
-    s.onclose = null;
-    s.onerror = null;
-    s.onmessage = null;
-    try {
-      if (s.readyState === WebSocket.OPEN || s.readyState === WebSocket.CONNECTING) {
-        s.close(1000, "Normal closure");
-      }
-    } catch {}
+    s.onopen = s.onmessage = s.onerror = s.onclose = null;
+    if (s.readyState === WebSocket.OPEN || s.readyState === WebSocket.CONNECTING) {
+      try { s.close(1000, "Normal closure"); } catch {}
+    }
   }
-  updateState("disconnected");
+  bridgeSocket = null;
+  if (preserveState) {
+    updateState(preserveState, preserveState === "client_conflict" ? connectionConflict : verificationInfo);
+  } else if (preserveDetails && verificationInfo) {
+    extensionState = "disconnected";
+    setBadge("");
+    chrome.storage.local.set({
+      extensionState,
+      verificationInfo,
+      connectionConflict,
+      currentJob: activeJobs.size > 0 ? Array.from(activeJobs.values())[0] : null,
+    });
+  } else {
+    updateState("disconnected");
+  }
+}
+
+function connectionError(message) {
+  chrome.storage.local.set({ lastConnectionError: message });
 }
 
 function scheduleBridgeReconnect() {
-  if (bridgeReconnectTimeout) return;
-  if (bridgeSocket && (bridgeSocket.readyState === WebSocket.OPEN || bridgeSocket.readyState === WebSocket.CONNECTING)) {
-    return;
-  }
+  if (!connectionEnabled || bridgeReconnectTimeout) return;
   reconnectAttempts++;
-  // Exponential backoff with random jitter (1s, 1.5s, 2.25s ... capped at 30s)
-  const baseDelay = Math.min(30000, 1000 * Math.pow(1.5, Math.min(reconnectAttempts, 8)));
-  const jitter = Math.floor(Math.random() * 1000);
-  const delay = baseDelay + jitter;
-
-  console.log(`[bridge] Scheduling reconnect in ${(delay / 1000).toFixed(1)}s (attempt ${reconnectAttempts})`);
+  const delay = Math.min(30000, 1000 * Math.pow(1.5, Math.min(reconnectAttempts, 8))) + Math.floor(Math.random() * 1000);
   bridgeReconnectTimeout = setTimeout(() => {
     bridgeReconnectTimeout = null;
     connectBridge();
   }, delay);
 }
 
-async function fetchPairingToken() {
-  try {
-    const extId = chrome.runtime.id || "";
-    const pairResponse = await fetch(`${HELPER}/browser/pair?ext_id=${encodeURIComponent(extId)}`, {
-      headers: { "X-Extension-Id": extId },
-      cache: "no-store",
-    });
-    if (!pairResponse.ok) throw new Error(`pair HTTP ${pairResponse.status}`);
-    const pair = await pairResponse.json();
-    if (pair && pair.ok && pair.token) {
-      await chrome.storage.local.set({
-        gatewayUrl: pair.wsUrl || `${HELPER.replace("http", "ws")}/browser/v1/ws`,
-        fallbackWsUrl: pair.fallbackWsUrl || "ws://127.0.0.1:8767/browser-extension",
-        pairingToken: pair.token,
-      });
-      return pair;
-    }
-  } catch (err) {
-    console.warn("[bridge] Auto-pairing request failed:", err.message);
-  }
-  return null;
-}
-
-async function connectBridge(overrideUrl, overrideToken) {
-  if (bridgeSocket && (bridgeSocket.readyState === WebSocket.OPEN || bridgeSocket.readyState === WebSocket.CONNECTING)) {
-    return;
-  }
+async function connectBridge() {
+  if (!connectionEnabled) return;
+  if (bridgeSocket && bridgeSocket.readyState !== WebSocket.CLOSED) return;
   if (bridgeConnecting) return bridgeConnecting;
-
-  bridgeConnecting = (async () => {
+  const generation = connectionGeneration;
+  const current = () => generation === connectionGeneration && connectionEnabled;
+  const attempt = (async () => {
     try {
-      let stored = await chrome.storage.local.get(["gatewayUrl", "fallbackWsUrl", "pairingToken"]);
-      let token = overrideToken || stored.pairingToken;
-      let wsUrl = overrideUrl || stored.gatewayUrl;
-
-      // Auto-pair or refresh token if missing or after reconnection attempts
-      if (!token || reconnectAttempts > 0) {
-        const pair = await fetchPairingToken();
-        if (pair && pair.token) {
-          token = pair.token;
-          wsUrl = pair.wsUrl || wsUrl;
-        }
-      }
-
-      if (!wsUrl) wsUrl = "ws://127.0.0.1:8766/browser/v1/ws";
-      const fullUrl = `${wsUrl}${wsUrl.includes("?") ? "&" : "?"}token=${encodeURIComponent(token || "")}`;
-
-      const socket = new WebSocket(fullUrl);
-      bridgeSocket = socket;
-      let opened = false;
-
-      socket.onopen = () => {
-        opened = true;
-        console.log("[bridge] WebSocket connected to", wsUrl);
-        if (bridgeReconnectTimeout) {
-          clearTimeout(bridgeReconnectTimeout);
-          bridgeReconnectTimeout = null;
-        }
-        reconnectAttempts = 0;
-        updateState("connected");
-
-        // Authenticate envelope
-        bridgeSend({
-          v: 1,
-          type: "authenticate",
-          id: "auth-" + Date.now(),
-          auth: { token },
-        });
-
-        // 20s Heartbeat keeps MV3 worker active
-        if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
-        bridgeHeartbeat = setInterval(() => {
-          bridgeSend({
-            v: 1,
-            type: "ping",
-            id: "ping-" + Date.now(),
-            params: { at: Date.now() },
-          });
-        }, 20000);
-      };
-
-      socket.onmessage = (event) => {
-        let envelope;
-        try {
-          envelope = JSON.parse(event.data);
-        } catch {
-          return;
-        }
-        if (envelope && envelope.type === "error" && envelope.error && envelope.error.code === "AUTHENTICATION_FAILED") {
-          console.warn("[bridge] Authentication failed, clearing stale token");
-          chrome.storage.local.remove("pairingToken");
-          closeBridgeSocket();
-          scheduleBridgeReconnect();
-          return;
-        }
-        dispatchEnvelope(envelope);
-      };
-
-      socket.onerror = (err) => {
-        console.warn("[bridge] WebSocket error:", err);
-      };
-
-      socket.onclose = (ev) => {
-        console.log("[bridge] WebSocket disconnected", ev.code, ev.reason);
-        if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
-        bridgeHeartbeat = null;
-        if (bridgeSocket === socket) {
-          bridgeSocket = null;
-          updateState("disconnected");
-        }
-        // If connection was never opened or rejected with auth codes, clear pairing token
-        if (!opened || ev.code === 4001 || ev.code === 4003) {
-          console.warn("[bridge] Connection not opened or authentication rejected, clearing pairing token");
-          chrome.storage.local.remove("pairingToken");
-        }
-        if (!opened && stored.fallbackWsUrl && wsUrl !== stored.fallbackWsUrl) {
-          chrome.storage.local.set({ gatewayUrl: stored.fallbackWsUrl });
-        }
-        fallbackHttpLoop();
-        scheduleBridgeReconnect();
-      };
-    } catch (error) {
-      console.warn("[bridge] WebSocket unavailable, falling back to HTTP:", error.message);
-      if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
-      bridgeHeartbeat = null;
-      if (bridgeSocket) {
-        try {
-          if (bridgeSocket.readyState === WebSocket.OPEN || bridgeSocket.readyState === WebSocket.CONNECTING) {
-            bridgeSocket.close();
-          }
-        } catch {}
-        bridgeSocket = null;
-      }
-      updateState("disconnected");
-      fallbackHttpLoop();
-      scheduleBridgeReconnect();
-    }
-  })().finally(() => {
-    bridgeConnecting = null;
-  });
-
-  return bridgeConnecting;
-}
-
-// ── HTTP Long-Poll Fallback ──────────────────────────────────────────────────
-let looping = false;
-function enqueueLegacyJob(job, transport) {
-  if (!job || !job.id) return;
-  if (transport === "websocket") {
-    bridgeSend({
-      v: 1,
-      type: "accepted",
-      id: job.id,
-      jobId: job.id,
-      params: { kind: "legacy.ingest.job", jobId: job.id },
-    });
-  }
-  jobChain = jobChain.then(() => runJob(job)).catch((err) => console.error("[bridge] Job failed:", err));
-}
-
-async function fallbackHttpLoop() {
-  if (looping) return;
-  looping = true;
-  try {
-    while (!bridgeSocket || bridgeSocket.readyState !== WebSocket.OPEN) {
-      let jobs = [];
-      try {
-        const r = await fetch(`${HELPER}/ingest/jobs?wait=25`);
-        jobs = (await r.json()).jobs || [];
-      } catch {
-        await new Promise((s) => setTimeout(s, 5000));
+      const stored = await chrome.storage.local.get([
+        "gatewayUrl",
+        "pairingToken",
+        "connectionEnabled",
+        "clientId",
+        "takeover",
+      ]);
+      if (!current()) return;
+      if (stored.connectionEnabled === false) {
+        connectionEnabled = false;
+        closeBridgeSocket();
         return;
       }
-      for (const job of jobs) enqueueLegacyJob(job, "http");
+      let token = stored.pairingToken;
+      let wsUrl = stored.gatewayUrl || "ws://127.0.0.1:8766/browser/v1/ws";
+      const clientId = stored.clientId || crypto.randomUUID();
+      const takeover = stored.takeover === true;
+      const target = new URL(wsUrl);
+      if (!['ws:', 'wss:'].includes(target.protocol) ||
+          !['127.0.0.1', 'localhost', '[::1]'].includes(target.hostname) || target.username || target.password) {
+        throw new Error("Gateway phải là địa chỉ WebSocket localhost hợp lệ");
+      }
+      // Refresh the process-local token on every reconnect, including custom helper ports.
+      const pairUrl = new URL(target.toString());
+      pairUrl.protocol = target.protocol === 'wss:' ? 'https:' : 'http:';
+      if (pairUrl.port === '8767') pairUrl.port = '8766';
+      pairUrl.pathname = '/browser/pair';
+      pairUrl.search = pairUrl.hash = '';
+      const controller = new AbortController();
+      pairingController = controller;
+      const timeout = setTimeout(() => controller.abort(), 8000);
+      try {
+        const response = await fetch(pairUrl.toString(), {
+          cache: "no-store",
+          headers: { "X-Bridge-Client": "ai-cowork-bridge" },
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`Ghép nối bị từ chối (HTTP ${response.status})`);
+        const pair = await response.json();
+        if (typeof pair.token !== 'string' || !pair.token) throw new Error("Gateway không trả pairing token");
+        token = pair.token;
+      } finally {
+        clearTimeout(timeout);
+        if (pairingController === controller) pairingController = null;
+      }
+      if (!current()) return;
+      await chrome.storage.local.set({
+        gatewayUrl: wsUrl,
+        pairingToken: token,
+        clientId,
+        takeover: false,
+      });
+      if (!current()) return;
+      target.searchParams.set('token', token);
+      target.searchParams.set('client_id', clientId);
+      if (takeover) target.searchParams.set('takeover', '1');
+      const socket = new WebSocket(target.toString());
+      bridgeSocket = socket;
+      const ownsSocket = () => current() && bridgeSocket === socket;
+      const fail = message => {
+        if (!ownsSocket()) return;
+        connectionError(message);
+        closeBridgeSocket({ preserveDetails: true });
+        scheduleBridgeReconnect();
+      };
+      bridgeHandshakeTimeout = setTimeout(() => fail("Gateway không hoàn tất kết nối trong 10 giây"), 10000);
+      socket.onopen = () => {
+        if (!ownsSocket()) return;
+        clearTimeout(bridgeHandshakeTimeout);
+        bridgeHandshakeTimeout = null;
+        clearReconnect();
+        reconnectAttempts = 0;
+        lastBridgeMessageAt = Date.now();
+        connectionError("");
+        const restoredState = verificationInfo
+          ? stateForVerification(verificationInfo)
+          : (activeJobs.size ? "busy" : "connected");
+        updateState(restoredState, verificationInfo);
+        for (const pending of pendingIngestRequests.values()) bridgeSend(pending.message);
+        if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
+        bridgeHeartbeat = setInterval(() => {
+          if (!ownsSocket()) return;
+          if (Date.now() - lastBridgeMessageAt > 45000) {
+            fail("Gateway không phản hồi heartbeat; đang kết nối lại");
+            return;
+          }
+          bridgeSend({ v: 1, type: "ping", id: "ping-" + Date.now(), params: { at: Date.now() } });
+        }, 20000);
+      };
+      socket.onmessage = event => {
+        if (!ownsSocket()) return;
+        lastBridgeMessageAt = Date.now();
+        let envelope;
+        try { envelope = JSON.parse(event.data); } catch { return; }
+        Promise.resolve(dispatchEnvelope(envelope)).catch(error => console.warn("[bridge] dispatch failed:", error.message));
+      };
+      socket.onerror = () => fail("Không kết nối được WebSocket. Kiểm tra launcher, URL và quyền extension");
+      socket.onclose = () => fail("Kết nối gateway đã đóng; đang kết nối lại");
+    } catch (error) {
+      if (!current()) return;
+      connectionError(error.name === 'AbortError' ? "Gateway không phản hồi ghép nối trong 8 giây" : `Không kết nối được gateway: ${error.message}`);
+      closeBridgeSocket({ preserveDetails: true });
+      scheduleBridgeReconnect();
     }
-  } finally {
-    looping = false;
+  })();
+  bridgeConnecting = attempt;
+  try { await attempt; } finally {
+    if (bridgeConnecting === attempt) bridgeConnecting = null;
   }
+}
+
+async function configureConnection(message) {
+  connectionGeneration++;
+  connectionEnabled = false;
+  clearReconnect();
+  if (pairingController) pairingController.abort();
+  closeBridgeSocket();
+  bridgeConnecting = null;
+  const enabled = message.action === "connect";
+  const config = { connectionEnabled: enabled };
+  if (enabled) {
+    if (typeof message.url === "string") config.gatewayUrl = message.url.trim();
+    if (typeof message.token === "string") config.pairingToken = message.token.trim();
+    config.takeover = message.takeover === true;
+  }
+  const generation = connectionGeneration;
+  await chrome.storage.local.set(config);
+  if (generation !== connectionGeneration) return;
+  connectionEnabled = enabled;
+  if (enabled) await connectBridge();
+}
+
+// ── WebSocket Job Delivery ─────────────────────────────────────────────────
+function enqueueLegacyJob(job) {
+  if (!job || !job.id) return;
+  bridgeSend({ v: 1, type: "accepted", id: job.id, jobId: job.id });
+  traceJob(job, null, "job-accepted", { sourceUrl: job.url });
+
+  // ACK every delivery, including a duplicate replay, so the server can release
+  // its queue entry. Only the first non-active delivery is allowed to execute.
+  if (activeJobs.has(job.id)) {
+    console.log("[bridge] Job already active, skipping duplicate enqueue:", job.id);
+    return;
+  }
+  if (job.retry) {
+    knownJobs.delete(job.id);
+    notifiedVerificationJobIds.delete(job.id);
+  }
+  if (knownJobs.has(job.id)) return;
+  knownJobs.add(job.id);
+  jobChain = jobChain.then(() => runJob(job)).catch((err) => console.error("[bridge] Job failed:", err))
+    .finally(() => {
+      // Bound completed-job deduplication without evicting queued jobs.
+      if (knownJobs.size > 1000) knownJobs.delete(job.id);
+    });
 }
 
 // ── Top-Level Listeners (MV3 Requirement) ───────────────────────────────────
@@ -1668,34 +1929,68 @@ chrome.runtime.onStartup.addListener(connectBridge);
 chrome.alarms.onAlarm.addListener(connectBridge);
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.action === "connect") {
-    closeBridgeSocket();
-    connectBridge(msg.url, msg.token);
-    sendResponse({ ok: true });
-  } else if (msg.action === "autoPair") {
-    if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
-      sendResponse({ ok: true, connected: true });
-      return true;
-    }
-    closeBridgeSocket();
-    fetchPairingToken().then((pair) => {
-      if (pair) {
-        connectBridge(pair.wsUrl, pair.token);
-        sendResponse({ ok: true, token: pair.token, wsUrl: pair.wsUrl });
-      } else {
-        sendResponse({ ok: false, error: "Auto-pair failed" });
-      }
+  if (msg.action === "getStatus") {
+    chrome.storage.local.get([
+      "gatewayUrl",
+      "lastConnectionError",
+    ], (stored) => {
+      const socketConnected = Boolean(
+        bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN,
+      );
+      sendResponse({
+        ok: true,
+        extensionState,
+        connected: socketConnected,
+        socketReadyState: bridgeSocket ? bridgeSocket.readyState : WebSocket.CLOSED,
+        socketUrl: bridgeSocket?.url || null,
+        gatewayUrl: stored.gatewayUrl || null,
+        lastConnectionError: stored.lastConnectionError || "",
+        verificationInfo,
+        connectionConflict,
+        currentJob: activeJobs.size > 0 ? Array.from(activeJobs.values())[0] : null,
+        reconnectAttempts,
+        lastBridgeMessageAt,
+      });
     });
     return true;
-  } else if (msg.action === "disconnect") {
-    closeBridgeSocket();
-    sendResponse({ ok: true });
-  } else if (msg.action === "resumeVerification") {
-    resumeVerification();
+  }
+  if (msg.action === "connect" || msg.action === "disconnect") {
+    configureConnection(msg).then(() => sendResponse({ ok: true }), error => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+  if (msg.action === "resumeVerification") {
+    resumeVerification(msg.jobId);
     sendResponse({ ok: true });
   }
-  return true;
+  return false;
 });
 
-// Auto-start
+// Recreate the watchdog alarm when an MV3 worker starts after browser restart.
+chrome.alarms.create("bridge_heartbeat_alarm", { periodInMinutes: 1 });
 connectBridge();
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    idsFrom,
+    extractShopName,
+    isShopeeHostname,
+    isValidShopeeUrl,
+    findOrOpenShopeeTab,
+    resolveShopId,
+    preflightRatingsInTab,
+    evaluatePreflightResult,
+    extractShopeeReviews,
+    normaliseRating,
+    ratingTotal,
+    crawlPercent,
+    classifyShopeeFailure,
+    formatShopeeFailure,
+    runJob,
+    resumeVerification,
+    triggerVerificationRequired,
+    enqueueLegacyJob,
+    knownJobs,
+    pendingVerificationJobs,
+    notifiedVerificationJobIds,
+  };
+}

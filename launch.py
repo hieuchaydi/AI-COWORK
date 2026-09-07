@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import atexit
 import csv
+import hashlib
 import io
 import json
 import os
@@ -39,6 +40,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from browser_ws_bridge import BrowserWebSocketBridge, validate_extension_origin, verify_pairing_token
+from browser_bridge.ingest import IngestRPC
 
 
 # Our banners and Vietnamese hints use non-cp1252 characters (⇒, ✓, ─). A Windows
@@ -52,6 +54,7 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 ROOT = Path(__file__).resolve().parent
+BRIDGE_CLIENT_HEADER = "ai-cowork-bridge"
 
 
 def _find_venv() -> Path:
@@ -148,6 +151,8 @@ def _outputs_root() -> Path:
 # is only meaningful while both the helper and Chrome are up, and a stale job replayed
 # after a restart would scrape something nobody asked for.
 _INGEST_JOBS: list[dict] = []
+_INGEST_INFLIGHT: dict[str, dict] = {}
+_INGEST_ALL_JOBS: dict[str, dict] = {}
 _INGEST_JOBS_LOCK = threading.Lock()
 _INGEST_JOB_EVENT = threading.Event()
 # job id → what /ingest received for it, so the agent can block on completion instead of
@@ -155,6 +160,129 @@ _INGEST_JOB_EVENT = threading.Event()
 _INGEST_RESULTS: dict[str, dict] = {}
 _INGEST_PROGRESS: dict[str, dict] = {}
 _INGEST_PROGRESS_LOCK = threading.Lock()
+_INGEST_TRACES: dict[str, list[dict]] = {}
+_INGEST_TRACES_LOCK = threading.Lock()
+
+
+def _sanitize_trace_url(url: object) -> str | None:
+    if not url or not isinstance(url, str):
+        return None
+    url_str = url.strip()
+    if not url_str:
+        return None
+    clean = url_str.split("#")[0]
+    clean = re.sub(
+        r"([?&][^=]*(?:token|auth|session|cookie|sig|signature|sp_atk|password|key|passkey)[^=]*=)[^&#]+",
+        r"\1[REDACTED]",
+        clean,
+        flags=re.IGNORECASE,
+    )
+    return clean
+
+
+def _sanitize_trace_error(err: object) -> str | None:
+    if not err:
+        return None
+    msg = str(err)
+    msg = re.sub(r"<[^>]*>", " ", msg)
+    msg = re.sub(r"(?:token|cookie|auth|session)=[^\s,;&]+", "[REDACTED]", msg, flags=re.IGNORECASE)
+    msg = re.sub(r"\s+", " ", msg).strip()
+    return msg[:400] if msg else None
+
+
+def _record_shopee_trace(entry: dict) -> dict:
+    if not isinstance(entry, dict):
+        return {}
+    job_id = str(entry.get("jobId") or entry.get("job_id") or entry.get("job") or "")
+    if not job_id:
+        return entry
+
+    itemid = entry.get("itemid")
+    if itemid is None and job_id in _INGEST_ALL_JOBS:
+        itemid = _INGEST_ALL_JOBS[job_id].get("itemid")
+    shopid = entry.get("shopid")
+    tab_url = entry.get("tabUrl")
+    if not tab_url and job_id in _INGEST_ALL_JOBS:
+        tab_url = _INGEST_ALL_JOBS[job_id].get("url")
+
+    clean_entry = {
+        "jobId": job_id,
+        "itemid": str(itemid) if itemid is not None else None,
+        "shopid": str(shopid) if shopid is not None else None,
+        "tabId": int(entry["tabId"]) if isinstance(entry.get("tabId"), int) else None,
+        "tabUrl": _sanitize_trace_url(tab_url),
+        "event": str(entry.get("event") or "unknown"),
+        "offset": int(entry["offset"]) if isinstance(entry.get("offset"), int) else None,
+        "limit": int(entry["limit"]) if isinstance(entry.get("limit"), int) else None,
+        "requestStart": str(entry.get("requestStart")) if entry.get("requestStart") else None,
+        "requestEnd": str(entry.get("requestEnd")) if entry.get("requestEnd") else None,
+        "httpStatus": int(entry["httpStatus"]) if isinstance(entry.get("httpStatus"), int) else (
+            int(entry["status"]) if isinstance(entry.get("status"), int) else None
+        ),
+        "responseUrl": _sanitize_trace_url(entry.get("responseUrl")),
+        "elapsedMs": int(entry["elapsedMs"]) if isinstance(entry.get("elapsedMs"), (int, float)) else None,
+        "error": _sanitize_trace_error(entry.get("error")),
+        "is_login": bool(entry["is_login"]) if isinstance(entry.get("is_login"), bool) else (
+            bool(entry["isLogin"]) if isinstance(entry.get("isLogin"), bool) else None
+        ),
+        "at": str(entry.get("at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+    }
+
+    if isinstance(entry.get("rowsCount"), int):
+        clean_entry["rowsCount"] = entry["rowsCount"]
+    if isinstance(entry.get("batchSize"), int):
+        clean_entry["batchSize"] = entry["batchSize"]
+    if isinstance(entry.get("totalTarget"), int):
+        clean_entry["totalTarget"] = entry["totalTarget"]
+
+    with _INGEST_TRACES_LOCK:
+        if job_id not in _INGEST_TRACES:
+            _INGEST_TRACES[job_id] = []
+        _INGEST_TRACES[job_id].append(clean_entry)
+
+    # Persist trace to outputs/logs/shopee_jobs.jsonl
+    try:
+        log_dir = _outputs_root() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "shopee_jobs.jsonl"
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(clean_entry, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"[trace] error writing to shopee_jobs.jsonl: {exc}", file=sys.stderr)
+
+    return clean_entry
+
+
+def _persist_ingest_state() -> None:
+    try:
+        f = _outputs_root() / ".ingest_jobs_state.json"
+        data = {
+            "all_jobs": _INGEST_ALL_JOBS,
+            "progress": _INGEST_PROGRESS,
+            "results": _INGEST_RESULTS,
+        }
+        f.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_ingest_state() -> None:
+    try:
+        f = _outputs_root() / ".ingest_jobs_state.json"
+        if f.is_file():
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                with _INGEST_JOBS_LOCK:
+                    _INGEST_ALL_JOBS.update(data.get("all_jobs") or {})
+                    _INGEST_RESULTS.update(data.get("results") or {})
+                with _INGEST_PROGRESS_LOCK:
+                    _INGEST_PROGRESS.update(data.get("progress") or {})
+    except Exception:
+        pass
+
+
+_load_ingest_state()
+
 
 # Chrome extension control channel. The token is persisted to outputs/.bridge_token
 # and is disclosed only to a chrome-extension:// origin by /browser/pair.
@@ -259,15 +387,161 @@ def _run_tool_in_sandbox(code: str, args: dict, timeout: int = 30) -> dict:
 _load_persisted_tools()
 
 
+def _extract_shopee_itemid(value: object) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    # /product/<shopid>/<itemid>
+    m = re.search(r"/product/\d+/(\d{6,})", text)
+    if m:
+        return m.group(1)
+    # i.<shopid>.<itemid>
+    m = re.search(r"i\.\d+\.(\d{6,})", text)
+    if m:
+        return m.group(1)
+    # vanity /<shopname>/<itemid> e.g. /depnhaphuong/25018847315
+    m = re.search(r"/[a-zA-Z0-9_.-]+/(\d{6,})(?:[?&#/]|$)", text)
+    if m:
+        return m.group(1)
+    # query parameter itemid=...
+    m = re.search(r"[?&]item_?id=(\d{6,})", text)
+    if m:
+        return m.group(1)
+    # shopee_<itemid>
+    m = re.search(r"shopee_(\d{6,})", text)
+    if m:
+        return m.group(1)
+    # Any trailing 8+ digit id
+    m = re.search(r"[./-](\d{8,})(?:[?&#/]|$)", text)
+    # Any trailing 6+ digit id
+    m = re.search(r"[./-](\d{6,})(?:[?&#/]|$)", text)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _generate_shopee_report(
+    stem: str,
+    rows: list,
+    source: str = "",
+    csv_rel: str = "",
+    zip_rel: str = "",
+    zip_parts: list[str] | None = None,
+    manifest_rel: str = "",
+    manifest_data: dict | None = None,
+) -> str:
+    text_dir = _outputs_root() / "text"
+    text_dir.mkdir(parents=True, exist_ok=True)
+    report_file = text_dir / f"{stem}_report.md"
+
+    star_counts = {5: 0, 4: 0, 3: 0, 2: 0, 1: 0}
+    reviews_with_media = 0
+    total_images_in_rows = 0
+    total_videos_in_rows = 0
+
+    for r in rows:
+        try:
+            s = int(r.get("sao") or 0)
+            if s in star_counts:
+                star_counts[s] += 1
+        except (ValueError, TypeError):
+            pass
+        so_anh = _safe_int(r.get("so_anh")) or len(_split_ingest_urls(r.get("anh_urls") or r.get("image_urls")))
+        so_video = _safe_int(r.get("so_video")) or len(_split_ingest_urls(r.get("video_urls")))
+        total_images_in_rows += so_anh
+        total_videos_in_rows += so_video
+        if so_anh > 0 or so_video > 0 or r.get("anh") or r.get("video"):
+            reviews_with_media += 1
+
+    total_reviews = len(rows)
+    reviews_without_media = total_reviews - reviews_with_media
+
+    if not manifest_data and manifest_rel:
+        man_path = _outputs_root() / Path(manifest_rel).relative_to("outputs")
+        if man_path.is_file():
+            try:
+                manifest_data = json.loads(man_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+    total_urls = manifest_data.get("total_urls", total_images_in_rows + total_videos_in_rows) if manifest_data else (total_images_in_rows + total_videos_in_rows)
+    downloaded_count = manifest_data.get("downloaded_count", 0) if manifest_data else 0
+    unique_count = manifest_data.get("unique_count", 0) if manifest_data else 0
+    duplicate_count = manifest_data.get("duplicate_count", 0) if manifest_data else 0
+    failed_count = manifest_data.get("failed_count", 0) if manifest_data else 0
+
+    lines = [
+        f"# Báo cáo đánh giá Shopee: {stem}",
+        "",
+        f"- **Nguồn**: {source or 'N/A'}",
+        f"- **Thời gian xử lý**: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- **Tổng số đánh giá**: {total_reviews}",
+        f"- **Đánh giá có ảnh/video**: {reviews_with_media}",
+        f"- **Đánh giá không có media**: {reviews_without_media}",
+        "",
+        "## Phân bố số sao",
+        f"- ⭐⭐⭐⭐⭐ (5 sao): {star_counts[5]}",
+        f"- ⭐⭐⭐⭐ (4 sao): {star_counts[4]}",
+        f"- ⭐⭐⭐ (3 sao): {star_counts[3]}",
+        f"- ⭐⭐ (2 sao): {star_counts[2]}",
+        f"- ⭐ (1 sao): {star_counts[1]}",
+        "",
+        "## Thống kê Media & Deduplication",
+        f"- **Tổng số ảnh**: {total_images_in_rows}",
+        f"- **Tổng số video**: {total_videos_in_rows}",
+        f"- **Tổng số URL media**: {total_urls}",
+        f"- **Số file tải thành công**: {downloaded_count}",
+        f"- **Số file duy nhất (unique)**: {unique_count}",
+        f"- **Số file trùng lặp (SHA-256 deduplicated)**: {duplicate_count}",
+        f"- **Số file lỗi tải**: {failed_count}",
+        "",
+        "## Tệp kết quả",
+    ]
+    if csv_rel:
+        lines.append(f"- [Tải file CSV](http://localhost:8766/{csv_rel})")
+
+    parts = zip_parts if zip_parts else (getattr(zip_rel, "parts", None) or ([zip_rel] if zip_rel else []))
+    if len(parts) > 1:
+        for idx, part in enumerate(parts, start=1):
+            lines.append(f"- [Tải trọn bộ ảnh/video .ZIP (Part {idx})](http://localhost:8766/{part})")
+    elif len(parts) == 1:
+        lines.append(f"- [Tải trọn bộ ảnh/video .ZIP](http://localhost:8766/{parts[0]})")
+    else:
+        lines.append("- *Không có media nào được tải (chỉ xuất file CSV)*")
+
+    if manifest_rel:
+        lines.append(f"- [Xem manifest JSON](http://localhost:8766/{manifest_rel})")
+
+    report_rel = f"outputs/text/{report_file.name}"
+    lines.append(f"- [Xem báo cáo Markdown](http://localhost:8766/{report_rel})")
+    lines.append("")
+
+    report_file.write_text("\n".join(lines), encoding="utf-8")
+    return report_rel
+
+
 def _queue_ingest_job(url: str, kind: str) -> dict:
+    itemid = _extract_shopee_itemid(url)
     job = {
-        "id": f"job-{int(time.time() * 1000)}",
+        "id": f"job-{secrets.token_hex(12)}",
         "url": url,
         "kind": kind,
         "queued_at": time.strftime("%H:%M:%S"),
     }
+    if itemid:
+        job["itemid"] = itemid
+        job["name"] = f"shopee_{itemid}"
+        job["name"] = f"shopee_{itemid}_reviews"
+    _INGEST_ALL_JOBS[job["id"]] = job
     with _INGEST_JOBS_LOCK:
         _INGEST_JOBS.append(job)
+    _record_shopee_trace({
+        "jobId": job["id"],
+        "itemid": itemid,
+        "event": "job-dispatch",
+        "tabUrl": url,
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
     _update_ingest_progress(
         job["id"],
         {
@@ -280,6 +554,7 @@ def _queue_ingest_job(url: str, kind: str) -> dict:
             "url": url,
         },
     )
+    _persist_ingest_state()
     _INGEST_JOB_EVENT.set()
     if _BROWSER_WS.connected:
         try:
@@ -293,6 +568,11 @@ def _queue_ingest_job(url: str, kind: str) -> dict:
 def _update_ingest_progress(job_id: str, patch: dict) -> dict | None:
     if not job_id:
         return None
+    if isinstance(patch, dict):
+        if "trace" in patch and isinstance(patch["trace"], dict):
+            _record_shopee_trace(patch["trace"])
+        elif patch.get("stage") == "trace" and isinstance(patch.get("debug"), dict):
+            _record_shopee_trace(patch["debug"])
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     with _INGEST_PROGRESS_LOCK:
         current = dict(_INGEST_PROGRESS.get(job_id) or {})
@@ -300,6 +580,7 @@ def _update_ingest_progress(job_id: str, patch: dict) -> dict | None:
         current["job"] = job_id
         current["updated_at"] = now
         _INGEST_PROGRESS[job_id] = current
+        _persist_ingest_state()
         return dict(current)
 
 
@@ -328,17 +609,26 @@ def _claim_ingest_jobs(wait_seconds: float) -> list[dict]:
 def _ack_ingest_job(job_id: str) -> None:
     if not job_id:
         return
+    job_obj = _INGEST_ALL_JOBS.get(job_id, {})
+    _record_shopee_trace({
+        "jobId": job_id,
+        "itemid": job_obj.get("itemid"),
+        "event": "job-accepted",
+        "tabUrl": job_obj.get("url"),
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
     with _INGEST_JOBS_LOCK:
         for i, j in enumerate(_INGEST_JOBS):
             if j.get("id") == job_id:
-                _INGEST_JOBS.pop(i)
+                _INGEST_INFLIGHT[job_id] = _INGEST_JOBS.pop(i)
                 break
+    _persist_ingest_state()
 
 
 def _on_browser_ws_connect() -> None:
     """Replay unclaimed jobs after first connect or a reconnect."""
     with _INGEST_JOBS_LOCK:
-        pending = list(_INGEST_JOBS)
+        pending = list(_INGEST_JOBS) + list(_INGEST_INFLIGHT.values())
     for job in pending:
         if not _BROWSER_WS.send({"type": "ingest.job", "job": job}):
             break
@@ -346,15 +636,313 @@ def _on_browser_ws_connect() -> None:
 
 def _on_browser_ws_message(message: dict) -> None:
     kind = message.get("type")
-    if kind in ("ingest.ack", "accepted"):
+    if kind == "ingest.rpc":
+        _INGEST_RPC.submit(message)
+    elif kind in ("ingest.ack", "accepted"):
         job_id = str(message.get("jobId") or message.get("id") or "")
+        params = message.get("params") or {}
+        job_id = str(
+            message.get("jobId")
+            or message.get("id")
+            or params.get("jobId")
+            or params.get("id")
+            or params.get("job_id")
+            or ""
+        )
         _ack_ingest_job(job_id)
     elif kind in ("bridge.ping", "ping"):
         _BROWSER_WS.send({"type": "bridge.pong", "at": time.time()})
+    elif kind == "verification.required":
+        params = message.get("params") or {}
+        job_id = str(params.get("job_id") or params.get("jobId") or "")
+        reason = str(params.get("reason") or "Yêu cầu xác minh danh tính / CAPTCHA Shopee")
+        _BROWSER_WS.transport.require_verification(params.get("url") or "")
+        if job_id:
+            _update_ingest_progress(
+                job_id,
+                {
+                    "status": "awaiting_user_verification",
+                    "stage": "verification_required",
+                    "verification_required": True,
+                    "message": reason,
+                    "error": reason,
+                    "url": params.get("url"),
+                    "percent": 100,
+                },
+            )
+            _persist_ingest_state()
+    elif kind == "verification.resolved":
+        _BROWSER_WS.transport.resume_verification()
+
+
+_INGEST_RPC = IngestRPC(
+    send=lambda message: _BROWSER_WS.send(message),
+    store=lambda body: _store_ingest_payload(body),
+    progress=lambda job_id, patch: _update_ingest_progress(job_id, patch),
+)
 
 
 _BROWSER_WS.on_connect = _on_browser_ws_connect
 _BROWSER_WS.on_message = _on_browser_ws_message
+
+
+def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
+    """Persist a result shared by WebSocket ingestion and legacy HTTP clients."""
+    job_id = (body.get("job") if isinstance(body, dict) else None) or ""
+    job_id = (
+        (body.get("job") or body.get("jobId") or body.get("job_id"))
+        if isinstance(body, dict)
+        else None
+    ) or ""
+    job_obj = _INGEST_ALL_JOBS.get(job_id) if job_id else None
+    source = (body.get("source") if isinstance(body, dict) else None) or (job_obj.get("url") if job_obj else None)
+    source_text = str(source or "")
+
+    # A job that failed in the browser reports here too — otherwise the agent
+    # would poll /ingest/result forever waiting for a run that already died.
+    if isinstance(body, dict) and (body.get("error") or body.get("verification_required") or body.get("login_required") or body.get("api_blocked")):
+        err_msg = str(body.get("error") or "Shopee yêu cầu đăng nhập hoặc xác minh")[:500]
+        lowered = err_msg.lower()
+        # 1. Login required
+        is_login = bool(
+            body.get("login_required")
+            or "login required" in lowered
+            or "is_login=false" in lowered
+            or ("is_login" in lowered and "false" in lowered)
+            or "90309999" in lowered
+        )
+
+        # 2. API Blocked (HTTP 403 / Access Denied without CAPTCHA or Login)
+        explicit_api_blocked = bool(
+            body.get("api_blocked")
+            or body.get("stage") == "api_blocked"
+        )
+        text_api_blocked = bool(
+            "không thấy captcha" in lowered
+            or "không có captcha" in lowered
+            or "api access denied" in lowered
+            or "access denied" in lowered
+            or "api_blocked" in lowered
+            or "api blocked" in lowered
+            or ("403" in lowered and "/verify/traffic" not in lowered and "challenge" not in lowered)
+        )
+        is_api_blocked = not is_login and (explicit_api_blocked or text_api_blocked)
+
+        # 3. Verification / CAPTCHA (Challenge requiring user interaction)
+        is_verification = not is_login and not is_api_blocked and (
+            body.get("verification_required") is True
+            or (
+                body.get("verification_required") is not False
+                and (
+                    "verification required" in lowered
+                    or "/verify/traffic" in lowered
+                    or "challenge" in lowered
+                    or ("captcha" in lowered and "không thấy captcha" not in lowered and "không có captcha" not in lowered)
+                )
+            )
+        )
+
+        if is_login:
+            status = "login_required"
+            stage = "login_required"
+        elif is_verification:
+            status = "awaiting_user_verification"
+            stage = "verification_required"
+        elif is_api_blocked:
+            status = "error"
+            stage = "api_blocked"
+        else:
+            status = "error"
+            stage = "failed"
+
+        if job_id:
+            result = {
+                "ok": False,
+                "error": err_msg,
+                "status": status,
+                "stage": stage,
+                "verification_required": is_verification,
+                "login_required": is_login,
+                "api_blocked": is_api_blocked,
+            }
+            _INGEST_RESULTS[job_id] = result
+            with _INGEST_JOBS_LOCK:
+                _INGEST_INFLIGHT.pop(job_id, None)
+            _update_ingest_progress(
+                job_id,
+                {
+                    "status": status,
+                    "stage": stage,
+                    "verification_required": is_verification,
+                    "login_required": is_login,
+                    "api_blocked": is_api_blocked,
+                    "message": err_msg,
+                    "error": err_msg,
+                    "percent": 100,
+                },
+            )
+            _persist_ingest_state()
+            return 200, result
+        return 200, {
+            "ok": False,
+            "error": err_msg,
+            "status": status,
+            "stage": stage,
+            "verification_required": is_verification,
+            "login_required": is_login,
+            "api_blocked": is_api_blocked,
+        }
+
+    rows = body.get("rows") if isinstance(body, dict) else body
+    if not isinstance(rows, list):
+        return 400, {"ok": False, "error": "expected {rows: [...]} or a JSON array"}
+
+    if len(rows) == 0:
+        err_msg = "Không có đánh giá nào được tìm thấy hoặc quyền truy cập bị hạn chế"
+        if job_id:
+            _INGEST_RESULTS[job_id] = {"ok": False, "error": err_msg, "count": 0}
+            with _INGEST_JOBS_LOCK:
+                _INGEST_INFLIGHT.pop(job_id, None)
+            _update_ingest_progress(
+                job_id,
+                {
+                    "status": "error",
+                    "stage": "empty",
+                    "message": err_msg,
+                    "error": err_msg,
+                    "percent": 100,
+                    "rows": 0,
+                    "count": 0,
+                },
+            )
+            _persist_ingest_state()
+        return 200, {"ok": False, "error": err_msg, "count": 0}
+
+    raw = (name_hint or (body.get("name") if isinstance(body, dict) else "") or (job_obj.get("name") if job_obj else "") or "")
+    # Check if we should resolve name according to itemid (Requirement 3)
+    # Check if we should resolve name according to itemid (Requirement 8)
+    itemid = _extract_shopee_itemid(raw) or _extract_shopee_itemid(source_text)
+    if itemid:
+        name = f"shopee_{itemid}_reviews.json"
+        stem = f"shopee_{itemid}_reviews"
+    else:
+        name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(raw)).strip("_")
+        if not name or name.startswith("job-") or name.startswith("shopee_job-"):
+            name = "ingest_" + time.strftime("%Y%m%d_%H%M%S")
+        stem = name[:-5] if name.endswith(".json") else name
+        if not name.endswith(".json"):
+            name += ".json"
+
+    max_zip_mb = _safe_int(
+        (body.get("max_zip_mb") if isinstance(body, dict) else None)
+        or (job_obj.get("max_zip_mb") if job_obj else None)
+        or os.environ.get("MAX_ZIP_MB", 0)
+    )
+
+    media_dir = None
+    zip_rel = None
+    if name.lower().startswith("shopee_") or "shopee.vn" in source_text.lower():
+        if job_id:
+            _update_ingest_progress(
+                job_id,
+                {
+                    "status": "saving",
+                    "stage": "organize",
+                    "message": f"Đang sắp xếp {len(rows)} review và chuẩn bị tải media",
+                    "rows": len(rows),
+                    "percent": 98,
+                },
+            )
+        rows, media_dir, zip_rel = _prepare_shopee_review_rows(name, rows, job_id, max_zip_mb=max_zip_mb)
+
+    inbox = _outputs_root() / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    target = inbox / name
+    payload = {
+        "received_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source": source,
+        "count": len(rows),
+        "media_dir": f"outputs/{media_dir}" if media_dir else None,
+        "zip": zip_rel,
+        "rows": rows,
+    }
+    try:
+        target.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+    except OSError as exc:
+        return 500, {"ok": False, "error": f"write failed: {exc}"}
+
+    csv_rel = _write_ingest_csv(name, rows)
+    csv_file = (_outputs_root() / Path(csv_rel).relative_to("outputs")) if csv_rel else None
+
+    # Ensure CSV is included in the ZIP archive (or first part if multipart)
+    if zip_rel and csv_file and csv_file.is_file():
+        zip_full = _outputs_root() / Path(zip_rel).relative_to("outputs")
+        if zip_full.is_file():
+            try:
+                import zipfile
+                with zipfile.ZipFile(zip_full, "a") as zf:
+                    if csv_file.name not in zf.namelist():
+                        zf.write(csv_file, arcname=csv_file.name)
+            except Exception as exc:
+                print(f"[ingest] failed adding csv to zip: {exc}", file=sys.stderr)
+
+    zip_parts = list(getattr(zip_rel, "parts", None) or ([zip_rel] if zip_rel else []))
+    manifest_rel = f"outputs/{media_dir}/manifest.json" if media_dir else None
+    report_rel = _generate_shopee_report(
+        stem=stem,
+        rows=rows,
+        source=source_text,
+        csv_rel=csv_rel or "",
+        zip_rel=zip_rel or "",
+        zip_parts=zip_parts,
+        manifest_rel=manifest_rel or "",
+    ) if (name.lower().startswith("shopee_") or "shopee.vn" in source_text.lower()) else None
+
+    print(f"[ingest] {len(rows)} rows → {target}", file=sys.stderr)
+    result = {
+        "ok": True,
+        "count": len(rows),
+        "path": f"outputs/inbox/{name}",
+        "url": f"/outputs/inbox/{name}",
+        "csv": csv_rel,
+        "media_dir": f"outputs/{media_dir}" if media_dir else None,
+        "manifest": manifest_rel,
+        "zip": zip_rel,
+        "zip_url": f"/{zip_rel}" if zip_rel else None,
+        "zip_parts": zip_parts,
+        "zip_urls": [f"/{zp}" for zp in zip_parts] if zip_parts else ([f"/{zip_rel}"] if zip_rel else []),
+        "report": report_rel,
+        "report_url": f"/{report_rel}" if report_rel else None,
+    }
+    if job_id:
+        _INGEST_RESULTS[job_id] = result
+        with _INGEST_JOBS_LOCK:
+            _INGEST_INFLIGHT.pop(job_id, None)
+        _update_ingest_progress(
+            job_id,
+            {
+                "status": "done",
+                "stage": "saved",
+                "message": f"Đã lưu {len(rows)} dòng" + (f", đóng gói {zip_rel}" if zip_rel else ""),
+                "rows": len(rows),
+                "count": len(rows),
+                "path": result["path"],
+                "csv": csv_rel,
+                "media_dir": result.get("media_dir"),
+                "manifest": manifest_rel,
+                "zip": zip_rel,
+                "zip_url": result.get("zip_url"),
+                "zip_parts": zip_parts,
+                "zip_urls": result.get("zip_urls"),
+                "report": report_rel,
+                "report_url": result.get("report_url"),
+                "percent": 100,
+            },
+        )
+        _persist_ingest_state()
+    return 200, result
 
 
 def _write_ingest_csv(json_name: str, rows: list) -> str | None:
@@ -384,7 +972,7 @@ def _write_ingest_csv(json_name: str, rows: list) -> str | None:
     stem = json_name[:-5] if json_name.endswith(".json") else json_name
     target = out_dir / f"{stem}.csv"
     try:
-        target.write_text("﻿" + buf.getvalue(), encoding="utf-8", newline="")
+        target.write_bytes(b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8"))
     except OSError:
         return None
     return f"outputs/csv/{target.name}"
@@ -401,12 +989,15 @@ _SHOPEE_REVIEW_COLUMNS = [
     "so_anh",
     "anh_urls",
     "image_files",
+    "image_names",
     "video",
     "so_video",
     "video_urls",
     "video_files",
+    "video_names",
     "media_urls",
     "media_files",
+    "media_names",
     "media_dir",
     "media_errors",
 ]
@@ -501,17 +1092,127 @@ def _download_ingest_media(url: str, target_without_ext: Path) -> str:
     return f"outputs/{target.relative_to(_outputs_root()).as_posix()}"
 
 
-def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tuple[list, str | None]:
+class ZipPath(str):
+    parts: list[str] = []
+
+
+def _zip_shopee_media(
+    media_root: Path,
+    stem: str,
+    csv_path: Path | None = None,
+    max_zip_mb: int | float = 0,
+) -> ZipPath | None:
+    if not media_root.exists():
+        return None
+    media_files = [p for p in media_root.iterdir() if p.is_file() and p.name != "manifest.json"]
+    manifest_file = media_root / "manifest.json"
+
+    if csv_path is None:
+        cand = _outputs_root() / "csv" / f"{stem}.csv"
+        if cand.is_file():
+            csv_path = cand
+
+    if not media_files and not manifest_file.exists() and (not csv_path or not csv_path.is_file()):
+        return None
+
+    zips_dir = _outputs_root() / "zips"
+    zips_dir.mkdir(parents=True, exist_ok=True)
+
+    max_bytes = int(float(max_zip_mb or 0) * 1024 * 1024)
+    total_uncompressed = sum(p.stat().st_size for p in media_files)
+    if csv_path and csv_path.is_file():
+        total_uncompressed += csv_path.stat().st_size
+    if manifest_file.exists():
+        total_uncompressed += manifest_file.stat().st_size
+
+    should_split = bool(max_bytes > 0 and total_uncompressed > max_bytes and len(media_files) > 1)
+    import zipfile
+
+    if should_split:
+        parts: list[list[Path]] = []
+        current_part: list[Path] = []
+        current_bytes = 0
+
+        for f_path in sorted(media_files, key=lambda x: str(x)):
+            f_size = f_path.stat().st_size
+            if current_part and (current_bytes + f_size > max_bytes):
+                parts.append(current_part)
+                current_part = [f_path]
+                current_bytes = f_size
+            else:
+                current_part.append(f_path)
+                current_bytes += f_size
+        if current_part:
+            parts.append(current_part)
+
+        zip_rels: list[str] = []
+        for part_idx, part_files in enumerate(parts, start=1):
+            part_name = f"{stem}_media_part{part_idx:02d}.zip"
+            part_zip = zips_dir / part_name
+            with zipfile.ZipFile(part_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                if part_idx == 1 and csv_path and csv_path.is_file():
+                    zf.write(csv_path, arcname=csv_path.name)
+                if manifest_file.exists():
+                    zf.write(manifest_file, arcname="manifest.json")
+                for f in part_files:
+                    zf.write(f, arcname=f.name)
+            zip_rels.append(f"outputs/zips/{part_name}")
+
+        primary = ZipPath(zip_rels[0])
+        primary.parts = zip_rels
+        return primary
+
+    # Single archive
+    zip_path = zips_dir / f"{stem}_media.zip"
+    try:
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            if csv_path and csv_path.is_file():
+                zf.write(csv_path, arcname=csv_path.name)
+            if manifest_file.exists():
+                zf.write(manifest_file, arcname="manifest.json")
+            for f in sorted(media_files, key=lambda x: str(x)):
+                zf.write(f, arcname=f.name)
+        rel = f"outputs/zips/{zip_path.name}"
+        res = ZipPath(rel)
+        res.parts = [rel]
+        return res
+    except Exception as exc:
+        print(f"[ingest] failed to zip media {media_root}: {exc}", file=sys.stderr)
+        return None
+
+
+def _prepare_shopee_review_rows(
+    name: str,
+    rows: list,
+    job_id: str = "",
+    max_zip_mb: int | float = 0,
+) -> tuple[list, str | None, str | None]:
     if not rows or not all(isinstance(r, dict) for r in rows):
-        return rows, None
+        return rows, None, None
 
     stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", name[:-5] if name.endswith(".json") else name).strip("._")
     if not stem:
         stem = "shopee_reviews"
-    media_root = _outputs_root() / "shopee_reviews" / stem / "media"
+    media_root = _outputs_root() / "media" / stem
+    media_root.mkdir(parents=True, exist_ok=True)
+
+    # 1. Deduplicate reviews with identical (user, thoi_gian, noi_dung)
+    seen_reviews: set[tuple[str, str, str]] = set()
+    deduped_rows: list[dict] = []
+    for r in rows:
+        key = (
+            str(r.get("user") or "").strip(),
+            str(r.get("thoi_gian") or r.get("time") or "").strip(),
+            str(r.get("noi_dung") or r.get("comment") or "").strip(),
+        )
+        if key != ("", "", ""):
+            if key in seen_reviews:
+                continue
+            seen_reviews.add(key)
+        deduped_rows.append(r)
 
     sorted_rows = sorted(
-        (dict(r) for r in rows),
+        (dict(r) for r in deduped_rows),
         key=lambda r: (
             _review_sort_time(r),
             _safe_int(r.get("huu_ich")),
@@ -529,24 +1230,111 @@ def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tupl
     media_saved = 0
     media_dir_rel = None
 
+    seen_hashes: dict[tuple[str, str], dict] = {}  # (kind, sha256) -> info
+    url_to_entry: dict[str, dict] = {}
+    manifest_entries: list[dict] = []
+    unique_count = 0
+    duplicate_count = 0
+    failed_count = 0
+
     for idx, row in enumerate(sorted_rows, start=1):
         image_files: list[str] = []
+        image_names: list[str] = []
         video_files: list[str] = []
+        video_names: list[str] = []
         errors: list[str] = []
-        for kind, urls, bucket in (
-            ("image", _split_ingest_urls(row.get("anh_urls") or row.get("image_urls")), image_files),
-            ("video", _split_ingest_urls(row.get("video_urls")), video_files),
+        for kind, urls, bucket_files, bucket_names in (
+            ("image", _split_ingest_urls(row.get("anh_urls") or row.get("image_urls")), image_files, image_names),
+            ("video", _split_ingest_urls(row.get("video_urls")), video_files, video_names),
         ):
             for media_idx, url in enumerate(urls, start=1):
-                media_root.mkdir(parents=True, exist_ok=True)
+                if url in url_to_entry:
+                    prev = url_to_entry[url]
+                    if prev.get("filename"):
+                        bucket_names.append(prev["filename"])
+                    if prev.get("local_path"):
+                        bucket_files.append(prev["local_path"])
+                    continue
+
                 base = media_root / f"review_{idx:05d}_{kind}_{media_idx:02d}"
                 try:
                     rel = _download_ingest_media(url, base)
-                    bucket.append(rel)
-                    media_saved += 1
-                    media_dir_rel = media_root.relative_to(_outputs_root()).as_posix()
+                    # Resolve real file on disk to compute hash and size
+                    target_file = (_outputs_root() / Path(rel).relative_to("outputs")) if rel.startswith("outputs/") else Path(rel)
+                    file_bytes = target_file.read_bytes() if target_file.is_file() else b""
+                    file_hash = hashlib.sha256(file_bytes).hexdigest() if file_bytes else ""
+                    file_size = len(file_bytes)
+
+                    hash_key = (kind, file_hash)
+                    # Check if another file of the same kind had identical content hash
+                    if file_hash and hash_key in seen_hashes:
+                        primary = seen_hashes[hash_key]
+                        duplicate_count += 1
+                        # Remove duplicate file from disk so media_root has only unique files
+                        target_file.unlink(missing_ok=True)
+                        entry = {
+                            "url": url,
+                            "type": kind,
+                            "loai_media": kind,
+                            "local_file": primary["filename"],
+                            "filename": primary["filename"],
+                            "local_path": primary["local_path"],
+                            "hash": file_hash,
+                            "sha256": file_hash,
+                            "size": file_size,
+                            "duplicate_of": primary["filename"],
+                            "error": None,
+                            "loi_tai": None,
+                        }
+                        manifest_entries.append(entry)
+                        url_to_entry[url] = entry
+                        bucket_files.append(primary["local_path"])
+                        bucket_names.append(primary["filename"])
+                    else:
+                        unique_count += 1
+                        media_saved += 1
+                        media_dir_rel = media_root.relative_to(_outputs_root()).as_posix()
+                        bucket_files.append(rel)
+                        bucket_names.append(target_file.name)
+                        entry = {
+                            "url": url,
+                            "type": kind,
+                            "loai_media": kind,
+                            "local_file": target_file.name,
+                            "filename": target_file.name,
+                            "local_path": rel,
+                            "hash": file_hash,
+                            "sha256": file_hash,
+                            "size": file_size,
+                            "duplicate_of": None,
+                            "error": None,
+                            "loi_tai": None,
+                        }
+                        manifest_entries.append(entry)
+                        url_to_entry[url] = entry
+                        if file_hash:
+                            seen_hashes[hash_key] = {"filename": target_file.name, "local_path": rel}
                 except Exception as exc:  # noqa: BLE001
-                    errors.append(f"{kind}:{url}:{exc}")
+                    failed_count += 1
+                    err_str = str(exc)
+                    errors.append(f"{kind}:{url}:{err_str}")
+                    entry = {
+                        "url": url,
+                        "type": kind,
+                        "loai_media": kind,
+                        "local_file": None,
+                        "filename": None,
+                        "local_path": None,
+                        "hash": None,
+                        "sha256": None,
+                        "size": 0,
+                        "duplicate_of": None,
+                        "error": err_str,
+                        "loi_tai": err_str,
+                    }
+                    manifest_entries.append(entry)
+                    url_to_entry[url] = entry
+
                 if job_id:
                     _update_ingest_progress(
                         job_id,
@@ -559,18 +1347,92 @@ def _prepare_shopee_review_rows(name: str, rows: list, job_id: str = "") -> tupl
                             "percent": 99 if media_total else 98,
                         },
                     )
-        if image_files:
-            row["image_files"] = "|".join(image_files)
-        if video_files:
-            row["video_files"] = "|".join(video_files)
-        media_files = image_files + video_files
-        if media_files:
-            row["media_files"] = "|".join(media_files)
-            row["media_dir"] = f"outputs/{media_dir_rel}" if media_dir_rel else ""
-        if errors:
-            row["media_errors"] = " || ".join(errors[:10])
 
-    return [_ordered_shopee_review_row(r) for r in sorted_rows], media_dir_rel
+        has_media_intent = bool(
+            image_files
+            or video_files
+            or errors
+            or row.get("anh_urls")
+            or row.get("image_urls")
+            or row.get("video_urls")
+        )
+        if has_media_intent:
+            if image_files:
+                row["image_files"] = "|".join(image_files)
+                row["image_names"] = "|".join(image_names)
+                row["so_anh"] = len(image_files)
+                row["anh"] = True
+            else:
+                row.setdefault("image_files", "")
+                row.setdefault("image_names", "")
+                row.setdefault("so_anh", 0)
+
+            if video_files:
+                row["video_files"] = "|".join(video_files)
+                row["video_names"] = "|".join(video_names)
+                row["so_video"] = len(video_files)
+                row["video"] = True
+            else:
+                row.setdefault("video_files", "")
+                row.setdefault("video_names", "")
+                row.setdefault("so_video", 0)
+
+            media_files = image_files + video_files
+            media_names = image_names + video_names
+            media_urls_all = _split_ingest_urls(row.get("anh_urls") or row.get("image_urls")) + _split_ingest_urls(row.get("video_urls"))
+            if media_urls_all:
+                row["media_urls"] = "|".join(media_urls_all)
+            if media_files:
+                row["media_files"] = "|".join(media_files)
+                row["media_names"] = "|".join(media_names)
+                row["media_dir"] = f"outputs/{media_dir_rel}" if media_dir_rel else ""
+            if errors:
+                row["media_errors"] = " || ".join(errors[:10])
+
+    # 2. Write manifest.json
+    manifest_data = {
+        "job_name": stem,
+        "target": stem,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "total_urls": media_total,
+        "downloaded_count": media_saved,
+        "unique_count": unique_count,
+        "duplicate_count": duplicate_count,
+        "failed_count": failed_count,
+        "files": manifest_entries,
+        "items": manifest_entries,
+    }
+    if manifest_entries:
+        manifest_text = json.dumps(manifest_data, ensure_ascii=False, indent=2)
+        (media_root / "manifest.json").write_text(manifest_text, encoding="utf-8")
+        (media_root.parent / "manifest.json").write_text(manifest_text, encoding="utf-8")
+
+        # Also copy to outputs/media/<stem> for media-scrape contract compatibility
+        alt_media_dir = _outputs_root() / "media" / stem
+        alt_media_dir.mkdir(parents=True, exist_ok=True)
+        for f in media_root.iterdir():
+            if f.is_file():
+                try:
+                    shutil.copy2(f, alt_media_dir / f.name)
+                except Exception:
+                    pass
+
+    zip_rel = None
+    if media_saved > 0 or manifest_entries:
+        if job_id:
+            _update_ingest_progress(
+                job_id,
+                {
+                    "status": "saving",
+                    "stage": "zipping",
+                    "message": f"Đang nén {media_saved} file media vào ZIP",
+                    "percent": 99,
+                },
+            )
+        csv_cand = _outputs_root() / "csv" / f"{stem}.csv"
+        zip_rel = _zip_shopee_media(media_root, stem, csv_path=csv_cand if csv_cand.is_file() else None, max_zip_mb=max_zip_mb)
+
+    return [_ordered_shopee_review_row(r) for r in sorted_rows], media_dir_rel, zip_rel
 
 
 # The bookmarklet body. Runs in the user's ORDINARY Chrome — no Playwright, no CDP,
@@ -1045,7 +1907,7 @@ class _HelperHandler(BaseHTTPRequestHandler):
     def _cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Extension-Id, Authorization, X-Bridge-Token")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Bridge-Client, X-Bridge-Token, Authorization")
         # Private Network Access: a page on a public origin (shopee.vn) POSTing to
         # http://127.0.0.1 gets a preflight that Chrome fails WITHOUT this header —
         # the /ingest bookmarklet dies silently otherwise.
@@ -1236,22 +2098,91 @@ class _HelperHandler(BaseHTTPRequestHandler):
         # /browser/pair — one-time bootstrap for the MV3 extension's loopback
         # WebSocket. Never expose the token to a normal web origin: otherwise any
         # visited page could turn localhost into a confused-deputy browser controller.
+        # Some MV3 extension contexts omit Origin on localhost fetches, so originless
+        # loopback requests are accepted; browser pages still send their web Origin
+        # and are rejected here.
         if self.path.split("?", 1)[0] == "/browser/pair":
-            self._handle_browser_pair()
+            origin = self.headers.get("Origin", "")
+            valid, ext_id = validate_extension_origin(origin, _BROWSER_WS.allowlisted_extension_ids)
+            if origin and not valid:
+                self._json(403, {"ok": False, "error": "Unauthorized extension origin"})
+                return
+            body = json.dumps(
+                {
+                    "ok": True,
+                    "protocolVersion": "1.0",
+                    "token": _BROWSER_WS.token,
+                    "wsUrl": f"ws://127.0.0.1:{HELPER_PORT}/browser/v1/ws",
+                    "fallbackWsUrl": f"ws://127.0.0.1:{HELPER_WS_PORT}/browser-extension",
+                    "capabilities": ["actions", "verification", "same_origin_fetch"],
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", origin or "*")
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         if self.path.split("?", 1)[0] == "/browser/status":
+            transport_state = _BROWSER_WS.transport.get_state()
+            verif_job = None
+            login_job = None
+            blocked_job = None
+            with _INGEST_PROGRESS_LOCK:
+                for jid, p in reversed(list(_INGEST_PROGRESS.items())):
+                    if p.get("status") == "login_required" or p.get("login_required"):
+                        if not login_job:
+                            login_job = {
+                                "job_id": jid,
+                                "url": p.get("url"),
+                                "reason": p.get("message") or p.get("error"),
+                            }
+                    elif p.get("stage") == "api_blocked" or p.get("api_blocked"):
+                        if not blocked_job:
+                            blocked_job = {
+                                "job_id": jid,
+                                "url": p.get("url"),
+                                "reason": p.get("message") or p.get("error"),
+                            }
+                    elif p.get("status") == "awaiting_user_verification" or p.get("verification_required"):
+                        if not verif_job:
+                            verif_job = {
+                                "job_id": jid,
+                                "url": p.get("url"),
+                                "reason": p.get("message") or p.get("error"),
+                            }
+            if verif_job or transport_state == "awaiting_user_verification":
+                state = "awaiting_user_verification"
+            elif login_job:
+                state = "login_required"
+            elif blocked_job:
+                state = "api_blocked"
+            else:
+                state = transport_state
             self._json(
                 200,
                 {
                     "ok": True,
-                    "transport": "extension-websocket" if _BROWSER_WS.connected else "http-long-poll",
+                    "transport": "extension-websocket",
+                    "state": state,
+                    "verification_required": bool(verif_job or state == "awaiting_user_verification"),
+                    "login_required": bool(login_job or state == "login_required"),
+                    "api_blocked": bool(blocked_job or state == "api_blocked"),
+                    "pending_verification": verif_job,
+                    "pending_login": login_job,
+                    "pending_blocked": blocked_job,
                     "connected": _BROWSER_WS.connected,
+                    "connectionPolicy": "exclusive",
+                    "connectionOwner": _BROWSER_WS.active_connection_info(),
                     "protocolVersion": "1.0",
                     "wsPort": HELPER_WS_PORT,
                     "httpPort": HELPER_PORT,
                     "wsUrl": f"ws://127.0.0.1:{HELPER_PORT}/browser/v1/ws",
                     "pendingJobs": len(_INGEST_JOBS),
+                    "inFlightJobs": len(_INGEST_INFLIGHT),
                 },
             )
             return
@@ -1286,24 +2217,114 @@ class _HelperHandler(BaseHTTPRequestHandler):
             origin = self.headers.get("Origin", "")
             valid_origin, _ = validate_extension_origin(origin, _BROWSER_WS.allowlisted_extension_ids)
 
-            # Require valid pairing token, API token, or request from authorized extension origin
+            # Require valid pairing token, API token, or request from authorized extension origin / loopback
             token_valid = req_token and (
                 verify_pairing_token(req_token, _BROWSER_WS.token)
                 or verify_pairing_token(req_token, API_TOKEN)
             )
-            if not token_valid and not valid_origin:
+            client_ip = self.client_address[0]
+            is_loopback = client_ip in ("127.0.0.1", "::1", "localhost")
+            if not token_valid and not valid_origin and not (is_loopback and not origin):
                 self._json(401, {"ok": False, "error": "Unauthorized: Valid token or extension origin required"})
                 return
 
             job_id = (qs.get("id", [""])[0] or qs.get("jobId", [""])[0] or "").strip()
+            if not job_id:
+                with _INGEST_PROGRESS_LOCK:
+                    for jid, p in reversed(list(_INGEST_PROGRESS.items())):
+                        if (p.get("status") == "awaiting_user_verification" or p.get("verification_required")) and not p.get("login_required") and not p.get("api_blocked"):
+                            job_id = jid
+                            break
+
+            if job_id:
+                with _INGEST_PROGRESS_LOCK:
+                    target_p = _INGEST_PROGRESS.get(job_id, {})
+                if target_p.get("status") == "login_required" or target_p.get("login_required"):
+                    self._json(400, {
+                        "ok": False,
+                        "error": "Không thể resume verification: Job yêu cầu đăng nhập tài khoản Shopee trên trình duyệt Chrome. Vui lòng đăng nhập và tạo yêu cầu cào mới.",
+                        "login_required": True,
+                    })
+                    return
+                if target_p.get("stage") == "api_blocked" or target_p.get("api_blocked"):
+                    self._json(400, {
+                        "ok": False,
+                        "error": "Không thể resume verification: Shopee đã chặn truy cập API (HTTP 403 / API Blocked).",
+                        "api_blocked": True,
+                    })
+                    return
+
             msg = {
                 "v": 1,
                 "type": "verification.resolved",
-                "params": {"jobId": job_id} if job_id else {},
+                "params": {"jobId": job_id, "retry": True} if job_id else {"retry": True},
             }
             sent = _BROWSER_WS.send(msg)
             _BROWSER_WS.transport.resume_verification()
-            self._json(200, {"ok": True, "resumed": True, "sent": sent, "jobId": job_id})
+
+            retried_job = None
+            if job_id:
+                _INGEST_RESULTS.pop(job_id, None)
+                _update_ingest_progress(
+                    job_id,
+                    {
+                        "status": "queued",
+                        "stage": "resumed",
+                        "verification_required": False,
+                        "message": "Đã giải quyết xác minh, đang tiếp tục cào",
+                        "percent": 5,
+                        "error": None,
+                    },
+                )
+                job = _INGEST_ALL_JOBS.get(job_id)
+                if job:
+                    retried_job = job
+                    with _INGEST_JOBS_LOCK:
+                        if job_id not in [j.get("id") for j in _INGEST_JOBS]:
+                            _INGEST_JOBS.append(job)
+                            _INGEST_JOB_EVENT.set()
+                    if _BROWSER_WS.connected:
+                        _BROWSER_WS.send({"type": "ingest.job", "job": job, "retry": True})
+                _persist_ingest_state()
+
+            self._json(200, {
+                "ok": True,
+                "resumed": True,
+                "sent": sent,
+                "jobId": job_id,
+                "retried": bool(retried_job),
+            })
+            return
+
+        if self.path.split("?", 1)[0] == "/ingest/retry":
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            job_id = (qs.get("id", [""])[0] or qs.get("jobId", [""])[0] or "").strip()
+            if not job_id:
+                self._json(400, {"ok": False, "error": "job id is required"})
+                return
+            job = _INGEST_ALL_JOBS.get(job_id)
+            if not job:
+                self._json(404, {"ok": False, "error": f"Job {job_id} not found in history"})
+                return
+            _INGEST_RESULTS.pop(job_id, None)
+            _update_ingest_progress(
+                job_id,
+                {
+                    "status": "queued",
+                    "stage": "retry",
+                    "message": "Đang thử lại job",
+                    "percent": 0,
+                    "error": None,
+                },
+            )
+            with _INGEST_JOBS_LOCK:
+                if job_id not in [j.get("id") for j in _INGEST_JOBS]:
+                    _INGEST_JOBS.append(job)
+                    _INGEST_JOB_EVENT.set()
+            sent = False
+            if _BROWSER_WS.connected:
+                sent = _BROWSER_WS.send({"type": "ingest.job", "job": job, "retry": True})
+            self._json(200, {"ok": True, "retried": job_id, "sent": sent, "job": job})
             return
 
         if self.path.split("?", 1)[0] == "/browser/reload":
@@ -1463,7 +2484,32 @@ class _HelperHandler(BaseHTTPRequestHandler):
             job_id = (qs.get("id", [""])[0] or "").strip()
             done = _INGEST_RESULTS.get(job_id)
             progress = _INGEST_PROGRESS.get(job_id)
-            self._json(200, {"ok": bool(done), "result": done, "progress": progress})
+            with _INGEST_TRACES_LOCK:
+                traces = list(_INGEST_TRACES.get(job_id, []))
+            self._json(200, {
+                "ok": bool(done),
+                "result": done,
+                "progress": progress,
+                "traces": traces,
+                "traces_count": len(traces),
+            })
+            return
+
+        # /ingest/traces?id=… — retrieve structured trace log for a job or recent jobs
+        if self.path.split("?", 1)[0] == "/ingest/traces":
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            job_id = (qs.get("id", [""])[0] or qs.get("jobId", [""])[0] or "").strip()
+            with _INGEST_TRACES_LOCK:
+                if job_id:
+                    traces = list(_INGEST_TRACES.get(job_id, []))
+                else:
+                    traces = [t for t_list in _INGEST_TRACES.values() for t in t_list][-200:]
+            self._json(200, {
+                "ok": True,
+                "jobId": job_id or None,
+                "count": len(traces),
+                "traces": traces,
+            })
             return
 
         # /ingest/progress?id=… — lightweight status for UIs and agents while a
@@ -1804,24 +2850,42 @@ class _HelperHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
 
-        if path_only == "/browser/pair":
-            self._handle_browser_pair()
-            return
+        if path_only == "/browser/command":
+            from browser_bridge.protocol import MAX_MESSAGE_BYTES, MessageEnvelope
+            from browser_bridge.actions import validate_action_params
 
-        if path_only == "/browser/action":
-            body = _read_json()
-            action = (body.get("action") or "").strip()
-            params = body.get("params") or {}
-            if not action:
-                _reply(400, {"ok": False, "error": "action is required"})
+            token = self.headers.get("X-Bridge-Token", "")
+            authorization = self.headers.get("Authorization", "")
+            if not token and authorization.startswith("Bearer "):
+                token = authorization[7:].strip()
+            origin = self.headers.get("Origin", "")
+            if origin and not validate_extension_origin(origin, _BROWSER_WS.allowlisted_extension_ids)[0]:
+                _reply(403, {"ok": False, "error": "Origin forbidden"})
                 return
-            ok, res, err = _BROWSER_WS.transport.execute_command(action, params)
-            _reply(200 if ok else 500, {
-                "ok": ok,
-                "action": action,
-                "result": res,
-                "error": err.to_dict() if err else None,
-            })
+            if not token or not (verify_pairing_token(token, _BROWSER_WS.token) or verify_pairing_token(token, API_TOKEN)):
+                _reply(401, {"ok": False, "error": "Valid bridge or API token required"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= MAX_MESSAGE_BYTES:
+                    _reply(413, {"ok": False, "error": "Invalid command body size"})
+                    return
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                envelope = MessageEnvelope.model_validate(body)
+                if envelope.type != "command" or not envelope.action:
+                    raise ValueError("Expected a command envelope with action")
+                if envelope.deadlineMs is None or not 1 <= envelope.deadlineMs <= 120000:
+                    raise ValueError("deadlineMs must be between 1 and 120000")
+                validate_action_params(envelope.action, envelope.params)
+            except (ValueError, TypeError) as exc:
+                _reply(400, {"ok": False, "error": str(exc)})
+                return
+            ok, result, error = _BROWSER_WS.transport.execute_command(
+                envelope.action, envelope.params, deadline_ms=envelope.deadlineMs,
+                command_id=envelope.id, session_id=envelope.sessionId,
+            )
+            _reply(200, {"ok": ok, "id": envelope.id, "result": result,
+                         "error": error.to_dict() if error else None})
             return
 
         # ─── /ingest — data pushed in from a normal browser tab ──────────────
@@ -1831,101 +2895,9 @@ class _HelperHandler(BaseHTTPRequestHandler):
         # `artifact:` chips pick it up with no extra wiring.
         if path_only == "/ingest":
             body = _read_json()
-            job_id = (body.get("job") if isinstance(body, dict) else None) or ""
-            # A job that failed in the browser reports here too — otherwise the agent
-            # would poll /ingest/result forever waiting for a run that already died.
-            if isinstance(body, dict) and body.get("error"):
-                if job_id:
-                    result = {"ok": False, "error": str(body["error"])[:500]}
-                    _INGEST_RESULTS[job_id] = result
-                    _update_ingest_progress(
-                        job_id,
-                        {
-                            "status": "error",
-                            "stage": "failed",
-                            "message": result["error"],
-                            "error": result["error"],
-                            "percent": 100,
-                        },
-                    )
-                _reply(200, {"ok": True, "recorded": "error"})
-                return
-            rows = body.get("rows") if isinstance(body, dict) else body
-            if not isinstance(rows, list):
-                _reply(400, {"ok": False, "error": "expected {rows: [...]} or a JSON array"})
-                return
             qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
-            raw = (qs.get("name", [""])[0] or (body.get("name") if isinstance(body, dict) else "") or "")
-            name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(raw)).strip("_")
-            if not name:
-                name = "ingest_" + time.strftime("%Y%m%d_%H%M%S")
-            if not name.endswith(".json"):
-                name += ".json"
-            source = (body.get("source") if isinstance(body, dict) else None)
-            source_text = str(source or "")
-            media_dir = None
-            if name.lower().startswith("shopee_") or "shopee.vn" in source_text.lower():
-                if job_id:
-                    _update_ingest_progress(
-                        job_id,
-                        {
-                            "status": "saving",
-                            "stage": "organize",
-                            "message": f"Đang sắp xếp {len(rows)} review và chuẩn bị tải media",
-                            "rows": len(rows),
-                            "percent": 98,
-                        },
-                    )
-                rows, media_dir = _prepare_shopee_review_rows(name, rows, job_id)
-            inbox = _outputs_root() / "inbox"
-            inbox.mkdir(parents=True, exist_ok=True)
-            target = inbox / name
-            payload = {
-                "received_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "source": source,
-                "count": len(rows),
-                "media_dir": f"outputs/{media_dir}" if media_dir else None,
-                "rows": rows,
-            }
-            try:
-                target.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
-                )
-            except OSError as exc:
-                _reply(500, {"ok": False, "error": f"write failed: {exc}"})
-                return
-            # Write the CSV here too, rather than leaving it to the agent. The whole
-            # point of this path is that it works when the model can't help: the
-            # workspace is elsewhere so read_file can't reach outputs/, and web_fetch
-            # truncates at 100k chars — a few hundred reviews would arrive cut in half.
-            # One click now produces the deliverable; the agent is only for summarising.
-            csv_rel = _write_ingest_csv(name, rows)
-            print(f"[ingest] {len(rows)} rows → {target}", file=sys.stderr)
-            result = {
-                "ok": True,
-                "count": len(rows),
-                "path": f"outputs/inbox/{name}",
-                "url": f"/outputs/inbox/{name}",
-                "csv": csv_rel,
-                "media_dir": f"outputs/{media_dir}" if media_dir else None,
-            }
-            if job_id:
-                _INGEST_RESULTS[job_id] = result
-                _update_ingest_progress(
-                    job_id,
-                    {
-                        "status": "done",
-                        "stage": "saved",
-                        "message": f"Đã lưu {len(rows)} dòng",
-                        "rows": len(rows),
-                        "count": len(rows),
-                        "path": result["path"],
-                        "csv": csv_rel,
-                        "media_dir": result.get("media_dir"),
-                        "percent": 100,
-                    },
-                )
-            _reply(200, result)
+            status, result = _store_ingest_payload(body, qs.get("name", [""])[0])
+            _reply(status, result)
             return
 
         if path_only == "/ingest/progress":
@@ -1937,6 +2909,126 @@ class _HelperHandler(BaseHTTPRequestHandler):
             patch = body.get("progress") if isinstance(body.get("progress"), dict) else body
             progress = _update_ingest_progress(job_id, patch)
             _reply(200, {"ok": True, "progress": progress})
+            return
+
+        if path_only == "/browser/resume":
+            body = _read_json()
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            auth_header = self.headers.get("Authorization", "")
+            req_token = body.get("token", "") or qs.get("token", [""])[0] or self.headers.get("X-Bridge-Token", "")
+            if not req_token and auth_header.startswith("Bearer "):
+                req_token = auth_header[7:].strip()
+            origin = self.headers.get("Origin", "")
+            valid_origin, _ = validate_extension_origin(origin, _BROWSER_WS.allowlisted_extension_ids)
+            token_valid = req_token and (
+                verify_pairing_token(req_token, _BROWSER_WS.token)
+                or verify_pairing_token(req_token, API_TOKEN)
+            )
+            client_ip = self.client_address[0]
+            is_loopback = client_ip in ("127.0.0.1", "::1", "localhost")
+            if not token_valid and not valid_origin and not (is_loopback and not origin):
+                _reply(401, {"ok": False, "error": "Unauthorized: Valid token or extension origin required"})
+                return
+
+            job_id = (body.get("id") or body.get("jobId") or qs.get("id", [""])[0] or qs.get("jobId", [""])[0] or "").strip()
+            if not job_id:
+                with _INGEST_PROGRESS_LOCK:
+                    for jid, p in reversed(list(_INGEST_PROGRESS.items())):
+                        if (p.get("status") == "awaiting_user_verification" or p.get("verification_required")) and not p.get("login_required") and not p.get("api_blocked"):
+                            job_id = jid
+                            break
+
+            if job_id:
+                with _INGEST_PROGRESS_LOCK:
+                    target_p = _INGEST_PROGRESS.get(job_id, {})
+                if target_p.get("status") == "login_required" or target_p.get("login_required"):
+                    _reply(400, {
+                        "ok": False,
+                        "error": "Không thể resume verification: Job yêu cầu đăng nhập tài khoản Shopee trên trình duyệt Chrome. Vui lòng đăng nhập và tạo yêu cầu cào mới.",
+                        "login_required": True,
+                    })
+                    return
+                if target_p.get("stage") == "api_blocked" or target_p.get("api_blocked"):
+                    _reply(400, {
+                        "ok": False,
+                        "error": "Không thể resume verification: Shopee đã chặn truy cập API (HTTP 403 / API Blocked).",
+                        "api_blocked": True,
+                    })
+                    return
+
+            msg = {
+                "v": 1,
+                "type": "verification.resolved",
+                "params": {"jobId": job_id, "retry": True} if job_id else {"retry": True},
+            }
+            sent = _BROWSER_WS.send(msg)
+            _BROWSER_WS.transport.resume_verification()
+
+            retried_job = None
+            if job_id:
+                _INGEST_RESULTS.pop(job_id, None)
+                _update_ingest_progress(
+                    job_id,
+                    {
+                        "status": "queued",
+                        "stage": "resumed",
+                        "verification_required": False,
+                        "message": "Đã giải quyết xác minh, đang tiếp tục cào",
+                        "percent": 5,
+                        "error": None,
+                    },
+                )
+                job = _INGEST_ALL_JOBS.get(job_id)
+                if job:
+                    retried_job = job
+                    with _INGEST_JOBS_LOCK:
+                        if job_id not in [j.get("id") for j in _INGEST_JOBS]:
+                            _INGEST_JOBS.append(job)
+                            _INGEST_JOB_EVENT.set()
+                    if _BROWSER_WS.connected:
+                        _BROWSER_WS.send({"type": "ingest.job", "job": job, "retry": True})
+                _persist_ingest_state()
+
+            _reply(200, {
+                "ok": True,
+                "resumed": True,
+                "sent": sent,
+                "jobId": job_id,
+                "retried": bool(retried_job),
+            })
+            return
+
+        if path_only == "/ingest/retry":
+            body = _read_json()
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            job_id = (body.get("id") or body.get("jobId") or qs.get("id", [""])[0] or qs.get("jobId", [""])[0] or "").strip()
+            if not job_id:
+                _reply(400, {"ok": False, "error": "job id is required"})
+                return
+            job = _INGEST_ALL_JOBS.get(job_id)
+            if not job:
+                _reply(404, {"ok": False, "error": f"Job {job_id} not found in history"})
+                return
+            _INGEST_RESULTS.pop(job_id, None)
+            _update_ingest_progress(
+                job_id,
+                {
+                    "status": "queued",
+                    "stage": "retry",
+                    "message": "Đang thử lại job",
+                    "percent": 0,
+                    "error": None,
+                },
+            )
+            with _INGEST_JOBS_LOCK:
+                if job_id not in [j.get("id") for j in _INGEST_JOBS]:
+                    _INGEST_JOBS.append(job)
+                    _INGEST_JOB_EVENT.set()
+            sent = False
+            if _BROWSER_WS.connected:
+                sent = _BROWSER_WS.send({"type": "ingest.job", "job": job, "retry": True})
+            _persist_ingest_state()
+            _reply(200, {"ok": True, "retried": job_id, "sent": sent, "job": job})
             return
 
         if path_only == "/google/refresh":
@@ -2193,7 +3285,7 @@ def _start_helper() -> ThreadingHTTPServer | None:
         print(f"[launch] Browser extension WebSocket on ws://127.0.0.1:{ws_port}/browser-extension")
     except OSError as exc:
         print(
-            f"[launch] browser WebSocket :{HELPER_WS_PORT} not started ({exc}); using HTTP long-poll",
+            f"[launch] browser WebSocket :{HELPER_WS_PORT} not started ({exc}); extension will retry WebSocket",
             file=sys.stderr,
         )
     try:
@@ -2208,11 +3300,9 @@ def _start_helper() -> ThreadingHTTPServer | None:
     return srv
 
 
-# ── Chrome Extension Auto-Launch ──────────────────────────────────────────────
-# Tự mở Chrome với profile riêng đã load sẵn browser-extension/.
-# Profile nằm tại <root>/chrome-profile/ — tách biệt hoàn toàn với Chrome cá nhân
-# của user. Extension persist trong profile này, không cần cài lại mỗi lần.
-# User chỉ cần đăng nhập Shopee 1 lần trong profile này.
+# ── Chrome Extension Setup ───────────────────────────────────────────────────
+# Official Chrome 137+ ignores --load-extension. Load unpacked once in the
+# dedicated profile; subsequent launches reuse the installed extension.
 
 def _find_chrome() -> str | None:
     """Tìm chrome.exe theo priority list. Trả None nếu không tìm thấy."""
@@ -2250,17 +3340,27 @@ def _find_chrome() -> str | None:
 _chrome_proc: subprocess.Popen | None = None  # giữ reference để cleanup
 
 
+def _profile_has_browser_extension(profile_dir: Path) -> bool:
+    """Check only extension registration, without reading browser history/cookies."""
+    expected = (ROOT / "browser-extension").resolve()
+    for filename in ("Preferences", "Secure Preferences"):
+        try:
+            data = json.loads((profile_dir / "Default" / filename).read_text(encoding="utf-8"))
+            settings = data.get("extensions", {}).get("settings", {})
+            for extension in settings.values():
+                path = extension.get("path")
+                if path and Path(path).resolve() == expected:
+                    return True
+        except (OSError, ValueError, TypeError):
+            continue
+    return False
+
+
 def _ensure_chrome_with_extension() -> bool:
-    """Mở Chrome với profile riêng đã load sẵn browser-extension/.
+    """Open the persistent Chrome profile and offer one-time unpacked setup.
 
-    - Profile tại <root>/chrome-profile/ (persist qua restart)
-    - Extension được load mỗi lần Chrome mở (--load-extension flag)
-    - Nếu Chrome đã đang chạy với profile này thì skip
-    - Trả True nếu launch thành công, False nếu không tìm được Chrome
-
-    Note: extension KHÔNG bền vững kiểu "installed" — nó được load qua flag.
-    Chrome sẽ hỏi "disable developer mode extensions?" → user bấm Cancel/Keep.
-    Đây là trade-off: không cần user cài thủ công, nhưng có popup 1 lần.
+    A successful process launch does not imply that the extension connected;
+    /browser/status is the authority for connectivity.
     """
     global _chrome_proc
 
@@ -2281,15 +3381,17 @@ def _ensure_chrome_with_extension() -> bool:
     # Trang mặc định khi mở: ingest help page — giải thích cho user biết Chrome này dùng để gì
     start_url = f"http://127.0.0.1:{HELPER_PORT}/ingest"
 
+    installed = _profile_has_browser_extension(profile_dir)
     args = [
         chrome_exe,
         f"--user-data-dir={profile_dir}",
-        f"--load-extension={ext_dir}",
         "--no-first-run",               # bỏ qua wizard chào mừng của Chrome
         "--no-default-browser-check",   # không hỏi đặt làm trình duyệt mặc định
         "--disable-background-networking",  # giảm network noise
         start_url,
     ]
+    if not installed:
+        args.append("chrome://extensions/")
 
     try:
         _chrome_proc = subprocess.Popen(
@@ -2299,9 +3401,13 @@ def _ensure_chrome_with_extension() -> bool:
             # Không kế thừa console của launcher để Chrome không bị kill khi Ctrl+C
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
         )
-        print(f"[launch] Chrome launched (pid={_chrome_proc.pid}) with AI cowork extension.")
+        print(f"[launch] Chrome launched (pid={_chrome_proc.pid}); waiting for extension connection.")
         print(f"[launch]   Profile: {profile_dir}")
         print(f"[launch]   Extension: {ext_dir}")
+        if not installed:
+            print("[launch]   Chrome 137+ requires one-time Load unpacked setup.")
+            print("[launch]   In chrome://extensions: enable Developer mode, click Load unpacked,")
+            print(f"[launch]   then select: {ext_dir}")
         print(f"[launch]   Tip: đăng nhập Shopee trong cửa sổ Chrome này để crawl hoạt động.")
         return True
     except OSError as e:
@@ -2980,8 +4086,7 @@ def main() -> None:
     # Tiny helper HTTP: Google/connectors wizards + outputs/artifacts serving.
     _start_helper()
 
-    # Auto-launch Chrome with the browser-extension pre-loaded.
-    # This lets the Shopee ingest pipeline work without manual extension install.
+    # Open Chrome and guide one-time unpacked extension installation if needed.
     # Chrome opens a separate profile so it doesn't interfere with the user's
     # personal Chrome session. User only needs to log into Shopee once per profile.
     _ensure_chrome_with_extension()

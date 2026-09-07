@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from typing import Any, Optional
 
@@ -65,57 +66,145 @@ def _pin_reasoning_effort(kwargs: dict[str, Any]) -> None:
 # trims the list itself right before the call, dropping the LEAST important tools
 # first so a fat list stays usable instead of failing every turn.
 #
-# Cap keyed by a substring of the endpoint base_url (None = no cap → send everything).
-_TOOL_CAPS: tuple[tuple[str, int], ...] = (("api.groq.com", 128),)
+# Cap keyed by a substring of the endpoint base_url (None = no cap -> send everything).
+# Groq hard caps at 128, but sending 128 tools causes heavy schema overhead (~15k tokens)
+# which quickly exhausts Groq's Free Tier TPM limit and leads to timeouts / degradation.
+# We default Groq to a focused 32-tool cap (overridable via COWORKER_GROQ_TOOL_CAP),
+# and dynamically promote tools matching the user's intent.
+_DEFAULT_GROQ_CAP = 32
+_TOOL_CAPS: tuple[tuple[str, int], ...] = (("api.groq.com", _DEFAULT_GROQ_CAP),)
 
-# Servers whose tools are dropped FIRST when trimming (rank 0). These are bulky and
-# niche: telegram-bot's 91 tools would otherwise crowd out the agent's core surface.
-# Everything not listed keeps its normal rank (see _tool_rank).
+# Servers whose tools are bulky and niche: telegram-bot alone has 91 tools.
+# They are deprioritized by default unless the user query explicitly mentions them.
 _DEPRIORITIZED_SERVERS = frozenset({"telegram_bot", "telegram_mtproto"})
+
+# Core built-in tools that should always survive trimming.
+_CORE_BUILTINS = frozenset({
+    "read_file",
+    "write_file",
+    "list_files",
+    "grep_files",
+    "run_shell",
+    "search_web",
+    "todo_write",
+    "todo_read",
+    "current_time",
+    "send_message",
+    "ask_user",
+    "propose_plan",
+    "request_directory",
+})
+
+# Domain keywords for dynamic context-aware tool promotion.
+_DOMAIN_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "browser": ("cào", "crawl", "scrape", "shopee", "web", "url", "link", "trang", "html", "browser", "tải", "ảnh", "video", "zip", "review", "đánh giá"),
+    "crawl": ("cào", "crawl", "scrape", "shopee", "web", "url", "link", "trang", "csv", "zip", "media", "review", "bài báo", "vnexpress"),
+    "telegram": ("telegram", "bot", "chat", "nhắn", "tg", "kênh", "channel", "group", "tin nhắn"),
+    "google": ("google", "drive", "mail", "gmail", "tài liệu", "doc", "sheet", "lịch", "calendar", "gdrive"),
+    "github": ("git", "github", "commit", "pr", "pull request", "branch", "kho", "repository"),
+    "filesystem": ("file", "tệp", "thư mục", "folder", "directory", "đọc", "ghi", "xem"),
+}
 
 
 def _tool_cap_for(base_url: Optional[str]) -> Optional[int]:
     if not base_url:
         return None
-    for needle, cap in _TOOL_CAPS:
+    for needle, default_cap in _TOOL_CAPS:
         if needle in base_url:
-            return cap
+            env_val = os.environ.get("COWORKER_GROQ_TOOL_CAP")
+            if env_val:
+                try:
+                    return int(env_val)
+                except ValueError:
+                    pass
+            return default_cap
     return None
 
 
-def _tool_rank(schema: dict[str, Any]) -> int:
-    """Keep-priority for one tool schema — higher survives trimming.
+def _extract_recent_query(messages: Optional[list[dict[str, Any]]]) -> str:
+    if not messages:
+        return ""
+    parts = []
+    for m in reversed(messages[-4:]):
+        content = m.get("content", "")
+        if isinstance(content, str):
+            parts.append(content.lower())
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(str(part.get("text", "")).lower())
+    return " ".join(parts)
 
-    2 = built-in tool (no `mcp__` prefix): browser/crawl/core, the agent's own surface.
-    1 = a normal MCP bridge tool.
-    0 = a deprioritized bridge (dropped first).
+
+def _tool_rank(schema: dict[str, Any], query: str = "") -> float:
+    """Keep-priority for one tool schema with context-aware scoring -- higher survives trimming.
+
+    - Core built-ins get top baseline score (100.0).
+    - Normal MCP tools get baseline 10.0.
+    - Deprioritized bulky bridges (telegram 91 tools) get baseline 0.0.
+    - If user query matches domain keywords, relevant tools gain substantial score boosts (+50.0).
     """
     name = ((schema or {}).get("function") or {}).get("name") or ""
+    desc = (((schema or {}).get("function") or {}).get("description") or "").lower()
+    name_lower = name.lower()
+
     if not name.startswith("mcp__"):
-        return 2
-    server = name.split("__", 2)[1] if name.count("__") >= 2 else ""
-    return 0 if server in _DEPRIORITIZED_SERVERS else 1
+        base_score = 100.0 if name in _CORE_BUILTINS else 20.0
+        server = ""
+    else:
+        server = name.split("__", 2)[1] if name.count("__") >= 2 else ""
+        base_score = 0.0 if server in _DEPRIORITIZED_SERVERS else 10.0
+
+    if not query:
+        return base_score
+
+    score = base_score
+    for domain, kws in _DOMAIN_KEYWORDS.items():
+        if any(kw in query for kw in kws):
+            if domain in name_lower or domain in server or domain in desc:
+                score += 50.0
+
+    if any(tg_kw in query for tg_kw in ("telegram", "tg", "bot", "tin nhắn", "chat_id")):
+        if "telegram" in name_lower or "telegram" in server:
+            score += 60.0
+
+    if any(sp_kw in query for sp_kw in ("shopee", "shopee.vn", "đánh giá shopee", "review shopee")):
+        if name_lower.startswith("browser_"):
+            score = -100.0  # CDP browser tools blocked on Shopee
+        elif "shopee" in name_lower or name_lower in ("crawl_and_export_bundle", "download_media_from_csv"):
+            score += 80.0
+
+    return score
 
 
 def _cap_tools(
-    tools: Optional[list[dict[str, Any]]], base_url: Optional[str]
+    tools: Optional[list[dict[str, Any]]],
+    base_url: Optional[str],
+    messages: Optional[list[dict[str, Any]]] = None,
 ) -> Optional[list[dict[str, Any]]]:
-    """Trim `tools` to the endpoint's cap, keeping the highest-ranked ones and
-    preserving their original order. No-op when under the cap or the endpoint is
-    uncapped."""
+    """Trim tools to the endpoint's cap, keeping the highest-ranked ones according to
+    context-aware scoring and preserving their original order. No-op when under the cap or
+    the endpoint is uncapped."""
     cap = _tool_cap_for(base_url)
     if not tools or cap is None or len(tools) <= cap:
         return tools
-    # Stable sort by descending rank keeps original order within a rank; take the top
-    # `cap`, then restore original order among the survivors for a stable payload.
-    keep = set(id(t) for t in sorted(tools, key=_tool_rank, reverse=True)[:cap])
-    trimmed = [t for t in tools if id(t) in keep]
+
+    query = _extract_recent_query(messages)
+    ranked = sorted(
+        enumerate(tools),
+        key=lambda item: (_tool_rank(item[1], query), -item[0]),
+        reverse=True,
+    )
+    keep_indices = set(idx for idx, _ in ranked[:cap])
+    trimmed = [t for idx, t in enumerate(tools) if idx in keep_indices]
+
     _log.warning(
-        "Trimmed tool list %d -> %d for %s (provider caps at %d); dropped lowest-priority tools.",
+        "Trimmed tool list %d -> %d for %s (cap=%d, query='%s'); dropped lowest-priority tools.",
         len(tools),
         len(trimmed),
         base_url,
         cap,
+        query[:50],
     )
     return trimmed
 
@@ -256,7 +345,7 @@ class OpenAIProvider(ProviderClient):
             "messages": _strip_foreign_sidecars(messages),
             **settings,
         }
-        tools = _cap_tools(tools, self._base_url)
+        tools = _cap_tools(tools, self._base_url, messages=messages)
         if tools:
             kwargs["tools"] = tools
         _pin_reasoning_effort(kwargs)
@@ -306,7 +395,7 @@ class OpenAIProvider(ProviderClient):
             "stream_options": {"include_usage": True},
             **settings,
         }
-        tools = _cap_tools(tools, self._base_url)
+        tools = _cap_tools(tools, self._base_url, messages=messages)
         if tools:
             kwargs["tools"] = tools
         _pin_reasoning_effort(kwargs)

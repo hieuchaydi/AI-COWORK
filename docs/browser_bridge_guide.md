@@ -18,7 +18,7 @@ Hệ thống điều khiển trình duyệt của `AI-COWORK` trước đây d�
 
 ```
 Codex / MCP Client / Local Engine
-    ↕ Python Typed Transport (WebSocketTransport / HttpPollingTransport)
+    ↕ Python Typed Transport hoặc HTTP API của launcher
 Browser Gateway (:8766 / :8767) (127.0.0.1 only)
     ↕ RFC 6455 WebSocket (Envelope v1 Protocol)
 Chrome Extension MV3 (Chrome Profile thật)
@@ -152,7 +152,7 @@ python launch.py
 Lúc này Gateway sẽ tự động lắng nghe:
 - HTTP API & WebSocket Upgrade: `http://127.0.0.1:8766`
 - Raw WebSocket Endpoint: `ws://127.0.0.1:8767/browser-extension`
-- Đồng thời Chrome sẽ tự khởi động với profile chuyên biệt tại `chrome-profile/` đã tải sẵn extension.
+- Chrome mở profile riêng tại `chrome-profile/`. Lần đầu cần bật Developer mode và Load unpacked thư mục `browser-extension/` trong `chrome://extensions/`. Chrome chính thức từ bản 137 không hỗ trợ tự nạp bằng `--load-extension`; launcher không coi việc mở Chrome là đã kết nối extension.
 
 ### Cài đặt Extension thủ công trên Chrome thường (tùy chọn)
 1. Mở Chrome, truy cập: `chrome://extensions/`
@@ -164,43 +164,82 @@ Lúc này Gateway sẽ tự động lắng nghe:
 
 ---
 
-## 7. Migration Guide: Từ HTTP Polling sang WebSocket
+## 7. Extension dùng WebSocket cho toàn bộ luồng công việc
 
-Nếu bạn đang có code sử dụng cơ chế queue HTTP cũ (`/ingest/job`, `/ingest/jobs`, `/ingest/result`), việc chuyển đổi sang WebSocket cực kỳ đơn giản:
+Sau khi ghép nối, extension chỉ dùng socket cho lệnh, job, tiến độ, kết quả,
+báo lỗi, heartbeat và xác minh. Không còn HTTP polling `/ingest/jobs`, POST
+`/ingest/progress`, POST `/ingest`, hay HTTP `/ping` trong extension.
+HTTP `/browser/pair` chỉ bootstrap token trước WebSocket handshake; HTTP fetch
+đến website để lấy dữ liệu vẫn là giao thức của chính website đó.
 
-### Code cũ (HTTP Polling)
+- Gateway → extension: `command`, `ingest.job`, `cancel`, `verification.resolved`.
+- Extension → gateway: `accepted`, `result`, `error`, `ping`, sự kiện xác minh.
+- Upload ingest: `ingest.rpc` chứa `params.operation` là `progress`, `chunk`
+  hoặc `complete`; gateway trả `ingest.reply` với cùng `id`, `ok`, `result/error`.
+- Kết quả lớn được chia thành chunk theo thứ tự, tối đa tổng 64 MiB/upload.
+  Gói chưa được xác nhận được gửi lại cùng ID, tối đa 5 phút. Gateway nhớ
+  request đã xử lý trong cache giới hạn 512 mục/10 phút để tránh lưu trùng.
+- Công việc lưu file và tải media chạy ngoài vòng đọc socket, giữ heartbeat
+  và lệnh điều khiển hoạt động trong lúc lưu kết quả.
+- Mất kết nối: extension reconnect bằng backoff; gateway giữ job đang chạy
+  để gửi lại khi kết nối phục hồi. Extension đang sống nhận diện job trùng.
+  Nếu worker đã khởi động lại, job chưa hoàn tất có thể chạy lại từ đầu.
+  Queue/upload chưa hoàn tất nằm trong RAM, không sống qua restart gateway.
+
+API HTTP `/ingest/job`, `/ingest/result` của launcher vẫn dành cho client cũ:
+client xếp job và đọc kết quả qua HTTP, nhưng gateway trao đổi với extension
+qua WebSocket. Reload extension tại `chrome://extensions` sau khi cập nhật.
+
+## 8. Gọi typed action từ client bên ngoài launcher
+
+Khi `python launch.py` đang chạy và extension đã kết nối, client gửi
+`POST http://127.0.0.1:8766/browser/command` với header
+`Authorization: Bearer <API_TOKEN>` (hoặc `X-Bridge-Token` chứa pairing token).
+Không đưa token vào URL. API_TOKEN là token của launcher đang chạy.
+
 ```python
-# Xếp job
-r = urllib.request.urlopen("http://127.0.0.1:8766/ingest/job?url=https://shopee.vn/product/1/2")
-job_id = json.loads(r.read())["job"]["id"]
+import json
+import os
+import urllib.request
 
-# Chờ kết quả bằng vòng lặp poll
-while True:
-    time.sleep(2)
-    res = json.loads(urllib.request.urlopen(f"http://127.0.0.1:8766/ingest/result?id={job_id}").read())
-    if res["ok"]:
-        data = res["result"]
-        break
-```
-
-### Code mới (TransportManager với Tự động Fallback)
-```python
-from browser_bridge.transport import TransportManager, WebSocketTransport, HttpPollingTransport
-from browser_ws_bridge import BrowserWebSocketBridge
-
-# Khởi tạo hoặc lấy instance bridge hiện có
-# TransportManager ưu tiên 100% qua WebSocket realtime, nếu extension ngắt kết nối sẽ tự động fallback sang HTTP polling
-transport_mgr = TransportManager(ws_transport=bridge.transport, http_transport=HttpPollingTransport(base_url="http://127.0.0.1:8766"))
-
-# Thực thi lệnh trực tiếp với typed params và correlation ID
-ok, result, error = transport_mgr.execute(
-    action="page.navigate",
-    params={"url": "https://shopee.vn/product/1/2", "waitUntil": "networkidle"},
-    deadline_ms=15000,
+request = urllib.request.Request(
+    "http://127.0.0.1:8766/browser/command",
+    data=json.dumps({
+        "v": 1, "type": "command", "id": "list-tabs-1",
+        "action": "tab.list", "params": {}, "deadlineMs": 10000,
+    }).encode("utf-8"),
+    headers={
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + os.environ["API_TOKEN"],
+    },
 )
-
-if ok:
-    print("Dữ liệu trả về tức thì:", result)
-else:
-    print("Lỗi thực thi:", error.message)
+with urllib.request.urlopen(request, timeout=15) as response:
+    print(json.load(response))
 ```
+
+Kết quả có `ok`, `id`, `result`, `error`. Deadline cho phép 1–120000 ms;
+body tối đa 8 MiB. Sai xác thực trả HTTP 401, website origin không được phép
+trả 403, envelope/params không hợp lệ trả 400. Lỗi thực thi trả `ok: false`
+và error có cấu trúc. API chỉ gửi typed action qua WebSocket; extension chưa
+kết nối sẽ trả lỗi, không chuyển thao tác DOM thành job cào dữ liệu HTTP.
+HTTP ingest cũ vẫn dùng cho job cào dữ liệu. Extension tự lấy lại pairing token
+của gateway mặc định sau khi launcher khởi động lại.
+
+
+## 9. Chẩn đoán kết nối
+
+- Chạy `run-web.bat` hoặc `.venv\Scripts\python.exe launch.py`. Chỉ chạy GUI,
+  backend hoặc `run.bat` (TUI) sẽ không tự tạo helper WebSocket.
+- Mở `http://127.0.0.1:8766/browser/status`: nếu không truy cập được, launcher
+  chưa chạy hoặc helper lỗi khởi động. `connected: false` nghĩa là gateway
+  đang chạy nhưng chưa có extension kết nối.
+- Trong đúng cửa sổ/profile Chrome đang dùng: mở `chrome://extensions`, bật
+  Developer mode, Load unpacked thư mục `browser-extension` của checkout này.
+  Sau khi cập nhật code, bấm Reload extension.
+- Popup hiển thị lỗi ghép nối/socket gần nhất. Connect lưu cấu hình trước khi
+  thử kết nối. Disconnect được ghi nhớ qua lần worker khởi động lại.
+- Ghép nối giới hạn 8 giây, handshake 10 giây; nếu gateway không gửi dữ liệu
+  trong hơn 45 giây, watchdog heartbeat đóng socket và reconnect theo backoff.
+  Các callback của lần kết nối cũ không được thay đổi kết nối mới.
+- Chrome 137+ đã bỏ cờ `--load-extension` trong bản Chrome chính thức:
+  https://groups.google.com/a/chromium.org/g/chromium-extensions/c/1-g8EFx2BBY

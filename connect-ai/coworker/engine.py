@@ -31,6 +31,7 @@ from .providers.errors import (
     friendly_model_error,
 )
 from .tools import ToolRegistry, route_tools_for_context
+from .tools import ToolRegistry, route_tools_for_context, prune_acknowledged_payloads
 
 # Quota/rate-limit recovery (connect-AI patch). Running out of quota mid-turn used
 # to end the turn with a red error and a Retry button — on a free Gemini tier that
@@ -539,6 +540,7 @@ class TurnEngine:
             self.registry,
             self.messages,
             agent_family=self.agent_family,
+            model=self.model,
         )
         tools = self.registry.schemas(active_names=active_names) or None
         model, messages, settings = (
@@ -1050,6 +1052,7 @@ class TurnEngine:
             for msg in self.messages
             if msg.get("role") != "notice"
         ]
+        out = prune_acknowledged_payloads(out)
         # PDF attachments (stored as `file` parts) are adapted to the ACTIVE model right
         # here — never in the persisted history — so a mid-session model switch always
         # re-decides: native PDF models get the real document, the rest get the local

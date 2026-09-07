@@ -616,3 +616,28 @@ def test_http_polling_network_error_handling():
     assert err.code == ErrorCode.INTERNAL_ERROR.value
     assert err.retryable is True
 
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_failed_send_cleans_pending_and_busy_state(raises):
+    def send(_):
+        if raises:
+            raise OSError("socket closed")
+        return False
+
+    transport = WebSocketTransport(send_fn=send, is_connected_fn=lambda: True)
+    transport.set_state(ExtensionState.CONNECTED)
+    ok, _, error = transport.execute_command("tab.list")
+    assert not ok and error is not None
+    assert transport.get_state() == ExtensionState.CONNECTED
+    assert not transport._pending
+
+
+def test_http_polling_accepts_helper_nested_job_response():
+    transport = HttpPollingTransport(
+        queue_fn=lambda url, kind: {"ok": True, "job": {"id": "nested-job"}},
+        get_result_fn=lambda job_id: ({"ok": True, "id": job_id}, None),
+    )
+    ok, result, error = transport.execute_command("shopee-reviews", {"url": "https://shopee.vn/product/1/2"})
+    assert ok and error is None
+    assert result["id"] == "nested-job"

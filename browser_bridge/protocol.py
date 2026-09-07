@@ -42,6 +42,7 @@ class ErrorCode(str, Enum):
     PAYLOAD_TOO_LARGE = "PAYLOAD_TOO_LARGE"
     SAME_ORIGIN_VIOLATION = "SAME_ORIGIN_VIOLATION"
     VERIFICATION_REQUIRED = "VERIFICATION_REQUIRED"
+    CLIENT_ALREADY_CONNECTED = "CLIENT_ALREADY_CONNECTED"
     INTERNAL_ERROR = "INTERNAL_ERROR"
 
 
@@ -147,4 +148,3 @@ def redact_sensitive_data(val: Any) -> Any:
         if "data:image" in val or "base64," in val:
             return f"{val[:32]}...[DATA_TRUNCATED_{len(val)}B]"
     return val
-

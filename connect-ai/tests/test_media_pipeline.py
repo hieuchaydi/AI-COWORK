@@ -11,7 +11,8 @@ if str(REPO_ROOT) not in sys.path:
 
 import pytest
 from coworker.tools.crawl import make_crawl_tools
-from coworker.tools.media_pipeline import crawl_and_export_bundle
+from coworker.tools.media_pipeline import crawl_and_export_bundle, download_media_from_csv
+from coworker.tools.router import categorize_tool, ToolCategory
 
 
 def test_crawl_and_export_bundle_no_media(tmp_path):
@@ -377,6 +378,186 @@ def test_crawl_and_export_bundle_fallback_default_output_dir(monkeypatch):
         Path(res["csv"]["path"]).unlink(missing_ok=True)
         Path(res["zip"]["path"]).unlink(missing_ok=True)
         Path(res["report"]["path"]).unlink(missing_ok=True)
+
+
+def test_download_media_from_csv_explicit_columns(tmp_path, monkeypatch):
+    """Verify download_media_from_csv extracts media URLs from specified columns,
+    packages ZIP, generates report, and returns metadata."""
+    csv_file = tmp_path / "products.csv"
+    csv_content = (
+        "\ufeffsku,title,image_url,video_url,notes\n"
+        "SKU01,Laptop,https://example.com/laptop.jpg,https://example.com/laptop_demo.mp4,Note 1\n"
+        "SKU02,Mouse,https://example.com/mouse.png,,Note 2\n"
+    )
+    csv_file.write_text(csv_content, encoding="utf-8")
+
+    captured = {}
+
+    def mock_download_and_zip(urls, zip_filename, folder_name, output_dir="", **kwargs):
+        captured["urls"] = urls
+        captured["folder_name"] = folder_name
+        zpath = Path(output_dir) / "zips" / zip_filename
+        zpath.parent.mkdir(parents=True, exist_ok=True)
+        zpath.write_bytes(b"PK0304mockzip")
+        return {
+            "ok": True,
+            "zip_path": str(zpath),
+            "zip_url": f"http://localhost:8766/outputs/zips/{zip_filename}",
+            "zip_urls": [f"http://localhost:8766/outputs/zips/{zip_filename}"],
+            "part_count": 1,
+            "file_count": len(urls),
+            "unique_count": len(urls),
+            "duplicate_count": 0,
+            "skipped_count": 0,
+            "failed_count": 0,
+            "media_folder": str(Path(output_dir) / "media" / folder_name),
+            "manifest_path": str(Path(output_dir) / "media" / folder_name / "manifest.json"),
+            "manifest": {"job_name": folder_name, "files": []},
+        }
+
+    monkeypatch.setattr("coworker.tools.media_pipeline._download_media_and_zip", mock_download_and_zip)
+
+    res = download_media_from_csv(
+        csv_path=str(csv_file),
+        url_columns=["image_url", "video_url"],
+        job_name="products_export",
+        output_dir=str(tmp_path),
+    )
+
+    assert res.get("ok") is True
+    assert res["job_name"] == "products_export"
+    assert res["row_count"] == 2
+    assert res["media_found"] == 3
+    assert captured["urls"] == [
+        "https://example.com/laptop.jpg",
+        "https://example.com/laptop_demo.mp4",
+        "https://example.com/mouse.png",
+    ]
+    assert res["zip"]["file_count"] == 3
+    assert "products_export_media.zip" in res["zip"]["filename"]
+    assert Path(res["zip"]["path"]).exists()
+
+    # Report verification
+    report_file = Path(res["report"]["path"])
+    assert report_file.exists()
+    report_text = report_file.read_text(encoding="utf-8")
+    assert "Media Extraction Report: products_export" in report_text
+    assert "**Tổng số dòng CSV**: 2" in report_text
+    assert "**Số media URL tìm thấy**: 3" in report_text
+
+
+def test_download_media_from_csv_autodetect_columns(tmp_path, monkeypatch):
+    """Verify download_media_from_csv automatically detects columns with media URLs."""
+    csv_file = tmp_path / "reviews.csv"
+    csv_content = (
+        "user,comment,anh_urls,rating\n"
+        "Alice,Tuyet voi,https://example.com/a1.jpg,5\n"
+        "Bob,Tot,https://example.com/b1.png,4\n"
+    )
+    csv_file.write_text(csv_content, encoding="utf-8")
+
+    captured_urls = []
+
+    def mock_download_and_zip(urls, zip_filename, folder_name, output_dir="", **kwargs):
+        captured_urls.extend(urls)
+        zpath = Path(output_dir) / "zips" / zip_filename
+        zpath.parent.mkdir(parents=True, exist_ok=True)
+        zpath.write_bytes(b"PK0304mockzip")
+        return {
+            "ok": True,
+            "zip_path": str(zpath),
+            "zip_url": f"http://localhost:8766/outputs/zips/{zip_filename}",
+            "file_count": len(urls),
+            "unique_count": len(urls),
+            "duplicate_count": 0,
+            "skipped_count": 0,
+            "failed_count": 0,
+            "media_folder": str(Path(output_dir) / "media" / folder_name),
+        }
+
+    monkeypatch.setattr("coworker.tools.media_pipeline._download_media_and_zip", mock_download_and_zip)
+
+    res = download_media_from_csv(csv_path=str(csv_file), output_dir=str(tmp_path))
+    assert res.get("ok") is True
+    assert res["media_found"] == 2
+    assert captured_urls == ["https://example.com/a1.jpg", "https://example.com/b1.png"]
+
+
+def test_download_media_from_csv_handles_pipe_and_json_urls(tmp_path, monkeypatch):
+    """Verify multi-URL cells (pipe-separated and JSON arrays) are split and deduplicated."""
+    csv_file = tmp_path / "multi.csv"
+    csv_content = (
+        "id,gallery\n"
+        "1,\"https://example.com/pic1.jpg|https://example.com/pic2.png\"\n"
+        "2,\"[\"\"https://example.com/pic2.png\"\", \"\"https://example.com/pic3.webp\"\"]\"\n"
+    )
+    csv_file.write_text(csv_content, encoding="utf-8")
+
+    captured_urls = []
+
+    def mock_download_and_zip(urls, zip_filename, folder_name, output_dir="", **kwargs):
+        captured_urls.extend(urls)
+        zpath = Path(output_dir) / "zips" / zip_filename
+        zpath.parent.mkdir(parents=True, exist_ok=True)
+        zpath.write_bytes(b"PK0304mockzip")
+        return {
+            "ok": True,
+            "zip_path": str(zpath),
+            "zip_url": f"http://localhost:8766/outputs/zips/{zip_filename}",
+            "file_count": len(urls),
+            "unique_count": len(urls),
+            "duplicate_count": 0,
+            "skipped_count": 0,
+            "failed_count": 0,
+            "media_folder": str(Path(output_dir) / "media" / folder_name),
+        }
+
+    monkeypatch.setattr("coworker.tools.media_pipeline._download_media_and_zip", mock_download_and_zip)
+
+    res = download_media_from_csv(csv_path=str(csv_file), output_dir=str(tmp_path))
+    assert res.get("ok") is True
+    # pic2.png was duplicated across row 1 and row 2 -> deduplicated to 3 unique URLs
+    assert res["media_found"] == 3
+    assert captured_urls == [
+        "https://example.com/pic1.jpg",
+        "https://example.com/pic2.png",
+        "https://example.com/pic3.webp",
+    ]
+
+
+def test_download_media_from_csv_registered_as_crawl_tool():
+    """Verify that download_media_from_csv is registered in make_crawl_tools and router."""
+    tools = {t.__name__: t for t in make_crawl_tools()}
+    assert "download_media_from_csv" in tools
+    assert categorize_tool("download_media_from_csv") == ToolCategory.CRAWL
+
+
+def test_download_media_from_csv_error_cases(tmp_path):
+    """Verify error handling for nonexistent files, empty files, or missing media."""
+    # 1. Nonexistent file
+    res1 = download_media_from_csv("nonexistent_path_123.csv")
+    assert res1.get("ok") is False
+    assert "CSV file not found" in res1["error"]
+
+    # 2. Empty CSV
+    empty_file = tmp_path / "empty.csv"
+    empty_file.write_text("", encoding="utf-8")
+    res2 = download_media_from_csv(str(empty_file))
+    assert res2.get("ok") is False
+    assert "Failed to read CSV" in res2["error"] or "has no headers" in res2["error"]
+
+    # 3. CSV with no media URLs
+    no_media_file = tmp_path / "no_media.csv"
+    no_media_file.write_text("name,price\nItem A,100\nItem B,200\n", encoding="utf-8")
+    res3 = download_media_from_csv(str(no_media_file))
+    assert res3.get("ok") is False
+    assert "No image or video URLs found" in res3["error"]
+
+    # 4. Invalid specified columns
+    res4 = download_media_from_csv(str(no_media_file), url_columns=["nonexistent_col"])
+    assert res4.get("ok") is False
+    assert "None of the specified url_columns" in res4["error"]
+
 
 
 

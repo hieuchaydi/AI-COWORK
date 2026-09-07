@@ -60,6 +60,18 @@ class BrowserTransport(ABC):
         """Attempts to cancel an in-flight command."""
         pass
 
+    def require_verification(self, url: str = "", reason: str = "") -> None:
+        """Sets the transport state to awaiting user verification."""
+        pass
+
+    def resume_verification(self) -> None:
+        """Resumes transport state from awaiting user verification back to connected."""
+        pass
+
+    def is_paused(self) -> bool:
+        """Returns True if the transport is paused awaiting verification."""
+        return False
+
 
 class _PendingCommand:
     def __init__(self, command_id: str, action: str, deadline: float):
@@ -155,6 +167,14 @@ class WebSocketTransport(BrowserTransport):
             if self._state == ExtensionState.AWAITING_USER_VERIFICATION:
                 self._state = ExtensionState.CONNECTED
                 self._verification_info = None
+
+    def require_verification(self, url: str = "", reason: str = "") -> None:
+        with self._lock:
+            self.set_state(ExtensionState.AWAITING_USER_VERIFICATION, {"url": url, "reason": reason})
+
+    def is_paused(self) -> bool:
+        with self._lock:
+            return self._state == ExtensionState.AWAITING_USER_VERIFICATION
 
     def handle_inbound_envelope(self, envelope_data: Dict[str, Any]) -> None:
         """Processes an incoming message envelope from the extension."""
@@ -310,7 +330,7 @@ class WebSocketTransport(BrowserTransport):
 
             with self._lock:
                 self._pending.pop(cid, None)
-                if self._state == ExtensionState.BUSY:
+                if self._state == ExtensionState.BUSY and not self._pending:
                     self._state = ExtensionState.CONNECTED
 
             if not finished:
@@ -327,7 +347,15 @@ class WebSocketTransport(BrowserTransport):
                 return False, None, pending.error
 
             return True, pending.result, None
+        except Exception as exc:
+            return False, None, BridgeError.create(
+                ErrorCode.INTERNAL_ERROR, f"Command transmission failed: {exc}", retryable=True,
+            )
         finally:
+            with self._lock:
+                self._pending.pop(cid, None)
+                if self._state == ExtensionState.BUSY and not self._pending:
+                    self._state = ExtensionState.CONNECTED
             self._semaphore.release()
 
     def cancel_command(self, command_id: str) -> bool:
@@ -401,7 +429,7 @@ class HttpPollingTransport(BrowserTransport):
             )
 
         job = self._queue_fn(url, action)
-        job_id = job.get("id", "")
+        job_id = (job.get("job") or job).get("id", "")
         if not job_id:
             return False, None, BridgeError.create(
                 ErrorCode.INTERNAL_ERROR,
