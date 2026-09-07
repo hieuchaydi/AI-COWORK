@@ -207,6 +207,12 @@ test('classifies Shopee API 403 separately from login and traffic verification',
     textSample: 'challenge'
   })`, context), 'verification');
   assert.equal(vm.runInContext(`classifyShopeeFailure({
+    status: 200,
+    url: 'https://shopee.vn/api/v2/item/get_ratings',
+    pageUrl: 'https://shopee.vn/verify/traffic?anti_bot_tracking_id=redacted',
+    json: { is_login: true }
+  })`, context), 'verification');
+  assert.equal(vm.runInContext(`classifyShopeeFailure({
     status: 403,
     url: 'https://shopee.vn/api/v2/item/get_ratings',
     json: { error: 90309999, is_login: false },
@@ -392,6 +398,8 @@ test('ratings preflight and pagination execute in the Shopee page MAIN world', a
     { world: 'MAIN', tabId: 42 },
     { world: 'MAIN', tabId: 42 },
   ]);
+  assert.equal(vm.runInContext('PAGE_SIZE', context), 6);
+  assert.equal(vm.runInContext('PACE_MS', context), 1200);
 });
 
 test('extractShopeeReviews halts with login_required before crawl when preflight fails login', async () => {

@@ -12,9 +12,11 @@
 // 6. Backward-compatible Shopee reviews extraction and acknowledged WebSocket result uploads.
 
 const HELPER = "http://127.0.0.1:8766";
-const PAGE_SIZE = 50;
+// Match the Shopee web UI request size. Large batches (for example 50) make
+// an otherwise valid in-page session get redirected to /verify/traffic.
+const PAGE_SIZE = 6;
 const MAX_REVIEWS = 20000;
-const PACE_MS = 700;
+const PACE_MS = 1200;
 
 // ── State Variables ──────────────────────────────────────────────────────────
 let bridgeSocket = null;
@@ -522,10 +524,12 @@ function shopeeLoginState(fetchRes) {
 function classifyShopeeFailure(fetchRes) {
   const json = fetchRes?.json || {};
   const url = String(fetchRes?.url || "").toLowerCase();
+  const pageUrl = String(fetchRes?.pageUrl || "").toLowerCase();
   const sample = String(fetchRes?.textSample || fetchRes?.error || "").toLowerCase();
   if (shopeeLoginState(fetchRes) === false) return "login";
 
-  const isChallenge = url.includes("/verify/traffic") || sample.includes("captcha") ||
+  const isChallenge = url.includes("/verify/traffic") || pageUrl.includes("/verify/traffic") ||
+                      sample.includes("captcha") ||
                       sample.includes("challenge") || sample.includes("verify/traffic");
   if (isChallenge) return "verification";
 
@@ -546,7 +550,7 @@ function formatShopeeFailure(fetchRes) {
     return `Shopee login required (HTTP ${status}, error=${fetchRes?.json?.error ?? "unknown"}, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome`;
   }
   if (kind === "verification") {
-    return `Shopee verification required (HTTP ${status}) — response=${endpoint}`;
+    return `Shopee verification required (HTTP ${status}) — tab=${page}; response=${endpoint}`;
   }
   return `Shopee reviews API access denied (HTTP ${status}) — không thấy CAPTCHA trên tab; endpoint=${endpoint}; tab=${page}; response=${sample || "empty"}`;
 }
