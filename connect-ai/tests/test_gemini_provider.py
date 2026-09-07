@@ -55,9 +55,9 @@ def _text_part(text):
     return SimpleNamespace(text=text, function_call=None)
 
 
-def _call_part(name, args):
+def _call_part(name, args, call_id=None):
     return SimpleNamespace(
-        text=None, function_call=SimpleNamespace(name=name, args=args)
+        text=None, function_call=SimpleNamespace(name=name, args=args, id=call_id)
     )
 
 
@@ -98,15 +98,15 @@ def test_convert_assistant_tool_turn_maps_role_model():
     # skip-validation sentinel so Gemini 3 doesn't 400 on the missing thought_signature.
     assert contents[1]["parts"] == [
         {
-            "function_call": {"name": "f", "args": {"x": 1}},
+            "function_call": {"name": "f", "args": {"x": 1}, "id": "call_0"},
             "thought_signature": _SKIP_SIGNATURE,
         }
     ]
 
 
-def test_convert_tool_results_map_id_to_name_and_merge():
-    # Function calls have no wire ids: results must map back to the function NAME, and a run
-    # of parallel results must fold into ONE user message.
+def test_convert_tool_results_replay_id_and_name_and_merge():
+    # Gemini 3.8 requires both id and name on FunctionResponse; a run of parallel results
+    # must still fold into ONE user message.
     _, contents = convert_messages(
         [
             {"role": "user", "content": "go"},
@@ -133,10 +133,12 @@ def test_convert_tool_results_map_id_to_name_and_merge():
     assert [c["role"] for c in contents] == ["user", "model", "user"]
     responses = [p["function_response"] for p in contents[2]["parts"]]
     assert responses[0] == {
+        "id": "call_0",
         "name": "a",
         "response": {"ok": True},
     }  # JSON result passes through
     assert responses[1] == {
+        "id": "call_1",
         "name": "b",
         "response": {"result": "plain text"},
     }  # string wrapped
@@ -335,6 +337,15 @@ def test_complete_parses_function_calls_with_synthesized_ids():
     assert turn.tool_calls[0].arguments == {"path": "a.txt"}
 
 
+def test_complete_preserves_provider_function_call_ids():
+    fake = _FakeClient(response=_response([_call_part("write_file", {}, "fc_abc")]))
+    provider = GeminiProvider(client=fake)
+    turn = provider.complete(
+        model="gemini-3.8-flash", messages=[{"role": "user", "content": "go"}]
+    )
+    assert [(c.id, c.name) for c in turn.tool_calls] == [("fc_abc", "write_file")]
+
+
 @pytest.mark.parametrize(
     "finish,expected",
     [
@@ -372,6 +383,31 @@ def test_complete_filters_and_aliases_settings():
         and "stop" not in config
         and "max_tokens" not in config
     )
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gemini-3.6-flash",
+        "gemini-3.7-flash",
+        "gemini-3.8-flash",
+        "gemini-4-flash",
+    ],
+)
+def test_complete_strips_legacy_sampling_for_new_gemini_models(model):
+    fake = _FakeClient(response=_response([_text_part("x")]))
+    provider = GeminiProvider(client=fake)
+    provider.complete(
+        model=model,
+        messages=[{"role": "user", "content": "x"}],
+        temperature=0.2,
+        top_p=0.8,
+        top_k=20,
+        max_tokens=512,
+    )
+    config = fake.kwargs["config"]
+    assert not {"temperature", "top_p", "top_k"} & config.keys()
+    assert config["max_output_tokens"] == 512
 
 
 def test_complete_passes_converted_tools_in_config():
@@ -487,6 +523,37 @@ def test_gemini_capabilities_parallel_tool_calls():
     caps = capabilities_for("gemini:gemini-2.5-flash")
     assert caps.tools and caps.vision and caps.streaming
     assert caps.parallel_tool_calls is True  # native provider folds results correctly
+
+
+def test_curated_gemini_catalog_contains_general_llms_only():
+    from coworker.providers.matrix import models_for_provider
+
+    models = models_for_provider("gemini")
+    expected = {
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-pro-preview",
+        "gemini-3.1-flash-lite",
+        "gemini-3-flash-preview",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemma-4-31b-it",
+        "gemma-4-26b-a4b-it",
+    }
+    assert expected <= set(models)
+    assert not any(
+        marker in model
+        for model in models
+        for marker in ("image", "live", "tts", "embedding", "antigravity")
+    )
+
+    gemma_caps = capabilities_for("gemini:gemma-4-31b-it")
+    assert gemma_caps.tools and gemma_caps.vision and gemma_caps.streaming
+    assert not gemma_caps.pdf and not gemma_caps.parallel_tool_calls
 
 
 def test_convert_pdf_file_part_to_inline_data():
@@ -636,6 +703,17 @@ def test_convert_signature_parts_validate_as_sdk_types():
     )
     part = types_mod.Part.model_validate(contents[-1]["parts"][0])
     assert part.thought_signature == b"sig"
+
+    response_part = types_mod.Part.model_validate(
+        {
+            "function_response": {
+                "id": "call_0",
+                "name": "a",
+                "response": {"ok": True},
+            }
+        }
+    )
+    assert response_part.function_response.id == "call_0"
 
 
 def test_thought_summaries_requested_and_surfaced_as_reasoning():

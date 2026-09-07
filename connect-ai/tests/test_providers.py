@@ -470,14 +470,15 @@ def test_matrix_labels_and_custom_model_fallback():
     labels = model_labels()
     assert labels["together:zai-org/GLM-5.2"] == "GLM-5.2 · via Together"
     assert labels["zai:glm-5.2"] == "GLM-5.2 · Z AI"
-    # Deliberately small: agent-capable current models only (owner call, 2026-07-04).
-    assert len(MATRIX) < 60
+    # Deliberately small: agent-capable current models only. The ceiling leaves room for
+    # the official Gemini 2.5/3.x generations while still catching catalog bloat.
+    assert len(MATRIX) < 70
     assert all(e.caps.tools for e in MATRIX.values())
     assert labels["gemini:gemma-4-31b-it"] == "Gemma 4 31B · Google"
     assert labels["gemini:gemma-4-26b-a4b-it"] == "Gemma 4 26B A4B · Google"
     assert labels["gemini:gemini-3.8-flash"] == "Gemini 3.8 Flash · Google"
     gemma_caps = capabilities_for("gemini:gemma-4-31b-it")
-    assert gemma_caps.tools and gemma_caps.vision and gemma_caps.pdf
+    assert gemma_caps.tools and gemma_caps.vision and not gemma_caps.pdf
     assert not gemma_caps.parallel_tool_calls
     # A custom (unlisted) reseller model falls back to the conservative default — usable,
     # but at the user's own risk (no parallel tool calls assumed).

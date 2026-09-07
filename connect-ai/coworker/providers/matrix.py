@@ -34,7 +34,7 @@ _AGENTIC = ModelCapabilities(
 _AGENTIC_VISION_SERIAL = ModelCapabilities(
     tools=True,
     vision=True,
-    pdf=True,
+    pdf=False,
     parallel_tool_calls=False,
     streaming=True,
 )
@@ -79,10 +79,11 @@ MATRIX: dict[str, ModelEntry] = {
     "anthropic:claude-haiku-4-5": ModelEntry(
         "Claude Haiku 4.5 · Anthropic", _AGENTIC_VISION, 200_000
     ),
-    # Google AI Studio catalogue checked live 2026-09-07. Put the high daily-quota
-    # Flash-Lite models first, then Gemma's 14.4K/day pools, then the low-RPD Flash
-    # generations. Gemma 4 supports native tool use and multimodal input; keep
-    # parallel tool calls conservative until the hosted API documents that behavior.
+    # Google AI Studio catalogue checked live 2026-09-07 and cross-checked against the
+    # official model pages. Put the high daily-quota Flash-Lite models first, then
+    # Gemma's 14.4K/day pools, then the lower-RPD generations. Gemma 4's hosted API
+    # documents text/image input and native tools, but not direct PDF input or parallel
+    # tool calls, so both capabilities stay conservative.
     "gemini:gemini-3.5-flash-lite": ModelEntry(
         "Gemini 3.5 Flash-Lite · Google", _AGENTIC_VISION, 1_048_576
     ),
@@ -109,6 +110,18 @@ MATRIX: dict[str, ModelEntry] = {
     ),
     "gemini:gemini-3.5-flash": ModelEntry(
         "Gemini 3.5 Flash · Google", _AGENTIC_VISION, 1_048_576
+    ),
+    "gemini:gemini-3-flash-preview": ModelEntry(
+        "Gemini 3 Flash (Preview) · Google", _AGENTIC_VISION, 1_048_576
+    ),
+    "gemini:gemini-2.5-pro": ModelEntry(
+        "Gemini 2.5 Pro · Google", _AGENTIC_VISION, 1_048_576
+    ),
+    "gemini:gemini-2.5-flash": ModelEntry(
+        "Gemini 2.5 Flash · Google", _AGENTIC_VISION, 1_048_576
+    ),
+    "gemini:gemini-2.5-flash-lite": ModelEntry(
+        "Gemini 2.5 Flash-Lite · Google", _AGENTIC_VISION, 1_048_576
     ),
     # -- direct OpenAI-compatible vendors ----------------------------------------
     # Muse Spark (Meta Model API, public preview 2026-07-09): multimodal + tools via

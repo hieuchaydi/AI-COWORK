@@ -6,8 +6,8 @@ must absorb:
 
 - The system prompt is `system_instruction` inside the request config, not a message role.
 - Roles are `user`/`model`; tool results ride as `function_response` parts in a user message.
-- Function calls carry NO ids — we synthesize `call_<n>` ids for the engine and map results
-  back by name (an id→name map built from the assistant turns during conversion).
+- Modern function calls carry ids which MUST be replayed on Gemini 3.8; older responses may
+  omit them, so we synthesize `call_<n>` ids only as a compatibility fallback.
 - Tool parameter schemas are an OpenAPI 3.0 subset: unsupported JSON Schema keys
   (`additionalProperties`, `$schema`, …) must be stripped or the API rejects the request.
 - Gemini 3 thought signatures: response parts carry `thought_signature` (bytes) that MUST
@@ -77,6 +77,22 @@ _SETTINGS_WHITELIST = {
     "max_output_tokens",
     "stop_sequences",
 }
+
+_LEGACY_SAMPLING_KEYS = {"temperature", "top_p", "top_k"}
+
+
+def _rejects_legacy_sampling(model: str) -> bool:
+    """Gemini 3.6+ rejects the legacy sampling controls outright.
+
+    Gemini 3 Flash (without a minor version), Gemini 3.1/3.5, Gemma, and Gemini 2.5
+    continue to accept them. Treat later major generations conservatively too.
+    """
+    match = re.match(r"^gemini-(\d+)(?:\.(\d+))?-", model)
+    if not match:
+        return False
+    major = int(match.group(1))
+    minor = int(match.group(2) or 0)
+    return major > 3 or (major == 3 and minor >= 6)
 
 # The OpenAPI-subset schema keys Gemini function declarations accept.
 _SCHEMA_KEYS = {
@@ -239,12 +255,13 @@ def convert_messages(
                 function = call.get("function") or {}
                 name = function.get("name") or ""
                 call_names[call.get("id") or ""] = name
-                part = {
-                    "function_call": {
-                        "name": name,
-                        "args": _parse_args(function.get("arguments")),
-                    }
+                wire_call = {
+                    "name": name,
+                    "args": _parse_args(function.get("arguments")),
                 }
+                if call.get("id"):
+                    wire_call["id"] = call["id"]
+                part = {"function_call": wire_call}
                 sig = call_sigs[i] if i < len(call_sigs) else None
                 # Real signature when we have one; otherwise the skip-validation sentinel
                 # so an unsigned call (failover / parallel-call quirk) doesn't 400 the turn.
@@ -260,6 +277,7 @@ def convert_messages(
                     "parts": [
                         {
                             "function_response": {
+                                "id": call_id,
                                 "name": call_names.get(call_id) or call_id,
                                 "response": _result_payload(message.get("content")),
                             }
@@ -379,7 +397,7 @@ def _parse_candidate(response: Any) -> _Parsed:
         if function_call is not None:
             out.calls.append(
                 ToolCall(
-                    id="",
+                    id=getattr(function_call, "id", "") or "",
                     name=getattr(function_call, "name", "") or "",
                     arguments=dict(getattr(function_call, "args", None) or {}),
                 )
@@ -457,6 +475,9 @@ class GeminiProvider(ProviderClient):
         config: dict[str, Any] = {
             k: v for k, v in settings.items() if k in _SETTINGS_WHITELIST
         }
+        if _rejects_legacy_sampling(model):
+            for key in _LEGACY_SAMPLING_KEYS:
+                config.pop(key, None)
         # Thinking models (2.5+/3.x — all our curated ids) think by default; ask for the
         # thought SUMMARIES too so the GUI can show them. Parse-side keeps them out of
         # answer text (`thought` parts → reasoning).
@@ -484,7 +505,7 @@ class GeminiProvider(ProviderClient):
         response = self._ensure_client().models.generate_content(**kwargs)
         parsed = _parse_candidate(response)
         tool_calls = [
-            ToolCall(id=f"call_{i}", name=c.name, arguments=c.arguments)
+            ToolCall(id=c.id or f"call_{i}", name=c.name, arguments=c.arguments)
             for i, c in enumerate(parsed.calls)
         ]
         return AssistantTurn(
@@ -543,7 +564,7 @@ class GeminiProvider(ProviderClient):
                 finish = parsed.finish
 
         tool_calls = [
-            ToolCall(id=f"call_{i}", name=c.name, arguments=c.arguments)
+            ToolCall(id=c.id or f"call_{i}", name=c.name, arguments=c.arguments)
             for i, c in enumerate(calls)
         ]
         yield StreamChunk(
