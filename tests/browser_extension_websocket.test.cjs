@@ -107,6 +107,16 @@ test('getStatus reports the live service-worker socket instead of stale storage'
   assert.equal(stored.extensionState, 'disconnected');
 });
 
+test('starting a new job clears stale Shopee attention from the popup', async () => {
+  const { context, stored } = await worker();
+  vm.runInContext(`
+    updateState("api_blocked", { kind: "api_blocked", job_id: "old-job" });
+    updateState("busy");
+  `, context);
+  assert.equal(stored.extensionState, 'busy');
+  assert.equal(stored.verificationInfo, null);
+});
+
 test('duplicate owner errors stop reconnect and require an explicit takeover', async () => {
   const { context, sockets, stored } = await worker();
   await vm.runInContext(`dispatchEnvelope({

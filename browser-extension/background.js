@@ -62,6 +62,10 @@ function updateState(newState, details = null) {
       setBadge("PAUS", "#f9ab00");
     }
   } else if (newState === "busy") {
+    // A newly accepted job supersedes terminal attention from an older job.
+    // Keeping this object made the popup show a stale Blocked/Login card while
+    // the current crawl was already progressing successfully.
+    verificationInfo = null;
     setBadge("BUSY", "#1a73e8");
   } else if (newState === "client_conflict") {
     connectionConflict = details || connectionConflict;
