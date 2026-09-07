@@ -3744,16 +3744,27 @@ def _seed_runtime_state() -> None:
     # 1. Model picker — everything the user might switch to. Add is idempotent (re-add
     # of an existing id is a no-op inside OpenWorker).
     picker = [
-        "gemini:gemini-3.7-flash",                # DEFAULT — newest Flash, GA 2026-08-13
-        "gemini:gemini-3.6-flash",                 # previous gen Flash, GA 2026-07-21
-        "gemini:gemini-3.5-flash-lite",            # cost-efficient, high throughput
-        "gemini:gemini-3.1-pro-preview",           # bigger reasoning
-        # Groq GPT-OSS — replaces llama-3.3-70b-versatile (deprecated 2026-08-16).
-        # Free tier, 128k context, OpenAI-compat. Still subject to TPM caps on free
-        # accounts — Dev-tier key recommended for agent work.
-        "groq:openai/gpt-oss-120b",               # best tool-use on Groq
-        "groq:openai/gpt-oss-20b",                 # lighter, faster fallback
+        # Google key is mandatory for this launcher. Order by useful free-tier pool:
+        # Flash-Lite 500 RPD, Gemma 14.4K RPD, then newer Flash/Pro reasoning models.
+        "gemini:gemini-3.5-flash-lite",
+        "gemini:gemini-3.1-flash-lite",
+        "gemini:gemma-4-31b-it",
+        "gemini:gemma-4-26b-a4b-it",
+        "gemini:gemini-3.8-flash",
+        "gemini:gemini-3.1-pro-preview",
+        "gemini:gemini-3.7-flash",
+        "gemini:gemini-3.6-flash",
+        "gemini:gemini-3.5-flash",
     ]
+    # Never seed a provider without its key. The server also filters at read time,
+    # but gating here prevents stale/unusable custom entries accumulating in prefs.
+    if GROQ_KEY:
+        picker.extend(
+            [
+                "groq:openai/gpt-oss-120b",
+                "groq:openai/gpt-oss-20b",
+            ]
+        )
     # Cerebras — very fast OpenAI-compatible inference. Only seed when the key is present
     # (compat providers fail on first use without a key). gpt-oss-120b = best tool use.
     if CEREBRAS_KEY:
@@ -3798,9 +3809,10 @@ def _seed_runtime_state() -> None:
     # up entries seeded by earlier boots that would otherwise poison the failover chain.
     hide = [
         "gemini:gemini-2.5-flash",             # deprecated, shutdown 2026-10-16
+        "gemini:gemini-2.5-flash-lite",        # superseded by 3.1/3.5 Flash-Lite
         "gemini:gemini-2.5-pro",               # deprecated, shutdown 2026-10-16
-        "gemini:gemini-3.1-flash-lite",        # superseded by 3.5-flash-lite
         "gemini:gemini-3.1-flash-lite-preview",
+        "gemini:gemini-3-flash-preview",        # superseded by 3.5+
         "groq:llama-3.3-70b-versatile",        # deprecated 2026-08-16
         "ollama:qwen2.5:7b",
     ]
@@ -3814,7 +3826,7 @@ def _seed_runtime_state() -> None:
     for model in hide:
         _ow_post("/v1/settings/models/remove", {"model": model})
 
-    # 1c. Pin default model: Claude Haiku > Cloudflare gpt-oss-120b > Gemini 3.7 Flash.
+    # 1c. Pin default model: Claude Haiku > Cloudflare gpt-oss-120b > Gemini 3.5 Flash-Lite.
     # Pinned every boot so a fresh chat can't inherit qwen from a stale session (the
     # original cause of "why is my agent writing fake code").
     # gpt-oss-120b sits above Gemini deliberately (2026-08-08): the Gemini free tier here
@@ -3826,7 +3838,7 @@ def _seed_runtime_state() -> None:
     elif "cloudflare:@cf/openai/gpt-oss-120b" in picker:
         default_model = "cloudflare:@cf/openai/gpt-oss-120b"
     else:
-        default_model = "gemini:gemini-3.7-flash"
+        default_model = "gemini:gemini-3.5-flash-lite"
     _ow_post("/v1/settings/default-model", {"model": default_model})
 
     # 1c-bis. Global AGENTS.md. SETUP told the user to copy this into the state dir by

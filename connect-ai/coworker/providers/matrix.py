@@ -31,6 +31,14 @@ from .base import ModelCapabilities
 _AGENTIC = ModelCapabilities(
     tools=True, vision=False, parallel_tool_calls=True, streaming=True
 )
+_AGENTIC_VISION_SERIAL = ModelCapabilities(
+    tools=True,
+    vision=True,
+    pdf=True,
+    parallel_tool_calls=False,
+    streaming=True,
+)
+
 # The native three (OpenAI, Anthropic, Gemini) all take PDFs directly; every
 # OpenAI-compatible vendor and reseller in the matrix does not (their chat APIs have
 # no inline file part — checked 2026-07-17), so those fall back via pdf_support.py.
@@ -71,19 +79,36 @@ MATRIX: dict[str, ModelEntry] = {
     "anthropic:claude-haiku-4-5": ModelEntry(
         "Claude Haiku 4.5 · Anthropic", _AGENTIC_VISION, 200_000
     ),
-    # Gemini 3 (thought signatures required in tool loops — carried via the `_gemini`
-    # message sidecar, see gemini_provider.py; ids from the vendor catalog 2026-08-28).
-    "gemini:gemini-3.7-flash": ModelEntry(
-        "Gemini 3.7 Flash · Google", _AGENTIC_VISION, 1_048_576
+    # Google AI Studio catalogue checked live 2026-09-07. Put the high daily-quota
+    # Flash-Lite models first, then Gemma's 14.4K/day pools, then the low-RPD Flash
+    # generations. Gemma 4 supports native tool use and multimodal input; keep
+    # parallel tool calls conservative until the hosted API documents that behavior.
+    "gemini:gemini-3.5-flash-lite": ModelEntry(
+        "Gemini 3.5 Flash-Lite · Google", _AGENTIC_VISION, 1_048_576
+    ),
+    "gemini:gemini-3.1-flash-lite": ModelEntry(
+        "Gemini 3.1 Flash-Lite · Google", _AGENTIC_VISION, 1_048_576
+    ),
+    "gemini:gemma-4-31b-it": ModelEntry(
+        "Gemma 4 31B · Google", _AGENTIC_VISION_SERIAL, 262_144
+    ),
+    "gemini:gemma-4-26b-a4b-it": ModelEntry(
+        "Gemma 4 26B A4B · Google", _AGENTIC_VISION_SERIAL, 262_144
+    ),
+    "gemini:gemini-3.8-flash": ModelEntry(
+        "Gemini 3.8 Flash · Google", _AGENTIC_VISION, 1_048_576
     ),
     "gemini:gemini-3.1-pro-preview": ModelEntry(
         "Gemini 3.1 Pro · Google", _AGENTIC_VISION, 1_048_576
     ),
+    "gemini:gemini-3.7-flash": ModelEntry(
+        "Gemini 3.7 Flash · Google", _AGENTIC_VISION, 1_048_576
+    ),
     "gemini:gemini-3.6-flash": ModelEntry(
         "Gemini 3.6 Flash · Google", _AGENTIC_VISION, 1_048_576
     ),
-    "gemini:gemini-3.5-flash-lite": ModelEntry(
-        "Gemini 3.5 Flash-Lite · Google", _AGENTIC_VISION, 1_048_576
+    "gemini:gemini-3.5-flash": ModelEntry(
+        "Gemini 3.5 Flash · Google", _AGENTIC_VISION, 1_048_576
     ),
     # -- direct OpenAI-compatible vendors ----------------------------------------
     # Muse Spark (Meta Model API, public preview 2026-07-09): multimodal + tools via

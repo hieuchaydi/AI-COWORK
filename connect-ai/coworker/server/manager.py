@@ -1727,7 +1727,8 @@ class SessionManager:
         (`get_settings` culls the ones whose provider has no key) plus custom ids the user
         added, minus matrix models they removed. Deliberately NO built-in seed list — a
         fresh install offers nothing until a provider key exists, and then exactly that
-        provider's matrix models appear. The active default is always kept selectable.
+        provider's non-hidden models appear. A custom default participates only when it
+        is not hidden; `usable_models` still removes it when its provider lacks a key.
         """
         from ..providers.matrix import MATRIX
 
@@ -1735,7 +1736,8 @@ class SessionManager:
         user = user if isinstance(user, list) else []
         hidden = set(self._prefs.get("hidden_models") or [])
         models = [m for m in [*MATRIX, *user] if m not in hidden]
-        return list(dict.fromkeys([self.model, *models]))
+        active = [self.model] if self.model not in hidden else []
+        return list(dict.fromkeys([*active, *models]))
 
     def usable_models(self) -> list[str]:
         """Every model this account can actually call right now, picker order.
@@ -1798,31 +1800,41 @@ class SessionManager:
         env_key = bool(os.environ.get("OPENAI_API_KEY"))
         stored = bool((self.secrets.get("provider:openai") or {}).get("api_key"))
         # Only surface models whose provider is actually configured — the composer picker
-        # reflects exactly what's connected. The active default is always kept selectable
-        # (it's hidden behind the "No model" state until a provider is connected anyway).
+        # reflects exactly what's connected. An unavailable default is never injected back
+        # into the list: doing so made models from providers without an API key visible.
         # Ollama is keyless, so "configured" is meaningless there — its models show only
         # while a local Ollama answers (cached liveness probe). Same list the engine
         # fails over across, so picker and failover can't disagree.
         selectable = self.usable_models()
-        if self.model not in selectable:
-            selectable.insert(0, self.model)
+        selected_model = (
+            self.model
+            if self.model in selectable
+            else (selectable[0] if selectable else "")
+        )
         from ..providers.matrix import model_context_windows, model_labels
+
+        labels = model_labels()
+        contexts = model_context_windows()
 
         return {
             "provider": "openai",
-            "model": self.model,
+            "model": selected_model,
             "models": selectable,
             # Curated-matrix display names ({full id → "GLM-5.2 · via Together"}) so every
             # picker shows human labels; custom models absent here render their raw id.
-            "model_labels": model_labels(),
+            "model_labels": {
+                model: labels[model] for model in selectable if model in labels
+            },
             # {full id → context window in tokens}, verified matrix entries only —
             # drives the composer's context-fill meter (absent id → meter hides).
-            "model_context_windows": model_context_windows(),
+            "model_context_windows": {
+                model: contexts[model] for model in selectable if model in contexts
+            },
             "has_key": env_key or stored,
             # Provider-agnostic "can this default model actually run?" — true when the default
             # model's provider is configured (any provider, not just OpenAI). Drives the GUI's
             # "No model connected" composer chip and the onboarding Skip warning.
-            "model_ready": self._provider_configured(self._model_provider(self.model)),
+            "model_ready": bool(selected_model),
             "source": "env" if env_key else ("store" if stored else None),
             "onboarded": bool(self._prefs.get("onboarded")),
             "experimental_connectors": experimental_enabled(self.secrets),

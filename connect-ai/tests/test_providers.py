@@ -473,6 +473,12 @@ def test_matrix_labels_and_custom_model_fallback():
     # Deliberately small: agent-capable current models only (owner call, 2026-07-04).
     assert len(MATRIX) < 60
     assert all(e.caps.tools for e in MATRIX.values())
+    assert labels["gemini:gemma-4-31b-it"] == "Gemma 4 31B · Google"
+    assert labels["gemini:gemma-4-26b-a4b-it"] == "Gemma 4 26B A4B · Google"
+    assert labels["gemini:gemini-3.8-flash"] == "Gemini 3.8 Flash · Google"
+    gemma_caps = capabilities_for("gemini:gemma-4-31b-it")
+    assert gemma_caps.tools and gemma_caps.vision and gemma_caps.pdf
+    assert not gemma_caps.parallel_tool_calls
     # A custom (unlisted) reseller model falls back to the conservative default — usable,
     # but at the user's own risk (no parallel tool calls assumed).
     caps = capabilities_for("together:some-org/Brand-New-Model")

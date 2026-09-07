@@ -312,7 +312,7 @@ def test_manager_provider_config(tmp_path, monkeypatch):
 
 def test_manager_curated_models(tmp_path, monkeypatch):
     """No seed list: the picker is the curated matrix filtered to key-holding providers,
-    plus user-added custom ids. A fresh install shows only the (not-yet-usable) default.
+    plus user-added custom ids. A fresh install with no key shows no phantom default.
     """
     monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
     from coworker.providers.registry import provider_descriptors
@@ -329,8 +329,8 @@ def test_manager_curated_models(tmp_path, monkeypatch):
     monkeypatch.setattr(SessionManager, "_ollama_alive", lambda self: True)
 
     mgr = SessionManager(data_dir=tmp_path)
-    # no provider keys → nothing but the always-selectable default
-    assert mgr.get_settings()["models"] == [mgr.model]
+    # no provider keys → no unusable model leaks into the picker
+    assert mgr.get_settings()["models"] == []
 
     # a provider key unlocks exactly that provider's matrix models
     mgr.set_provider("anthropic", {"api_key": "sk-ant-test"})
@@ -357,9 +357,9 @@ def test_manager_curated_models(tmp_path, monkeypatch):
     mgr.remove_model("ollama:qwen2.5-coder:32b")
     assert "ollama:qwen2.5-coder:32b" not in mgr.get_settings()["models"]
 
-    # the active default stays selectable even if removed from the curated list
+    # a removed active default must not leak back into the picker
     mgr.remove_model(mgr.model)
-    assert mgr.model in mgr.get_settings()["models"]
+    assert mgr.model not in mgr.get_settings()["models"]
 
     assert mgr.add_model("  ")["ok"] is False  # empty rejected
 
@@ -435,7 +435,7 @@ def test_anthropic_gemini_provider_config(tmp_path, monkeypatch):
     assert provs["anthropic"]["configured"] is False
     assert provs["gemini"]["needs_key"] is True
     assert "claude-sonnet-4-6" in provs["anthropic"]["suggested_models"]
-    assert "gemini-2.5-flash" in provs["gemini"]["suggested_models"]
+    assert "gemini-3.5-flash-lite" in provs["gemini"]["suggested_models"]
 
     res = mgr.set_provider("anthropic", {"api_key": "sk-ant-test"})
     assert res["ok"] is True and res["recommended_model"] == "claude-fable-5"

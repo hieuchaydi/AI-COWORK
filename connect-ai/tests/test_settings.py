@@ -45,7 +45,9 @@ def test_settings_rest_roundtrip(tmp_path, monkeypatch):
         and before["source"] is None
         and before["provider"] == "openai"
     )
-    assert before["onboarded"] is False and before["model"] in before["models"]
+    assert before["onboarded"] is False
+    assert before["model"] == "" and before["models"] == []
+    assert before["model_labels"] == {} and before["model_context_windows"] == {}
 
     set_resp = client.post(
         "/v1/settings/model-key", json={"api_key": "sk-secret-xyz"}
@@ -75,6 +77,7 @@ def test_default_model_and_onboarding_persist(tmp_path, monkeypatch):
     from coworker.server.manager import SessionManager
 
     monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     data_dir = tmp_path / "data"
     client = TestClient(create_app(SessionManager(data_dir=data_dir)))
 
@@ -174,3 +177,27 @@ def test_ollama_models_gated_on_liveness(tmp_path, monkeypatch):
 
     monkeypatch.setattr(SessionManager, "_ollama_alive", lambda self: True)
     assert "ollama:llama3.3" in manager.get_settings()["models"]
+
+
+def test_model_picker_only_returns_configured_providers(tmp_path, monkeypatch):
+    from coworker.server.manager import SessionManager
+
+    for key in (
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GROQ_API_KEY",
+        "CEREBRAS_API_KEY",
+        "CLOUDFLARE_API_TOKEN",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-test")
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    manager = SessionManager(data_dir=tmp_path / "data")
+
+    settings = manager.get_settings()
+    assert settings["models"]
+    assert all(model.startswith("gemini:") for model in settings["models"])
+    assert set(settings["model_labels"]) <= set(settings["models"])
+    assert set(settings["model_context_windows"]) <= set(settings["models"])
+    assert "gemini:gemma-4-31b-it" in settings["models"]
+    assert "gemini:gemini-3.8-flash" in settings["models"]

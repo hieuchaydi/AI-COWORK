@@ -339,7 +339,7 @@ DESCRIPTORS: list[ProviderDescriptor] = [
             ),
         ],
         build=_build_gemini,
-        recommended_model="gemini-3.6-flash",
+        recommended_model="gemini-3.5-flash-lite",
         env_key="GEMINI_API_KEY",
     ),
     ProviderDescriptor(
