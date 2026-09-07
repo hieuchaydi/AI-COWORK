@@ -468,6 +468,10 @@ async function resolveShopId(itemid, originalUrl, tab, progress) {
 async function fetchRatingsFromTab(tabId, itemid, shopid, offset, limit, referer) {
   const res = await chrome.scripting.executeScript({
     target: { tabId },
+    // Run as the Shopee page itself. The default ISOLATED world gives the
+    // request an extension/content-script initiator that Shopee's WAF rejects
+    // even when the tab has a valid logged-in cookie.
+    world: "MAIN",
     func: async (iid, sid, off, lim, ref) => {
       const path = `/api/v2/item/get_ratings?filter=0&flag=1&itemid=${iid}&limit=${lim}&offset=${off}&shopid=${sid}&type=0`;
       try {
@@ -550,6 +554,7 @@ function formatShopeeFailure(fetchRes) {
 async function preflightRatingsInTab(tabId, itemid, shopid, referer) {
   const res = await chrome.scripting.executeScript({
     target: { tabId },
+    world: "MAIN",
     func: async (iid, sid, ref) => {
       const path = `/api/v2/item/get_ratings?filter=0&flag=1&itemid=${iid}&limit=1&offset=0&shopid=${sid}&type=0`;
       try {

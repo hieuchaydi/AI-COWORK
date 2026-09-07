@@ -368,6 +368,32 @@ test('evaluates preflight login detection and status reporting', async () => {
   `, context), 'api_blocked');
 });
 
+test('ratings preflight and pagination execute in the Shopee page MAIN world', async () => {
+  const { context } = await worker();
+  vm.runInContext(`
+    globalThis.ratingScriptCalls = [];
+    chrome.scripting = {
+      executeScript: async options => {
+        ratingScriptCalls.push(options);
+        return [{ result: { ok: true, status: 200, json: { data: { ratings: [] } } } }];
+      },
+    };
+  `, context);
+
+  await vm.runInContext(`
+    preflightRatingsInTab(42, "1546910319", "93922606", "https://shopee.vn/product/93922606/1546910319")
+  `, context);
+  await vm.runInContext(`
+    fetchRatingsFromTab(42, "1546910319", "93922606", 0, 20, "https://shopee.vn/product/93922606/1546910319")
+  `, context);
+
+  const calls = vm.runInContext('ratingScriptCalls.map(call => ({ world: call.world, tabId: call.target.tabId }))', context);
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
+    { world: 'MAIN', tabId: 42 },
+    { world: 'MAIN', tabId: 42 },
+  ]);
+});
+
 test('extractShopeeReviews halts with login_required before crawl when preflight fails login', async () => {
   const { context } = await worker();
   vm.runInContext(`
