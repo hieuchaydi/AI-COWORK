@@ -159,6 +159,82 @@ _GROQ_MODEL_IDENTIFIERS = (
 _DEFAULT_GROQ_TOOL_CAP = 16
 
 
+def _tool_call_name(raw: Any) -> Optional[str]:
+    if isinstance(raw, dict):
+        fn = raw.get("function") or {}
+        return fn.get("name") or raw.get("name")
+    return getattr(raw, "name", None)
+
+
+def _tool_call_id(raw: Any) -> Optional[str]:
+    if isinstance(raw, dict):
+        return raw.get("id")
+    return getattr(raw, "id", None)
+
+
+def _tool_call_arguments(raw: Any) -> dict[str, Any]:
+    if hasattr(raw, "arguments"):
+        args = getattr(raw, "arguments")
+        return args if isinstance(args, dict) else {}
+    if not isinstance(raw, dict):
+        return {}
+    fn = raw.get("function") or {}
+    args = fn.get("arguments", raw.get("arguments", {}))
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args or "{}")
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def pending_tool_calls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return trailing assistant tool calls that do not yet have tool results.
+
+    This mirrors durable-resume's safety rule: only the unanswered calls on the
+    trailing assistant turn are actionable. If a user has spoken after them, the
+    model should reason from the new user input instead of replaying stale calls.
+    """
+    answered = {
+        msg.get("tool_call_id") for msg in messages if msg.get("role") == "tool"
+    }
+    for msg in reversed(messages):
+        role = msg.get("role")
+        if role == "user":
+            return []
+        if role == "assistant" and msg.get("tool_calls"):
+            pending: list[dict[str, Any]] = []
+            for raw_call in msg.get("tool_calls") or []:
+                call_id = _tool_call_id(raw_call)
+                if call_id in answered:
+                    continue
+                name = _tool_call_name(raw_call)
+                if not name:
+                    continue
+                pending.append(
+                    {
+                        "id": call_id or "",
+                        "name": name,
+                        "arguments": _tool_call_arguments(raw_call),
+                    }
+                )
+            return pending
+    return []
+
+
+def pending_tool_names(messages: list[dict[str, Any]]) -> set[str]:
+    """Names of durable-resume tool calls that still need a result."""
+    return {call["name"] for call in pending_tool_calls(messages)}
+
+
+def _compact_json(value: Any, max_chars: int = 220) -> str:
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return text if len(text) <= max_chars else text[: max_chars - 3] + "..."
+
+
 def is_groq_model(model: Optional[str]) -> bool:
     """Check if the target model is hosted on Groq or constrained by Groq tool limits."""
     if os.environ.get("COWORKER_FORCE_GROQ_ROUTER", "0").strip().lower() in ("1", "true", "yes"):
@@ -425,6 +501,7 @@ def consolidate_tools_for_turn(
     return result
 
 
+
 # ─── 2. Endpoint Idempotency Tracker ──────────────────────────────────────────
 
 class EndpointIdempotencyTracker:
@@ -678,14 +755,31 @@ def prune_acknowledged_payloads(
 # ─── 6. Sequential Workflow Slicing ───────────────────────────────────────────
 
 class WorkflowPhase(str, Enum):
+    # Crawl / Shopee workflow
     DISCOVERY = "discovery"
     QUEUE_JOB = "queue_job"
     POLL_RESULT = "poll_result"
     EXPORT_BUNDLE = "export_bundle"
     COMPLETED = "completed"
 
+    # Dev / Coding workflow
+    DEV_INSPECT = "dev_inspect"
+    DEV_EDIT = "dev_edit"
+    DEV_VERIFY = "dev_verify"
+    DEV_COMMIT = "dev_commit"
+
+    # Browser workflow
+    BROWSER_NAVIGATE = "browser_navigate"
+    BROWSER_INTERACT = "browser_interact"
+    BROWSER_EXTRACT = "browser_extract"
+
+    # Connectors workflow
+    CONNECTORS_RESOLVE = "connectors_resolve"
+    CONNECTORS_DISPATCH = "connectors_dispatch"
+
 
 _PHASE_ALLOWED_TOOLS: dict[WorkflowPhase, set[str]] = {
+    # Crawl / Shopee
     WorkflowPhase.DISCOVERY: {
         "read_file", "write_file", "web_search", "current_time", "ask_user"
     },
@@ -702,6 +796,54 @@ _PHASE_ALLOWED_TOOLS: dict[WorkflowPhase, set[str]] = {
     WorkflowPhase.COMPLETED: {
         "read_file", "write_file", "send_message", "current_time"
     },
+    # Dev / Coding
+    WorkflowPhase.DEV_INSPECT: {
+        "code_search", "grep_search", "find_by_name", "read_file", "list_dir", "view_file", "todo_write", "current_time"
+    },
+    WorkflowPhase.DEV_EDIT: {
+        "replace_file_content", "write_to_file", "read_file", "view_file", "todo_write", "current_time"
+    },
+    WorkflowPhase.DEV_VERIFY: {
+        "run_shell", "read_file", "view_file", "todo_write", "current_time"
+    },
+    WorkflowPhase.DEV_COMMIT: {
+        "run_shell", "git_status", "git_add", "git_commit", "read_file", "current_time"
+    },
+    # Browser
+    WorkflowPhase.BROWSER_NAVIGATE: {
+        "browser_open", "browser_wait", "current_time"
+    },
+    WorkflowPhase.BROWSER_INTERACT: {
+        "browser_click", "browser_fill", "browser_evaluate", "browser_wait", "browser_read_state", "current_time"
+    },
+    WorkflowPhase.BROWSER_EXTRACT: {
+        "browser_screenshot", "browser_read_state", "save_csv", "write_file", "current_time"
+    },
+    # Connectors
+    WorkflowPhase.CONNECTORS_RESOLVE: {
+        "list_connected_bots", "switch_bot", "slack_directory", "resolve_target", "current_time"
+    },
+    WorkflowPhase.CONNECTORS_DISPATCH: {
+        "send_message", "send_document", "download_and_send_document", "current_time"
+    },
+}
+
+
+_PHASE_ACTION_GUIDANCE: dict[WorkflowPhase, str] = {
+    WorkflowPhase.DISCOVERY: "- Discovery step: Discover targets and parameters via web_search or read_file.",
+    WorkflowPhase.QUEUE_JOB: "- Ingest step: Queue crawl job via web_fetch with the product URL.",
+    WorkflowPhase.POLL_RESULT: "- Polling step: Job is queued. Use web_fetch to poll job result until completed.",
+    WorkflowPhase.EXPORT_BUNDLE: "- Export step: Crawl result ready. Use save_csv and download_media_and_zip (or crawl_and_export_bundle).",
+    WorkflowPhase.COMPLETED: "- Workflow completed. Report final summary or direct download links to user.",
+    WorkflowPhase.DEV_INSPECT: "- Inspect step: Search and inspect relevant codebase files before making edits.",
+    WorkflowPhase.DEV_EDIT: "- Edit step: Code inspected. Apply modifications with replace_file_content or write_to_file.",
+    WorkflowPhase.DEV_VERIFY: "- Verify step: Code changes detected. Run verification tests via run_shell before committing.",
+    WorkflowPhase.DEV_COMMIT: "- Commit step: Tests passed. Run git_status and git_commit to persist changes.",
+    WorkflowPhase.BROWSER_NAVIGATE: "- Navigation step: Open target page with browser_open.",
+    WorkflowPhase.BROWSER_INTERACT: "- Interaction step: Interact with elements via browser_click, browser_fill, or browser_evaluate.",
+    WorkflowPhase.BROWSER_EXTRACT: "- Extraction step: Capture screenshot or read page state.",
+    WorkflowPhase.CONNECTORS_RESOLVE: "- Resolve step: Verify account/chat identity before dispatching message.",
+    WorkflowPhase.CONNECTORS_DISPATCH: "- Dispatch step: Send final payload via send_message or send_document.",
 }
 
 
@@ -844,6 +986,211 @@ def get_active_categories(
     return active
 
 
+def infer_workflow_phase(
+    messages: list[dict[str, Any]],
+    active_categories: Optional[set[ToolCategory]] = None,
+) -> Optional[WorkflowPhase]:
+    """Infer current active workflow phase from recent transcript actions.
+
+    Detects stage in multi-step workflows (Crawl, Dev, Browser, Connectors)
+    so tools and guidance can be scoped precisely without extra LLM round-trips.
+    """
+    if not messages:
+        return None
+
+    recent_tool_calls: list[str] = []
+    recent_tool_outputs: list[str] = []
+    for msg in reversed(messages):
+        role = msg.get("role")
+        if role == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                name = _tool_call_name(tc)
+                if name:
+                    recent_tool_calls.append(name)
+        elif role == "tool":
+            content = str(msg.get("content") or "")
+            recent_tool_outputs.append(content)
+        if len(recent_tool_calls) >= 8:
+            break
+
+    recent_texts: list[str] = []
+    for msg in reversed(messages):
+        if msg.get("role") in ("user", "steering"):
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                recent_texts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        recent_texts.append(part.get("text", ""))
+        if len(recent_texts) >= 3:
+            break
+    combined_text = " ".join(recent_texts).lower()
+
+    # Detect domain by concrete recent actions first, then fallback to keywords
+    has_dev_actions = any(tc in ("replace_file_content", "write_to_file", "run_shell", "execute_command", "code_search", "grep_search", "git_status", "git_commit") for tc in recent_tool_calls)
+    has_browser_actions = any("browser_" in tc for tc in recent_tool_calls)
+    has_crawl_actions = any(tc in ("crawl_urls", "save_csv", "crawl_and_export_bundle", "download_media_from_csv", "shopee_crawl_job") for tc in recent_tool_calls) or any("/ingest/" in tc for tc in recent_tool_calls)
+    has_connector_actions = any(tc in ("list_connected_bots", "switch_bot", "slack_directory", "send_message", "send_document") for tc in recent_tool_calls)
+
+    cats = active_categories or set()
+    if not cats:
+        cats = get_active_categories(messages=messages, total_registered_tools=30)
+
+    # 1. Dev / Coding workflow
+    is_dev = has_dev_actions or (
+        ToolCategory.DEV_SHELL in cats
+        and not (has_browser_actions or has_crawl_actions or has_connector_actions)
+    ) or _matches_any_keyword(combined_text, _DEV_SHELL_KEYWORDS)
+
+    if is_dev:
+        last_edit_idx = -1
+        last_test_idx = -1
+        test_passed = False
+
+        for idx, msg in enumerate(messages):
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    tname = _tool_call_name(tc)
+                    if tname in ("replace_file_content", "write_to_file"):
+                        last_edit_idx = idx
+                    elif tname in ("run_shell", "execute_command"):
+                        last_test_idx = idx
+            elif msg.get("role") == "tool" and idx > last_test_idx >= 0:
+                t_out = str(msg.get("content") or "").lower()
+                if "passed" in t_out or "exit code 0" in t_out or "ok" in t_out:
+                    if "failed" not in t_out and "error" not in t_out:
+                        test_passed = True
+
+        if last_edit_idx >= 0 and last_test_idx < last_edit_idx:
+            return WorkflowPhase.DEV_VERIFY
+        if last_test_idx > last_edit_idx >= 0 and test_passed:
+            return WorkflowPhase.DEV_COMMIT
+        if any(tc in ("code_search", "grep_search", "find_by_name", "read_file", "view_file") for tc in recent_tool_calls):
+            return WorkflowPhase.DEV_EDIT
+        return WorkflowPhase.DEV_INSPECT
+
+    # 2. Browser workflow
+    if has_browser_actions or (ToolCategory.BROWSER in cats and _matches_any_keyword(combined_text, _BROWSER_KEYWORDS)):
+        if any("browser_open" in tc for tc in recent_tool_calls):
+            if any(tc in ("browser_click", "browser_fill", "browser_evaluate") for tc in recent_tool_calls):
+                return WorkflowPhase.BROWSER_EXTRACT
+            return WorkflowPhase.BROWSER_INTERACT
+        return WorkflowPhase.BROWSER_NAVIGATE
+
+    # 3. Crawl / Shopee workflow
+    if has_crawl_actions or (ToolCategory.CRAWL in cats and (_matches_any_keyword(combined_text, _CRAWL_KEYWORDS) or _matches_any_keyword(combined_text, _SHOPEE_KEYWORDS))):
+        has_ack_or_result = any(
+            ("ok" in out and "true" in out.lower()) or "jobid=" in out.lower() or "csv" in out.lower()
+            for out in recent_tool_outputs
+        )
+        if has_ack_or_result:
+            return WorkflowPhase.EXPORT_BUNDLE
+
+        has_pending_job = any(
+            "job" in tc or "ingest" in tc for tc in recent_tool_calls
+        ) or any("job" in out.lower() or "jobid" in out.lower() for out in recent_tool_outputs)
+        if has_pending_job:
+            return WorkflowPhase.POLL_RESULT
+
+        has_url = any(
+            "http://" in str(m.get("content", "")) or "https://" in str(m.get("content", ""))
+            for m in messages[-4:]
+        )
+        if has_url:
+            return WorkflowPhase.QUEUE_JOB
+        return WorkflowPhase.DISCOVERY
+
+    # 4. Connectors workflow
+    if has_connector_actions or (ToolCategory.CONNECTORS in cats and (_matches_any_keyword(combined_text, _CONNECTORS_KEYWORDS) or "platform:" in combined_text)):
+        if any(tc in ("list_connected_bots", "switch_bot", "slack_directory") for tc in recent_tool_calls):
+            return WorkflowPhase.CONNECTORS_DISPATCH
+        return WorkflowPhase.CONNECTORS_RESOLVE
+
+    # Fallback to dev inspect if DEV_SHELL is the only active
+    if ToolCategory.DEV_SHELL in cats:
+        return WorkflowPhase.DEV_INSPECT
+
+    return None
+
+
+def build_tool_call_guidance(
+    messages: list[dict[str, Any]],
+    active_names: Optional[set[str] | list[str]] = None,
+    *,
+    max_pending: int = 4,
+) -> str:
+    """Build a compact provider-only guide for resume and tool-template selection.
+
+    The block is intentionally short because it is appended to every provider call
+    only when relevant. It does not replace JSON schemas; it gives small models a
+    stable decision frame so they continue the current workflow instead of calling
+    adjacent tools repeatedly.
+    """
+    if os.environ.get("COWORKER_TOOL_CALL_GUIDANCE", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+    ):
+        return ""
+
+    active = set(active_names or [])
+    cats = {categorize_tool(name) for name in active}
+    pending = pending_tool_calls(messages)
+
+    if not pending and cats <= {ToolCategory.CORE, ToolCategory.CUSTOM}:
+        return ""
+
+    lines = [
+        "Tool-call discipline:",
+        "- Prefer one cohesive next tool call over several exploratory adjacent calls.",
+        "- Do not repeat a tool call that already has a tool result in the transcript.",
+    ]
+
+    if pending:
+        lines.append(
+            "- Resume first: these assistant tool calls still need results before new work:"
+        )
+        for call in pending[:max_pending]:
+            args = _compact_json(call.get("arguments") or {})
+            lines.append(f"  {call['id'] or '?'} -> {call['name']}({args})")
+        if len(pending) > max_pending:
+            lines.append(f"  ... {len(pending) - max_pending} more pending call(s)")
+
+    inferred_phase = infer_workflow_phase(messages, active_categories=cats)
+    if inferred_phase and inferred_phase in _PHASE_ACTION_GUIDANCE:
+        lines.append(f"- Active workflow phase: {inferred_phase.value}")
+        lines.append(f"  {_PHASE_ACTION_GUIDANCE[inferred_phase]}")
+
+    if ToolCategory.DEV_SHELL in cats:
+        lines.append(
+            "- Dev template: code_search/read_file -> run_shell tests -> git_status/git_add/git_commit."
+        )
+    if ToolCategory.CRAWL in cats:
+        if any(name in active for name in ("shopee_crawl_job", "queue_ingest_job")):
+            lines.append(
+                "- Shopee template: queue ingest job -> poll job status/result -> read/export CSV/media once."
+            )
+        else:
+            lines.append(
+                "- Crawl template: fetch/discover -> crawl_and_export_bundle or save_csv -> media zip only when media exists."
+            )
+    if ToolCategory.BROWSER in cats:
+        lines.append(
+            "- Browser template: browser_open -> wait/read state -> click/fill/evaluate -> screenshot only when visual proof is needed."
+        )
+    if ToolCategory.CONNECTORS in cats:
+        lines.append(
+            "- Connector template: resolve the target/account first, then send_message/send_file once with the final payload."
+        )
+    if ToolCategory.AUTOMATION in cats:
+        lines.append(
+            "- Automation template: use current_time for relative deadlines, then create/update/list/cancel exactly one schedule."
+        )
+
+    return "\n".join(lines)
+
+
 def route_tools_for_context(
     registry: "ToolRegistry",
     messages: list[dict[str, Any]],
@@ -860,7 +1207,9 @@ def route_tools_for_context(
     - Preserves core tools and multi-turn continuity.
     """
     all_names = registry.names()
+    all_name_set = set(all_names)
     is_groq = is_groq_model(model)
+    pending_names = pending_tool_names(messages) & all_name_set
 
     # Detect Shopee intent from recent messages
     recent_texts: list[str] = []
@@ -894,9 +1243,21 @@ def route_tools_for_context(
         cat = categorize_tool(name, metadata=metadata)
         if cat in active_categories or (shopee_intent and cat == ToolCategory.CRAWL):
             selected.add(name)
+    # Durable resume has priority over ordinary category pruning: if the transcript
+    # contains a trailing assistant tool_call without a tool result, the next model
+    # hop must still see that exact tool's schema.
+    selected.update(pending_names)
 
     # Consolidate related operations & apply Shopee policy
+    # Infer workflow phase and prioritize stage-appropriate tools
+    inferred_phase = infer_workflow_phase(messages, active_categories=active_categories)
+    phase_tools = _PHASE_ALLOWED_TOOLS.get(inferred_phase, set()) if inferred_phase else set()
+    phase_tools_in_registry = phase_tools & all_name_set
+    if phase_tools_in_registry:
+        selected.update(phase_tools_in_registry)
+
     selected = consolidate_tools_for_turn(selected, is_groq=is_groq, shopee_intent=shopee_intent)
+    selected.update(pending_names)
 
     # Determine effective cap
     effective_cap = max_tools
@@ -913,8 +1274,12 @@ def route_tools_for_context(
     if effective_cap is not None and len(selected) > effective_cap:
         def _score_tool(t_name: str) -> float:
             score = 10.0
-            if t_name in _CORE_BUILTINS:
+            if t_name in pending_names:
+                score += 1000.0
+            if t_name in phase_tools:
                 score += 100.0
+            if t_name in _CORE_BUILTINS:
+                score += 50.0
             if shopee_intent:
                 if t_name in ("crawl_and_export_bundle", "download_media_from_csv", "save_csv"):
                     score += 80.0

@@ -1,20 +1,23 @@
 from .registry import ToolRegistry, ToolSpec
-from .router import ToolCategory, categorize_tool, route_tools_for_context
 from .router import (
     ToolCategory,
-    categorize_tool,
-    route_tools_for_context,
-    is_groq_model,
-    consolidate_tools_for_turn,
+    BackoffRetryPolicy,
     EndpointIdempotencyTracker,
     JobState,
     JobStateManager,
-    calculate_backoff,
-    BackoffRetryPolicy,
     PayloadAckManager,
-    prune_acknowledged_payloads,
     SequentialWorkflowCoordinator,
     WorkflowPhase,
+    build_tool_call_guidance,
+    calculate_backoff,
+    categorize_tool,
+    consolidate_tools_for_turn,
+    infer_workflow_phase,
+    is_groq_model,
+    pending_tool_calls,
+    pending_tool_names,
+    prune_acknowledged_payloads,
+    route_tools_for_context,
 )
 
 __all__ = [
@@ -25,6 +28,10 @@ __all__ = [
     "route_tools_for_context",
     "is_groq_model",
     "consolidate_tools_for_turn",
+    "build_tool_call_guidance",
+    "pending_tool_calls",
+    "pending_tool_names",
+    "infer_workflow_phase",
     "EndpointIdempotencyTracker",
     "JobState",
     "JobStateManager",

@@ -30,8 +30,12 @@ from .providers.errors import (
     classify_model_error,
     friendly_model_error,
 )
-from .tools import ToolRegistry, route_tools_for_context
-from .tools import ToolRegistry, route_tools_for_context, prune_acknowledged_payloads
+from .tools import (
+    ToolRegistry,
+    build_tool_call_guidance,
+    prune_acknowledged_payloads,
+    route_tools_for_context,
+)
 
 # Quota/rate-limit recovery (connect-AI patch). Running out of quota mid-turn used
 # to end the turn with a red error and a Retry button — on a free Gemini tier that
@@ -603,9 +607,12 @@ class TurnEngine:
             model=self.model,
         )
         tools = self.registry.schemas(active_names=active_names) or None
+        tool_guidance = build_tool_call_guidance(
+            self.messages, active_names=active_names
+        )
         model, messages, settings = (
             self.model,
-            self._outbound_messages(),
+            self._outbound_messages(tool_guidance=tool_guidance),
             self.model_settings,
         )
         provider = self.provider
@@ -1087,7 +1094,7 @@ class TurnEngine:
             self.messages.append(message)
         self._steering = []
 
-    def _outbound_messages(self) -> list[dict[str, Any]]:
+    def _outbound_messages(self, tool_guidance: str = "") -> list[dict[str, Any]]:
         """`self.messages` prepared for the provider. The SOLE provider feed (see `_astream`).
 
         Every message is stripped of the display-only sidecars — `source`, `_display`, and
@@ -1177,9 +1184,16 @@ class TurnEngine:
         context = (
             self.context_provider() if self.context_provider is not None else ""
         ) or ""
-        if not context:
+        blocks: list[str] = []
+        if context:
+            blocks.append(f"<system-context>\n{context}\n</system-context>")
+        if tool_guidance:
+            blocks.append(
+                f"<tool-routing-guidance>\n{tool_guidance}\n</tool-routing-guidance>"
+            )
+        if not blocks:
             return out
-        block = f"\n\n<system-context>\n{context}\n</system-context>"
+        block = "\n\n" + "\n\n".join(blocks)
         for i in range(len(out) - 1, -1, -1):
             if out[i].get("role") != "user":
                 continue
