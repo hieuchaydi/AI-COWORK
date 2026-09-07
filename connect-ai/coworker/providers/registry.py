@@ -661,10 +661,10 @@ DESCRIPTORS: list[ProviderDescriptor] = [
     _compat(
         "cohere",
         "Cohere",
-        base_url="https://api.cohere.com/v2",
-        recommended_model="command-r-plus",
+        base_url="https://api.cohere.com/compatibility/v1",
+        recommended_model="command-r-plus-08-2024",
         env_key="COHERE_API_KEY",
-        endpoint_help="Prefilled with Cohere's official v2 endpoint (https://api.cohere.com/v2).",
+        endpoint_help="Prefilled with Cohere's official OpenAI-compatible endpoint (https://api.cohere.com/compatibility/v1).",
     ),
     # Resellers: many labs' models behind one key, using THEIR model namespaces (the curated
     # ids + display labels live in providers/matrix.py).

@@ -163,15 +163,21 @@ MATRIX: dict[str, ModelEntry] = {
     "mistral:mistral-large-latest": ModelEntry(
         "Mistral Large · Mistral", _AGENTIC, 128_000
     ),
-    # Cohere (v2 API, OpenAI-compatible)
-    "cohere:command-r-plus": ModelEntry(
+    # Cohere (Compatibility API v1, OpenAI-compatible)
+    "cohere:command-r-plus-08-2024": ModelEntry(
         "Command R+ · Cohere", _AGENTIC, 128_000
     ),
-    "cohere:command-r": ModelEntry(
+    "cohere:command-r-08-2024": ModelEntry(
         "Command R · Cohere", _AGENTIC, 128_000
     ),
     "cohere:command-r7b-12-2024": ModelEntry(
         "Command R7B · Cohere", _AGENTIC, 128_000
+    ),
+    "cohere:command-a-plus-05-2026": ModelEntry(
+        "Command A+ · Cohere", _AGENTIC, 256_000
+    ),
+    "cohere:c4ai-aya-expanse-32b": ModelEntry(
+        "Aya Expanse 32B · Cohere", _AGENTIC, 128_000
     ),
     # -- resellers (their model namespaces, verbatim) -----------------------------
     "together:thinkingmachines/Inkling": ModelEntry("Inkling · via Together"),

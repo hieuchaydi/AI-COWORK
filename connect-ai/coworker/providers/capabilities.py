@@ -77,7 +77,8 @@ def capabilities_for(model: str) -> ModelCapabilities:
             "mistral",
             "magistral",
             "nemotron",
-            "command-r",
+            "command-",
+            "c4ai-",
         )
     ):
         return ModelCapabilities(
