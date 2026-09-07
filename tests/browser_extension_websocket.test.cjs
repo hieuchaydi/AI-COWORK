@@ -345,6 +345,27 @@ test('evaluates preflight login detection and status reporting', async () => {
   `, context);
   assert.equal(unauthEval.isLogin, false);
   assert.match(unauthEval.error, /login required/i);
+
+  // 4. Shopee may block the ratings endpoint while confirming the session is logged in.
+  const blockedEval = vm.runInContext(`
+    evaluatePreflightResult({
+      ok: false,
+      status: 403,
+      url: "https://shopee.vn/api/v2/item/get_ratings",
+      json: { error: 90309999, is_login: true, redirect_to_error_page: true },
+      textSample: '{"error":90309999,"is_login":true}',
+    })
+  `, context);
+  assert.equal(blockedEval.isLogin, true);
+  assert.match(blockedEval.error, /api access denied/i);
+  assert.equal(vm.runInContext(`
+    classifyShopeeFailure({
+      ok: false,
+      status: 403,
+      url: "https://shopee.vn/api/v2/item/get_ratings",
+      json: { error: 90309999, is_login: true, redirect_to_error_page: true },
+    })
+  `, context), 'api_blocked');
 });
 
 test('extractShopeeReviews halts with login_required before crawl when preflight fails login', async () => {
@@ -382,6 +403,43 @@ test('extractShopeeReviews halts with login_required before crawl when preflight
   }, (err) => {
     assert.equal(err.failureKind, 'login');
     assert.match(err.message, /login required/i);
+    return true;
+  });
+});
+
+test('extractShopeeReviews reports api_blocked when Shopee confirms login on a 403 response', async () => {
+  const { context } = await worker();
+  vm.runInContext(`
+    chrome.tabs = {
+      query: async () => [{ id: 11, url: "https://shopee.vn/product/111/222" }],
+      create: async () => ({ id: 11, url: "https://shopee.vn/product/111/222" }),
+      get: async () => ({ id: 11, url: "https://shopee.vn/product/111/222" }),
+      onUpdated: { addListener() {}, removeListener() {} },
+    };
+    chrome.scripting = {
+      executeScript: async () => [{
+        result: {
+          ok: false,
+          status: 403,
+          url: "https://shopee.vn/api/v2/item/get_ratings",
+          json: { error: 90309999, is_login: true, redirect_to_error_page: true },
+          textSample: '{"error":90309999,"is_login":true}',
+        }
+      }],
+    };
+  `, context);
+
+  await assert.rejects(async () => {
+    await vm.runInContext(`
+      extractShopeeReviews({
+        id: "job-preflight-api-blocked",
+        url: "https://shopee.vn/product/111/222",
+        itemid: "222",
+      }, () => {})
+    `, context);
+  }, (err) => {
+    assert.equal(err.failureKind, 'api_blocked');
+    assert.match(err.message, /api access denied/i);
     return true;
   });
 });

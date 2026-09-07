@@ -502,20 +502,31 @@ async function fetchRatingsFromTab(tabId, itemid, shopid, offset, limit, referer
   return res[0]?.result || { ok: false, error: "executeScript returned no result" };
 }
 
-function classifyShopeeFailure(fetchRes) {
+function shopeeLoginState(fetchRes) {
   const json = fetchRes?.json || {};
   const data = json?.data || {};
   const url = String(fetchRes?.url || "").toLowerCase();
   const sample = String(fetchRes?.textSample || fetchRes?.error || "").toLowerCase();
-  const isLogin = json?.error === 90309999 || json?.is_login === false || data?.is_login === false ||
-                  url.includes("/login") || sample.includes("is_login") || sample.includes("90309999");
-  if (isLogin) return "login";
+
+  if (json?.is_login === false || data?.is_login === false) return false;
+  if (json?.is_login === true || data?.is_login === true) return true;
+  if (fetchRes?.status === 401 || url.includes("/login")) return false;
+  if (/\b(?:is_login|login_required)\b["']?\s*[:=]\s*false\b/.test(sample)) return false;
+  return null;
+}
+
+function classifyShopeeFailure(fetchRes) {
+  const json = fetchRes?.json || {};
+  const url = String(fetchRes?.url || "").toLowerCase();
+  const sample = String(fetchRes?.textSample || fetchRes?.error || "").toLowerCase();
+  if (shopeeLoginState(fetchRes) === false) return "login";
 
   const isChallenge = url.includes("/verify/traffic") || sample.includes("captcha") ||
                       sample.includes("challenge") || sample.includes("verify/traffic");
   if (isChallenge) return "verification";
 
-  if (fetchRes?.status === 403 || sample.includes("403") || sample.includes("access denied") || sample.includes("api_blocked")) {
+  if (fetchRes?.status === 403 || json?.error === 90309999 || sample.includes("90309999") ||
+      sample.includes("403") || sample.includes("access denied") || sample.includes("api_blocked")) {
     return "api_blocked";
   }
   return "other";
@@ -576,20 +587,9 @@ async function preflightRatingsInTab(tabId, itemid, shopid, referer) {
 function evaluatePreflightResult(fetchRes) {
   const status = typeof fetchRes?.status === "number" ? fetchRes.status : (fetchRes?.ok ? 200 : null);
   const json = fetchRes?.json || {};
-  const data = json?.data || {};
-  const url = String(fetchRes?.url || "").toLowerCase();
-  const sample = String(fetchRes?.textSample || fetchRes?.error || "").toLowerCase();
-
-  const isLoginRequired =
-    status === 401 ||
-    json?.error === 90309999 ||
-    json?.is_login === false ||
-    data?.is_login === false ||
-    url.includes("/login") ||
-    sample.includes("is_login") ||
-    sample.includes("90309999");
-
-  const isLogin = Boolean(fetchRes?.ok && !isLoginRequired);
+  const explicitLoginState = shopeeLoginState(fetchRes);
+  const isLoginRequired = explicitLoginState === false;
+  const isLogin = explicitLoginState === true || Boolean(fetchRes?.ok && !isLoginRequired);
   let error = null;
   if (isLoginRequired) {
     error = `Shopee login required (HTTP ${status ?? "unknown"}, error=${json?.error ?? "unknown"}, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome`;
@@ -669,19 +669,20 @@ async function extractShopeeReviews(job, progress) {
     requestEnd: new Date(preflightEnd).toISOString(),
   });
 
-  // Nếu phiên chưa đăng nhập thì báo login_required và dừng ngay
-  if (!evalResult.isLogin) {
-    const err = new Error(evalResult.error || "Shopee login required (error 90309999, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome");
-    err.failureKind = "login";
-    err.fetchRes = preflightRes;
-    throw err;
-  }
-
-  // Nếu preflight bị lỗi khác (như verification hoặc api_blocked)
+  // Classify the API response before deriving auth state. Shopee can return
+  // 403/error=90309999 together with is_login=true; that is API blocking, not logout.
   if (!preflightRes.ok) {
     const failureKind = classifyShopeeFailure(preflightRes);
     const err = new Error(evalResult.error || formatShopeeFailure(preflightRes));
     err.failureKind = failureKind;
+    err.fetchRes = preflightRes;
+    throw err;
+  }
+
+  // Nếu phiên chưa đăng nhập thì báo login_required và dừng ngay
+  if (!evalResult.isLogin) {
+    const err = new Error(evalResult.error || "Shopee login required (is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome");
+    err.failureKind = "login";
     err.fetchRes = preflightRes;
     throw err;
   }
@@ -731,9 +732,10 @@ async function extractShopeeReviews(job, progress) {
     }
 
     const json = fetchRes.json;
-    if (json && (json.error === 90309999 || json.is_login === false || (json.data && json.data.is_login === false))) {
-      const err = new Error("Shopee login required (error 90309999, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome");
-      err.failureKind = "login";
+    if (json && (json.error || json.is_login === false || (json.data && json.data.is_login === false))) {
+      const failureKind = classifyShopeeFailure(fetchRes);
+      const err = new Error(formatShopeeFailure(fetchRes));
+      err.failureKind = failureKind;
       err.fetchRes = fetchRes;
       throw err;
     }
