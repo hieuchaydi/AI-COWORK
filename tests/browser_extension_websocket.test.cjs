@@ -18,7 +18,7 @@ async function worker(options = {}) {
     send(raw) {
       const frame = JSON.parse(raw);
       frames.push(frame);
-      if (frame.type === 'ingest.rpc') queueMicrotask(() => this.onmessage({ data: JSON.stringify({
+      if (frame.type === 'ingest.rpc' && options.autoReply !== false) queueMicrotask(() => this.onmessage({ data: JSON.stringify({
         type: 'ingest.reply', id: frame.id, ok: true, result: { saved: true },
       }) }));
     }
@@ -62,14 +62,13 @@ async function worker(options = {}) {
   return { context, frames, fetches, timers, timeouts, sockets, stored, getMessageListener: () => messageListener };
 }
 
-test('progress and large results use acknowledged WebSocket chunks exclusively', async () => {
+test('review results finalize from server checkpoint without a large WebSocket payload', async () => {
   const { context, frames, fetches, timers } = await worker();
   await vm.runInContext('reportProgress({id: "job-1"}, {percent: 20})', context);
   await vm.runInContext('uploadIngestResult({job: "job-1", rows: [{text: "x".repeat(180000)}]})', context);
   const operations = frames.map(frame => frame.params.operation);
-  assert.deepEqual(operations, ['progress', 'chunk', 'chunk', 'chunk', 'complete']);
-  const body = JSON.parse(frames.filter(frame => frame.params.operation === 'chunk').map(frame => frame.params.chunk).join(''));
-  assert.equal(body.rows[0].text.length, 180000);
+  assert.deepEqual(operations, ['progress', 'finalize']);
+  assert.equal(Object.hasOwn(frames[1].params, 'rows'), false);
   assert.equal(fetches.length, 1); // Only bootstrap pairing uses HTTP.
   assert.equal(timers.size, 0);
 });
@@ -179,6 +178,16 @@ test('unacknowledged requests are replayed with the same correlation id', async 
   await result;
   assert.equal(frames.length, 1);
   assert.equal(timers.size, 0);
+});
+
+test('transient socket close preserves pending ingest RPC for reconnect replay', async () => {
+  const { context, timers } = await worker({ autoReply: false });
+  const pending = vm.runInContext('sendIngestRequest({operation: "checkpoint", job: "job-3"})', context);
+  vm.runInContext('closeBridgeSocket({preserveDetails: true})', context);
+  assert.equal(vm.runInContext('pendingIngestRequests.size', context), 1);
+  assert.equal(timers.size, 1);
+  vm.runInContext('clearPendingIngestRequests("test cleanup")', context);
+  await assert.rejects(pending, /test cleanup/);
 });
 
 

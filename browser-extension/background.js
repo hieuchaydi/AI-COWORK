@@ -95,13 +95,13 @@ function stateForVerification(details) {
 const pendingIngestRequests = new Map();
 const knownJobs = new Set();
 
-function sendIngestRequest(params) {
+function sendIngestRequest(params, { timeoutMs = 120000 } = {}) {
   const id = crypto.randomUUID();
   const message = { v: 1, type: "ingest.rpc", id, params };
   return new Promise((resolve, reject) => {
     const started = Date.now();
     const retry = () => {
-      if (Date.now() - started > 30000) {
+      if (Date.now() - started > timeoutMs) {
         clearInterval(timer);
         pendingIngestRequests.delete(id);
         reject(new Error("WebSocket ingest acknowledgement timed out"));
@@ -218,6 +218,19 @@ async function traceJob(job, progress, event, details = {}) {
 }
 
 async function uploadIngestResult(body) {
+  // Review batches are already durably checkpointed on the helper. Finalize
+  // them server-side so a large result never has to cross WebSocket again.
+  if (body && body.job && Array.isArray(body.rows)) {
+    return sendIngestRequest({
+      operation: "finalize",
+      job: body.job,
+      name: body.name,
+      source: body.source,
+      itemid: body.itemid,
+      max_zip_mb: body.max_zip_mb,
+    }, { timeoutMs: 30 * 60 * 1000 });
+  }
+
   const uploadId = crypto.randomUUID();
   const payload = JSON.stringify(body);
   // Every frame stays below the gateway's 8 MiB limit, even after JSON escaping.
@@ -799,6 +812,9 @@ async function extractShopeeReviews(job, progress) {
   let offset = (job.checkpoint && typeof job.checkpoint.next_offset === "number")
     ? job.checkpoint.next_offset
     : ((job.checkpoint && typeof job.checkpoint.offset === "number") ? job.checkpoint.offset : 0);
+  let resumedRowsCount = (job.checkpoint && typeof job.checkpoint.rows_count === "number")
+    ? job.checkpoint.rows_count
+    : 0;
   let total = (job.checkpoint && typeof job.checkpoint.total === "number") ? job.checkpoint.total : null;
 
   if (offset === 0) {
@@ -807,13 +823,14 @@ async function extractShopeeReviews(job, progress) {
       const chk = stored[`checkpoint_${job.id}`];
       if (chk && typeof chk.next_offset === "number") {
         offset = chk.next_offset;
+        resumedRowsCount = typeof chk.rows_count === "number" ? chk.rows_count : chk.next_offset;
         if (chk.shopid && !shopid) shopid = chk.shopid;
         if (chk.total && total === null) total = chk.total;
       }
     } catch {}
   }
 
-  while (all.length < MAX_REVIEWS) {
+  while (resumedRowsCount + all.length < MAX_REVIEWS) {
     const requestStarted = Date.now();
     const requestStartIso = new Date(requestStarted).toISOString();
     await traceJob(job, progress, "ratings-request", {
@@ -886,7 +903,8 @@ async function extractShopeeReviews(job, progress) {
     const normalised = batch.map(normaliseRating);
     all.push(...normalised);
     if (total === null) total = ratingTotal(json);
-    const pct = crawlPercent(all.length + offset, total, 10, 80);
+    const completedRows = resumedRowsCount + all.length;
+    const pct = crawlPercent(completedRows, total, 10, 80);
     await traceJob(job, progress, "ratings-batch", {
       itemid,
       shopid,
@@ -895,40 +913,37 @@ async function extractShopeeReviews(job, progress) {
       tabId: tab.id,
       tabUrl: tab.url || "",
       batchSize: batch.length,
-      rowsCount: all.length + offset,
+      rowsCount: completedRows,
       totalTarget: total,
     });
     await progress({
       status: "running",
       stage: "fetch",
-      message: `Đã cào ${all.length + offset}${total ? "/" + total : ""} đánh giá`,
-      rows: all.length + offset,
+      message: `Đã cào ${completedRows}${total ? "/" + total : ""} đánh giá`,
+      rows: completedRows,
       percent: pct,
     });
 
     const nextOffset = offset + batch.length;
-    try {
-      await sendCheckpoint({
-        job: job.id,
-        offset: nextOffset,
+    const savedCheckpoint = await sendCheckpoint({
+      job: job.id,
+      offset: nextOffset,
+      next_offset: nextOffset,
+      itemid,
+      shopid,
+      rows: normalised,
+      total,
+    });
+    await chrome.storage.local.set({
+      [`checkpoint_${job.id}`]: {
         next_offset: nextOffset,
+        rows_count: Number(savedCheckpoint?.rows_count) || completedRows,
         itemid,
         shopid,
-        rows: normalised,
         total,
-      });
-      await chrome.storage.local.set({
-        [`checkpoint_${job.id}`]: {
-          next_offset: nextOffset,
-          itemid,
-          shopid,
-          total,
-          updated_at: Date.now(),
-        },
-      });
-    } catch (chkErr) {
-      console.warn("[bridge] Checkpoint send failed:", chkErr?.message || chkErr);
-    }
+        updated_at: Date.now(),
+      },
+    });
 
     if (batch.length < PAGE_SIZE) break;
     offset += PAGE_SIZE;
@@ -1689,7 +1704,7 @@ async function dispatchEnvelope(envelope) {
         connectionConflict,
         lastConnectionError: "Gateway đang được client khác sử dụng; hãy bấm Connect để takeover có chủ đích",
       });
-      closeBridgeSocket({ preserveState: "client_conflict" });
+      closeBridgeSocket({ preserveState: "client_conflict", rejectPending: true });
     } else {
       console.warn("[bridge] Gateway error:", error.code || "UNKNOWN", error.message || "");
     }
@@ -1880,8 +1895,10 @@ function clearReconnect() {
   bridgeReconnectTimeout = null;
 }
 
-function closeBridgeSocket({ preserveDetails = false, preserveState = null } = {}) {
-  clearPendingIngestRequests("WebSocket closed");
+function closeBridgeSocket({ preserveDetails = false, preserveState = null, rejectPending = false } = {}) {
+  // Transient disconnects preserve pending RPCs. Their stable request ids are
+  // replayed after socket.onopen, so an active crawl survives a short outage.
+  if (rejectPending) clearPendingIngestRequests("WebSocket closed");
   if (bridgeHandshakeTimeout) clearTimeout(bridgeHandshakeTimeout);
   bridgeHandshakeTimeout = null;
   if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
@@ -1942,7 +1959,7 @@ async function connectBridge() {
       if (!current()) return;
       if (stored.connectionEnabled === false) {
         connectionEnabled = false;
-        closeBridgeSocket();
+        closeBridgeSocket({ rejectPending: true });
         return;
       }
       let token = stored.pairingToken;
@@ -2048,7 +2065,7 @@ async function configureConnection(message) {
   connectionEnabled = false;
   clearReconnect();
   if (pairingController) pairingController.abort();
-  closeBridgeSocket();
+  closeBridgeSocket({ rejectPending: true });
   bridgeConnecting = null;
   const enabled = message.action === "connect";
   const config = { connectionEnabled: enabled };

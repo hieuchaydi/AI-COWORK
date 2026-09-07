@@ -598,6 +598,48 @@ def test_e2e_ingest_progress_chunks_and_result_over_websocket(gateway_server, mo
         rpc.executor.shutdown(wait=True)
 
 
+def test_ingest_finalize_sends_only_metadata_to_store():
+    from browser_bridge.ingest import IngestRPC
+
+    replies = []
+    stored = []
+    replied = threading.Event()
+
+    def send(message):
+        replies.append(message)
+        replied.set()
+        return True
+
+    def store(body):
+        stored.append(body)
+        return 200, {"ok": True, "count": 3006}
+
+    rpc = IngestRPC(send, store, lambda *_args: None)
+    try:
+        rpc.submit({
+            "v": 1,
+            "type": "ingest.rpc",
+            "id": "finalize-1",
+            "params": {
+                "operation": "finalize",
+                "job": "job-checkpointed",
+                "name": "shopee_1546910319_reviews",
+                "source": "https://shopee.vn/product/1/1546910319",
+            },
+        })
+        assert replied.wait(2)
+        assert stored == [{
+            "job": "job-checkpointed",
+            "name": "shopee_1546910319_reviews",
+            "source": "https://shopee.vn/product/1/1546910319",
+            "rows": [],
+        }]
+        assert replies[0]["ok"] is True
+        assert replies[0]["result"]["count"] == 3006
+    finally:
+        rpc.executor.shutdown(wait=True)
+
+
 def test_helper_http_websocket_upgrade_and_reconnect(monkeypatch):
     import launch
     import urllib.request

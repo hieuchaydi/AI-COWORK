@@ -65,6 +65,23 @@ class IngestRPC:
             if self.checkpoint is None:
                 raise ValueError("checkpoint handler not configured")
             return self.checkpoint(job, params)
+        if operation == "finalize":
+            job = params.get("job") or params.get("jobId") or params.get("job_id")
+            if not isinstance(job, str) or not job:
+                raise ValueError("job is required for finalize")
+            body = {
+                key: value
+                for key, value in params.items()
+                if key not in {"operation", "rows"}
+            }
+            # The store merges this empty tail with the durable server-side
+            # checkpoint. This keeps finalization messages tiny and resumable.
+            body["job"] = job
+            body["rows"] = []
+            status, result = self.store(body)
+            if status >= 400:
+                raise ValueError(result.get("error", "Unable to finalize result"))
+            return result
         if operation == "chunk":
             upload_id = params.get("uploadId") or params.get("upload_id")
             index, chunk = params.get("index"), params.get("chunk")
