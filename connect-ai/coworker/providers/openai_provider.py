@@ -332,6 +332,19 @@ class OpenAIProvider(ProviderClient):
             self._client = OpenAI(**kwargs)
         return self._client
 
+    def _resolve_model_name(self, model: str) -> str:
+        from .matrix import resolve_model_alias
+        resolved = resolve_model_alias(model)
+        if ":" in resolved:
+            prefix, bare = resolved.split(":", 1)
+            if prefix.lower() in (
+                "cohere", "groq", "cerebras", "openai", "deepseek", "together",
+                "fireworks", "openrouter", "mistral", "xai", "zai", "kimi", "minimax", "qwen"
+            ):
+                return bare
+            return resolved
+        return resolved
+
     def complete(
         self,
         *,
@@ -340,12 +353,17 @@ class OpenAIProvider(ProviderClient):
         tools: Optional[list[dict[str, Any]]] = None,
         **settings: Any,
     ) -> AssistantTurn:
+        wire_model = self._resolve_model_name(model)
         kwargs: dict[str, Any] = {
-            "model": model,
+            "model": wire_model,
             "messages": _strip_foreign_sidecars(messages),
             **settings,
         }
-        tools = _cap_tools(tools, self._base_url, messages=messages)
+        caps = self.capabilities(model)
+        if caps and not caps.tools:
+            tools = None
+        else:
+            tools = _cap_tools(tools, self._base_url, messages=messages)
         if tools:
             kwargs["tools"] = tools
         _pin_reasoning_effort(kwargs)
@@ -386,8 +404,9 @@ class OpenAIProvider(ProviderClient):
         tools: Optional[list[dict[str, Any]]] = None,
         **settings: Any,
     ):
+        wire_model = self._resolve_model_name(model)
         kwargs: dict[str, Any] = {
-            "model": model,
+            "model": wire_model,
             "messages": _strip_foreign_sidecars(messages),
             "stream": True,
             # Usage on the final chunk (empty `choices`). Compat servers that reject
@@ -395,7 +414,11 @@ class OpenAIProvider(ProviderClient):
             "stream_options": {"include_usage": True},
             **settings,
         }
-        tools = _cap_tools(tools, self._base_url, messages=messages)
+        caps = self.capabilities(model)
+        if caps and not caps.tools:
+            tools = None
+        else:
+            tools = _cap_tools(tools, self._base_url, messages=messages)
         if tools:
             kwargs["tools"] = tools
         _pin_reasoning_effort(kwargs)

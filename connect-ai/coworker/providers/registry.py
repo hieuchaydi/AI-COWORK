@@ -570,6 +570,15 @@ DESCRIPTORS: list[ProviderDescriptor] = [
         recommended_model="openai/gpt-oss-120b",
         env_key="GROQ_API_KEY",
     ),
+    # Cohere — Command / Aya models via official OpenAI-compatible endpoint.
+    _compat(
+        "cohere",
+        "Cohere",
+        base_url="https://api.cohere.com/compatibility/v1",
+        recommended_model="command-a-03-2025",
+        env_key="COHERE_API_KEY",
+        endpoint_help="Prefilled with Cohere's official OpenAI-compatible endpoint: https://api.cohere.com/compatibility/v1",
+    ),
     # Cerebras — wafer-scale inference, very fast. OpenAI-compatible. Free tier gives 65k
     # context (131k paid), enough to hold our ~200 tool schemas + a turn. Model ids as of
     # 2026-08: gpt-oss-120b (best tool use), gemma-4-31b, zai-glm-4.7 (deprecating soon).

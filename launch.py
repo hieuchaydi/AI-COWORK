@@ -108,6 +108,7 @@ GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 CEREBRAS_KEY = os.environ.get("CEREBRAS_API_KEY", "")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
+COHERE_KEY = os.environ.get("COHERE_API_KEY", "")
 # Cloudflare Workers AI — partner models (Gemini/GPT/Claude) on Cloudflare billing.
 # Both halves are required: the endpoint URL is account-scoped.
 CLOUDFLARE_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
@@ -3762,7 +3763,36 @@ def _seed_runtime_state() -> None:
         picker.extend(
             [
                 "groq:openai/gpt-oss-120b",
+                "groq:qwen/qwen3.6-27b",
                 "groq:openai/gpt-oss-20b",
+                "groq:groq/compound",
+                "groq:groq/compound-mini",
+            ]
+        )
+    if COHERE_KEY:
+        _ow_post(
+            "/v1/providers",
+            {
+                "name": "cohere",
+                "fields": {
+                    "api_key": COHERE_KEY,
+                    "base_url": "https://api.cohere.com/compatibility/v1",
+                },
+            },
+        )
+        picker.extend(
+            [
+                "cohere:command-a-03-2025",
+                "cohere:command-a-plus-05-2026",
+                "cohere:command-r-plus-08-2024",
+                "cohere:command-r-08-2024",
+                "cohere:command-r7b-12-2024",
+                "cohere:command-a-reasoning-08-2025",
+                "cohere:command-a-translate-08-2025",
+                "cohere:command-a-vision-07-2025",
+                "cohere:command-r7b-arabic-02-2025",
+                "cohere:c4ai-aya-expanse-32b",
+                "cohere:c4ai-aya-vision-32b",
             ]
         )
     # Cerebras — very fast OpenAI-compatible inference. Only seed when the key is present
@@ -4234,6 +4264,8 @@ def main() -> None:
         env["ANTHROPIC_API_KEY"] = ANTHROPIC_KEY
     if OPENAI_KEY:
         env["OPENAI_API_KEY"] = OPENAI_KEY
+    if COHERE_KEY:
+        env["COHERE_API_KEY"] = COHERE_KEY
     if CLOUDFLARE_TOKEN:
         env["CLOUDFLARE_API_TOKEN"] = CLOUDFLARE_TOKEN
     if CLOUDFLARE_ACCOUNT:

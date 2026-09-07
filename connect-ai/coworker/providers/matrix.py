@@ -202,13 +202,68 @@ MATRIX: dict[str, ModelEntry] = {
     "cloudflare:google/gemini-3.6-flash": ModelEntry(
         "Gemini 3.6 Flash · via Cloudflare", _AGENTIC, 1_048_576
     ),
-    # Groq — LPU inference, free tier. Model ids updated 2026-08-28: llama-3.3 deprecated,
-    # GPT-OSS series is the current primary offering. Tool cap 128 handled provider-side.
+    # Groq — LPU inference, free tier. 131K context window across models.
+    # Tool support: gpt-oss-120b, gpt-oss-20b, qwen3.6-27b support native tool calling.
+    # compound & compound-mini are text-only completions (no function calling parameter).
     "groq:openai/gpt-oss-120b": ModelEntry(
-        "GPT-OSS 120B · via Groq", _AGENTIC, 128_000
+        "GPT-OSS 120B · via Groq", _AGENTIC, 131_072
     ),
     "groq:openai/gpt-oss-20b": ModelEntry(
-        "GPT-OSS 20B · via Groq", _AGENTIC, 128_000
+        "GPT-OSS 20B · via Groq", _AGENTIC, 131_072
+    ),
+    "groq:groq/compound": ModelEntry(
+        "Compound · via Groq",
+        ModelCapabilities(tools=False, vision=False, streaming=True),
+        131_072,
+    ),
+    "groq:groq/compound-mini": ModelEntry(
+        "Compound Mini · via Groq",
+        ModelCapabilities(tools=False, vision=False, streaming=True),
+        131_072,
+    ),
+    "groq:qwen/qwen3.6-27b": ModelEntry(
+        "Qwen 3.6 27B · via Groq", _AGENTIC, 131_072
+    ),
+    # Cohere — Command / Aya family via official OpenAI-compatible endpoint.
+    # Free trial key: 20 RPM, 1,000 calls/month.
+    "cohere:command-a-plus-05-2026": ModelEntry(
+        "Command A+ (218B) · Cohere", _AGENTIC_VISION, 128_000
+    ),
+    "cohere:command-a-03-2025": ModelEntry(
+        "Command A (111B) · Cohere", _AGENTIC, 256_000
+    ),
+    "cohere:command-r-plus-08-2024": ModelEntry(
+        "Command R+ · Cohere", _AGENTIC, 128_000
+    ),
+    "cohere:command-r-08-2024": ModelEntry(
+        "Command R · Cohere", _AGENTIC, 128_000
+    ),
+    "cohere:command-r7b-12-2024": ModelEntry(
+        "Command R7B · Cohere", _AGENTIC, 128_000
+    ),
+    "cohere:command-a-reasoning-08-2025": ModelEntry(
+        "Command A Reasoning · Cohere", _AGENTIC, 256_000
+    ),
+    "cohere:command-a-translate-08-2025": ModelEntry(
+        "Command A Translate · Cohere", _AGENTIC, 8_000
+    ),
+    "cohere:command-a-vision-07-2025": ModelEntry(
+        "Command A Vision · Cohere",
+        ModelCapabilities(tools=False, vision=True, streaming=True),
+        128_000,
+    ),
+    "cohere:command-r7b-arabic-02-2025": ModelEntry(
+        "Command R7B Arabic · Cohere", _AGENTIC, 128_000
+    ),
+    "cohere:c4ai-aya-expanse-32b": ModelEntry(
+        "Aya Expanse 32B · Cohere",
+        ModelCapabilities(tools=False, vision=False, streaming=True),
+        128_000,
+    ),
+    "cohere:c4ai-aya-vision-32b": ModelEntry(
+        "Aya Vision 32B · Cohere",
+        ModelCapabilities(tools=False, vision=True, streaming=True),
+        16_000,
     ),
     # -- cloud accounts (models running in the user's own AWS/GCP) ----------------
     # Bedrock ids carry a family segment (claude/ → native Anthropic path, other/ →
@@ -260,8 +315,40 @@ MATRIX: dict[str, ModelEntry] = {
 }
 
 
+COHERE_ALIASES: dict[str, str] = {
+    "cohere:command-a-plus": "cohere:command-a-plus-05-2026",
+    "cohere:command-a": "cohere:command-a-03-2025",
+    "cohere:command-r-plus": "cohere:command-r-plus-08-2024",
+    "cohere:command-r": "cohere:command-r-08-2024",
+    "cohere:command-r7b": "cohere:command-r7b-12-2024",
+    "cohere:command-a-reasoning": "cohere:command-a-reasoning-08-2025",
+    "cohere:command-a-translate": "cohere:command-a-translate-08-2025",
+    "cohere:command-a-vision": "cohere:command-a-vision-07-2025",
+    "cohere:command-r7b-arabic": "cohere:command-r7b-arabic-02-2025",
+    "cohere:aya-expanse-32b": "cohere:c4ai-aya-expanse-32b",
+    "cohere:aya-vision-32b": "cohere:c4ai-aya-vision-32b",
+    "command-a-plus": "command-a-plus-05-2026",
+    "command-a": "command-a-03-2025",
+    "command-r-plus": "command-r-plus-08-2024",
+    "command-r": "command-r-08-2024",
+    "command-r7b": "command-r7b-12-2024",
+    "command-a-reasoning": "command-a-reasoning-08-2025",
+    "command-a-translate": "command-a-translate-08-2025",
+    "command-a-vision": "command-a-vision-07-2025",
+    "command-r7b-arabic": "command-r7b-arabic-02-2025",
+    "aya-expanse-32b": "c4ai-aya-expanse-32b",
+    "aya-vision-32b": "c4ai-aya-vision-32b",
+}
+
+
+def resolve_model_alias(model: str) -> str:
+    """Map human/short aliases to canonical model IDs (e.g. Cohere versioned IDs)."""
+    return COHERE_ALIASES.get(model, model)
+
+
 def entry_for(model: str) -> ModelEntry | None:
-    return MATRIX.get(model)
+    canonical = resolve_model_alias(model)
+    return MATRIX.get(canonical) or MATRIX.get(model)
 
 
 def model_labels() -> dict[str, str]:

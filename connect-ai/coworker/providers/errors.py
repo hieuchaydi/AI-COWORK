@@ -35,6 +35,18 @@ _NO_QUOTA = (
     # Gemini/Vertex speak gRPC status names for the same thing.
     "resource_exhausted",
     "resource has been exhausted",
+    # Cloudflare Workers AI free neuron exhaustion
+    "daily free allocation",
+    "used up your daily",
+    "neurons",
+    # Model capacity / TPM caps (cannot be resolved by transient pause; requires failover)
+    "tokens per minute",
+    "request too large",
+    "error code: 413",
+    "status code: 413",
+    "limit 8000",
+    "context_length_exceeded",
+    "maximum context length",
 )
 # A plain rate limit is NOT a quota failure: nothing is wrong with the account, the
 # caller just has to wait. Kept separate so callers can retry these instead of
@@ -60,6 +72,8 @@ def classify_model_error(model: str, exc: Exception) -> Optional[str]:
     Callers use this to fail over to another model — or, for RATE_LIMIT, to wait
     and try the same one again — instead of ending the turn (see TurnEngine).
     """
+    if getattr(exc, "status_code", None) == 413:
+        return QUOTA
     text = str(exc).lower()
     if any(marker in text for marker in _NO_QUOTA):
         return QUOTA

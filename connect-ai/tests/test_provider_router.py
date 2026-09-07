@@ -369,14 +369,15 @@ def test_set_provider_auto_adds_recommended_when_pulled(tmp_path, monkeypatch):
     from coworker.server.manager import SessionManager
 
     mgr = SessionManager(data_dir=tmp_path)
+    monkeypatch.setattr(mgr, "_ollama_alive", lambda: True)
     monkeypatch.setattr(  # pretend the recommended model is pulled
         mgr,
         "_suggested_models",
-        lambda name: ["qwen3-coder:30b"] if name == "ollama" else [],
+        lambda name: ["qwen2.5:7b"] if name == "ollama" else [],
     )
     res = mgr.set_provider("ollama", {"base_url": "http://localhost:11434"})
-    assert res["recommended_model"] == "qwen3-coder:30b"
-    assert "ollama:qwen3-coder:30b" in mgr.get_settings()["models"]
+    assert res["recommended_model"] == "qwen2.5:7b"
+    assert "ollama:qwen2.5:7b" in mgr.get_settings()["models"]
 
 
 def test_set_provider_skips_recommended_when_not_pulled(tmp_path, monkeypatch):
@@ -386,7 +387,7 @@ def test_set_provider_skips_recommended_when_not_pulled(tmp_path, monkeypatch):
     mgr = SessionManager(data_dir=tmp_path)
     monkeypatch.setattr(mgr, "_suggested_models", lambda name: [])  # nothing pulled
     mgr.set_provider("ollama", {"base_url": "http://localhost:11434"})
-    assert "ollama:qwen3-coder:30b" not in mgr.get_settings()["models"]
+    assert "ollama:qwen2.5:7b" not in mgr.get_settings()["models"]
 
 
 def test_provider_builders(monkeypatch):
