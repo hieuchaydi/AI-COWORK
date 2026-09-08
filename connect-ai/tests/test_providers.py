@@ -445,6 +445,30 @@ def test_reseller_descriptors_and_matrix_stay_in_lockstep():
         assert base.default.startswith("https://")
 
 
+def test_nvidia_descriptor_and_long_context_catalog():
+    from coworker.providers.matrix import MATRIX, models_for_provider
+    from coworker.providers.registry import get_descriptor
+
+    descriptor = get_descriptor("nvidia")
+    assert descriptor is not None
+    assert descriptor.env_key == "NVIDIA_API_KEY"
+    assert descriptor.recommended_model in models_for_provider("nvidia")
+    base = next(field for field in descriptor.fields if field.key == "base_url")
+    assert base.default == "https://integrate.api.nvidia.com/v1"
+
+    models = models_for_provider("nvidia")
+    assert models == [
+        "nvidia/nemotron-3.5-lightning-30b-a3b",
+        "nvidia/nemotron-3-super-120b-a12b",
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "deepseek-ai/deepseek-v4-flash-0731",
+        "deepseek-ai/deepseek-v4-pro-0813",
+        "minimaxai/minimax-m3",
+        "moonshotai/kimi-k3",
+    ]
+    assert all(MATRIX[f"nvidia:{model}"].context_window >= 1_000_000 for model in models)
+
+
 def test_foreign_sidecars_stripped_from_outbound_messages():
     """Provider-private sidecars (`_gemini` thought signatures et al) must never reach the
     OpenAI wire — it and its compat servers reject unknown message fields."""

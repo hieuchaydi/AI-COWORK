@@ -540,6 +540,17 @@ DESCRIPTORS: list[ProviderDescriptor] = [
         recommended_model="openai/gpt-oss-120b",
         env_key="GROQ_API_KEY",
     ),
+    # NVIDIA API Catalog — hosted NIM endpoints expose an OpenAI-compatible Chat API.
+    # The curated matrix intentionally contains only currently hosted models with a
+    # verified context window of at least one million tokens.
+    _compat(
+        "nvidia",
+        "NVIDIA NIM",
+        base_url="https://integrate.api.nvidia.com/v1",
+        recommended_model="nvidia/nemotron-3.5-lightning-30b-a3b",
+        env_key="NVIDIA_API_KEY",
+        endpoint_help="NVIDIA API Catalog OpenAI-compatible endpoint. Requires an NVIDIA Developer API key.",
+    ),
     # Cohere — native v2 Chat API, including multi-step tool use.
     ProviderDescriptor(
         name="cohere",

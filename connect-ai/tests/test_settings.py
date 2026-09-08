@@ -188,6 +188,7 @@ def test_model_picker_only_returns_configured_providers(tmp_path, monkeypatch):
         "GROQ_API_KEY",
         "CEREBRAS_API_KEY",
         "CLOUDFLARE_API_TOKEN",
+        "NVIDIA_API_KEY",
     ):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("GEMINI_API_KEY", "AIza-test")

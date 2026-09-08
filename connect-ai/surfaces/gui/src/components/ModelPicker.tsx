@@ -4,7 +4,7 @@ import { Icon } from "./Icon";
 const PROVIDER_LABELS: Record<string, string> = {
   openai: "OpenAI", anthropic: "Anthropic", gemini: "Gemini", groq: "Groq",
   cohere: "Cohere", vertex: "Vertex AI", bedrock: "Amazon Bedrock",
-  openrouter: "OpenRouter", ollama: "Ollama",
+  nvidia: "NVIDIA NIM", openrouter: "OpenRouter", ollama: "Ollama",
 };
 
 export interface ModelChoice { value: string; label: string; provider: string; }

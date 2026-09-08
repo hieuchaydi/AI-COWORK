@@ -203,6 +203,33 @@ MATRIX: dict[str, ModelEntry] = {
     "groq:qwen/qwen3.6-27b": ModelEntry(
         "Qwen 3.6 27B · via Groq", _AGENTIC, 131_072
     ),
+    # NVIDIA hosted NIM catalog, live-checked 2026-09-08. Only free-endpoint chat
+    # models whose official NVIDIA page specifies >= 1M context are listed.
+    "nvidia:nvidia/nemotron-3.5-lightning-30b-a3b": ModelEntry(
+        "Nemotron 3.5 Lightning 30B · NVIDIA NIM", _AGENTIC, 1_048_576
+    ),
+    "nvidia:nvidia/nemotron-3-super-120b-a12b": ModelEntry(
+        "Nemotron 3 Super 120B · NVIDIA NIM", _AGENTIC, 1_048_576
+    ),
+    "nvidia:nvidia/nemotron-3-ultra-550b-a55b": ModelEntry(
+        "Nemotron 3 Ultra 550B · NVIDIA NIM", _AGENTIC, 1_048_576
+    ),
+    "nvidia:deepseek-ai/deepseek-v4-flash-0731": ModelEntry(
+        "DeepSeek V4 Flash 0731 · NVIDIA NIM", _AGENTIC, 1_000_000
+    ),
+    "nvidia:deepseek-ai/deepseek-v4-pro-0813": ModelEntry(
+        "DeepSeek V4 Pro 0813 · NVIDIA NIM", _AGENTIC, 1_000_000
+    ),
+    "nvidia:minimaxai/minimax-m3": ModelEntry(
+        "MiniMax M3 · NVIDIA NIM",
+        ModelCapabilities(tools=True, vision=True, parallel_tool_calls=True, streaming=True),
+        1_000_000,
+    ),
+    "nvidia:moonshotai/kimi-k3": ModelEntry(
+        "Kimi K3 · NVIDIA NIM",
+        ModelCapabilities(tools=True, vision=True, parallel_tool_calls=True, streaming=True),
+        1_048_576,
+    ),
     # Cohere — Command / Aya family via the native v2 Chat endpoint.
     # Free trial key: 20 RPM, 1,000 calls/month.
     "cohere:command-a-plus-05-2026": ModelEntry(
