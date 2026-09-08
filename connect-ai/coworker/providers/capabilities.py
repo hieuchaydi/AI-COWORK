@@ -62,11 +62,11 @@ def capabilities_for(model: str) -> ModelCapabilities:
             tools=True, vision=False, parallel_tool_calls=False, streaming=True
         )
 
-    # OpenAI-compatible vendors (DeepSeek, Z AI/GLM, Kimi, MiniMax, Qwen, xAI/Grok, Mistral):
+    # OpenAI-compatible vendors (DeepSeek, Z AI/GLM, Kimi, MiniMax, Qwen, xAI/Grok, Mistral, NVIDIA):
     # tool calling + streaming across their current lineups; vision left off until probed
     # per-model (several have vision variants, but the text flagships are what we suggest).
-    if name.startswith(
-        ("deepseek", "glm", "kimi", "minimax", "qwen", "grok", "mistral", "magistral")
+    if provider == "nvidia" or name.startswith(
+        ("deepseek", "glm", "kimi", "minimax", "qwen", "grok", "mistral", "magistral", "nemotron")
     ):
         return ModelCapabilities(
             tools=True, vision=False, parallel_tool_calls=True, streaming=True

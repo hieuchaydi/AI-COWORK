@@ -468,6 +468,16 @@ def test_nvidia_descriptor_and_long_context_catalog():
     ]
     assert all(MATRIX[f"nvidia:{model}"].context_window >= 1_000_000 for model in models)
 
+    # Aliases route to active long-context endpoints
+    from coworker.providers.router import ProviderRouter
+    assert ProviderRouter._bare("nvidia:deepseek-ai/deepseek-v4-flash") == "deepseek-ai/deepseek-v4-flash-0731"
+    assert ProviderRouter._bare("nvidia:deepseek-ai/deepseek-v4-pro") == "deepseek-ai/deepseek-v4-pro-0813"
+    assert ProviderRouter._bare("nvidia:nemotron-3.5-lightning-30b-a3b") == "nvidia/nemotron-3.5-lightning-30b-a3b"
+
+    # Capability probe recognises nvidia provider
+    caps = capabilities_for("nvidia:custom-model")
+    assert caps.tools is True and caps.streaming is True
+
 
 def test_foreign_sidecars_stripped_from_outbound_messages():
     """Provider-private sidecars (`_gemini` thought signatures et al) must never reach the

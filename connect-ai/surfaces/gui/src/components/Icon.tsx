@@ -41,7 +41,8 @@ export type IconName =
   | "table"
   | "mic"
   | "stop"
-  | "x";
+  | "x"
+  | "check";
 
 export function Icon({
   name,
@@ -347,6 +348,12 @@ export function Icon({
           <path d="M10 11v6M14 11v6" />
           <path d="M6.5 7l.9 12c.1.9.8 1.5 1.7 1.5h7.8c.9 0 1.6-.6 1.7-1.5l.9-12" />
           <path d="M9.2 7V4.9c0-.5.4-.9.9-.9h3.8c.5 0 .9.4.9.9V7" />
+        </svg>
+      );
+    case "check":
+      return (
+        <svg {...s}>
+          <polyline points="20 6 9 17 4 12" />
         </svg>
       );
   }

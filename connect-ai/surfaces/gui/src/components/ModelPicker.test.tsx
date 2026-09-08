@@ -1,8 +1,11 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ModelPicker, groupModelChoices } from "./ModelPicker";
 
 describe("ModelPicker", () => {
+  afterEach(() => {
+    cleanup();
+  });
   const models = [
     "gemini:gemini-3.1-flash-lite", "groq:openai/gpt-oss-120b",
     "cohere:command-a-03-2025", "cohere:command-a",
@@ -30,4 +33,25 @@ describe("ModelPicker", () => {
     fireEvent.click(screen.getByText("GPT OSS 120B · Groq"));
     expect(onChange).toHaveBeenCalledWith("groq:openai/gpt-oss-120b");
   });
+
+  it("filters models dynamically via search input and displays 1M badges", () => {
+    const onChange = vi.fn();
+    const extendedModels = [
+      ...models,
+      "nvidia:nvidia/nemotron-3.5-lightning-30b-a3b",
+    ];
+    const extendedLabels = {
+      ...labels,
+      "nvidia:nvidia/nemotron-3.5-lightning-30b-a3b": "Nemotron 3.5 Lightning 30B · NVIDIA NIM",
+    };
+    render(<ModelPicker value={models[0]} models={extendedModels} modelLabels={extendedLabels} onChange={onChange} />);
+    fireEvent.click(screen.getByRole("button", { name: "Model" }));
+    const searchInput = screen.getByPlaceholderText(/Search models or providers/i);
+    fireEvent.change(searchInput, { target: { value: "nemotron" } });
+    expect(screen.getByText("Nemotron 3.5 Lightning 30B · NVIDIA NIM")).toBeTruthy();
+    expect(screen.getByText("1M Context")).toBeTruthy();
+    fireEvent.click(screen.getByText("Nemotron 3.5 Lightning 30B · NVIDIA NIM"));
+    expect(onChange).toHaveBeenCalledWith("nvidia:nvidia/nemotron-3.5-lightning-30b-a3b");
+  });
 });
+

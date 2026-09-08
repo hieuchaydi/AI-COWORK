@@ -76,6 +76,17 @@ class ProviderRouter(ProviderClient):
         if ":" in model:
             prefix, rest = model.split(":", 1)
             if get_descriptor(prefix) is not None:
+                if prefix == "nvidia":
+                    _NVIDIA_ALIASES = {
+                        "deepseek-ai/deepseek-v4-flash": "deepseek-ai/deepseek-v4-flash-0731",
+                        "deepseek-ai/deepseek-v4-pro": "deepseek-ai/deepseek-v4-pro-0813",
+                        "nemotron-3.5-lightning-30b-a3b": "nvidia/nemotron-3.5-lightning-30b-a3b",
+                        "nemotron-3-super-120b-a12b": "nvidia/nemotron-3-super-120b-a12b",
+                        "nemotron-3-ultra-550b-a55b": "nvidia/nemotron-3-ultra-550b-a55b",
+                        "minimax-m3": "minimaxai/minimax-m3",
+                        "kimi-k3": "moonshotai/kimi-k3",
+                    }
+                    return _NVIDIA_ALIASES.get(rest, rest)
                 return rest
         return model
 
