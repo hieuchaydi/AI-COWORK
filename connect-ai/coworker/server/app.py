@@ -1677,10 +1677,23 @@ def create_app(manager: SessionManager) -> FastAPI:
             # Mid-session rebind is allowed (roadmap item 3, supersedes the 2026-07-04
             # lock): history is canonical and providers convert per call. A real switch
             # appends a persisted notice; broadcast it so live views render the marker
-            # and update their header. Never rebind mid-turn — the running loop reads
-            # `engine.model` per iteration and a mixed turn is exactly the breakage the
-            # old lock existed to prevent.
-            if not model or manager.is_running(session_id):
+            # and update their header. During a running turn, queue the explicit
+            # override for the next provider-call boundary so the current stream is
+            # never relabelled halfway through.
+            if not model:
+                return
+            if manager.is_running(session_id):
+                if engine.request_model_switch(model):
+                    await manager.broadcast_session(
+                        session_id,
+                        {
+                            "type": "model_change_queued",
+                            "data": {
+                                "model": model,
+                                "text": f"Model change queued: {model}",
+                            },
+                        },
+                    )
                 return
             notice = engine.switch_model(model)
             if notice is None:  # same model, or first bind on a fresh session

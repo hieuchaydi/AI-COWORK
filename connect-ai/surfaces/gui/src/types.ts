@@ -20,6 +20,7 @@ export type EventType =
   | "model_failover"
   | "model_waiting"
   | "model_changed"
+  | "model_change_queued"
   | "turn_done";
 
 export interface WsEvent {

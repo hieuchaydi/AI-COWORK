@@ -35,6 +35,7 @@ class EventType(str, Enum):
     # going — either on another model, or after waiting for the limit to lift.
     MODEL_FAILOVER = "model_failover"  # {from, to, reason}
     MODEL_WAITING = "model_waiting"  # {model, retry_in, waited, budget, reason}
+    MODEL_CHANGED = "model_changed"  # explicit user override applied at a safe boundary
 
 
 @dataclass

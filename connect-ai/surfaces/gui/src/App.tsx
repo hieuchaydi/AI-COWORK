@@ -718,6 +718,13 @@ export function App() {
           if (d.model) setModel(d.model);
           setItems((p) => [...p, { kind: "notice", tone: "info", text: d.text || "Model switched" }]);
           break;
+        case "model_change_queued":
+          if (d.model) setModel(d.model);
+          setItems((p) => [
+            ...p,
+            { kind: "notice", tone: "info", text: d.text || "Model change queued for the next request." },
+          ]);
+          break;
         case "model_failover":
           // A model hit its quota and the turn moved to the next one by itself
           // (engine `_recover_from_model_error`) — the turn is still running.
@@ -929,7 +936,6 @@ export function App() {
     sessionRef.current?.setMode(m);
   };
   const changeModel = (m: string) => {
-    if (running) return; // the server refuses mid-turn rebinds — don't let the header lie
     setModel(m);
     sessionRef.current?.setModel(m);
   };

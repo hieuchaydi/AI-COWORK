@@ -1,8 +1,9 @@
 """Quota recovery (connect-AI patch): a model hitting its limit must not end the turn.
 
 Two ladders, in order:
-  1. fail over to the next configured model (instant), then
-  2. park the turn and retry when every model is walled (free tiers reset per minute).
+  1. fail over to the next configured model in the same provider (instant), then
+  2. park the turn and retry when that provider is walled (free tiers reset per minute).
+Cross-provider switches require an explicit manual override.
 Stop cancels a parked turn; an unrecoverable error still ends it the old way.
 """
 
@@ -75,7 +76,7 @@ def test_quota_fails_over_to_next_model(tmp_path):
         tmp_path,
         provider,
         model="gemini:gemini-3.7-flash",
-        fallbacks=["gemini:gemini-3.7-flash", "groq:openai/gpt-oss-120b"],
+        fallbacks=["gemini:gemini-3.7-flash", "gemini:gemini-3.5-flash-lite"],
     )
     events = _collect(engine)
 
@@ -83,28 +84,121 @@ def test_quota_fails_over_to_next_model(tmp_path):
     assert EventType.MODEL_FAILOVER in _types(events)
     failover = next(e for e in events if e.type == EventType.MODEL_FAILOVER)
     assert failover.data["from"] == "gemini:gemini-3.7-flash"
-    assert failover.data["to"] == "groq:openai/gpt-oss-120b"
+    assert failover.data["to"] == "gemini:gemini-3.5-flash-lite"
     # The turn finished on the healthy model, and the answer is the real one.
-    assert engine.model == "groq:openai/gpt-oss-120b"
-    assert provider.models_called == ["gemini:gemini-3.7-flash", "groq:openai/gpt-oss-120b"]
+    assert engine.model == "gemini:gemini-3.5-flash-lite"
+    assert provider.models_called == [
+        "gemini:gemini-3.7-flash",
+        "gemini:gemini-3.5-flash-lite",
+    ]
     assert events[-1].data["status"] == "completed"
 
 
-def test_failover_walks_the_whole_list(tmp_path):
-    provider = FlakyProvider({"a:one": QUOTA_EXC, "b:two": QUOTA_EXC})
+def test_quota_uses_same_provider_even_when_cross_provider_is_listed_first(tmp_path):
+    provider = FlakyProvider({"gemini:first": QUOTA_EXC})
     engine = _engine(
-        tmp_path, provider, model="a:one", fallbacks=["a:one", "b:two", "c:three"]
+        tmp_path,
+        provider,
+        model="gemini:first",
+        fallbacks=["gemini:first", "groq:fast", "gemini:second"],
+    )
+
+    events = _collect(engine)
+
+    assert EventType.ERROR not in _types(events)
+    assert provider.models_called == ["gemini:first", "gemini:second"]
+    assert engine.model == "gemini:second"
+
+
+def test_quota_never_crosses_provider_without_manual_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORKER_QUOTA_WAIT_SECONDS", "0")
+    provider = FlakyProvider({"gemini:first": QUOTA_EXC})
+    engine = _engine(
+        tmp_path,
+        provider,
+        model="gemini:first",
+        fallbacks=["gemini:first", "groq:fast"],
+    )
+
+    events = _collect(engine)
+
+    assert EventType.MODEL_FAILOVER not in _types(events)
+    assert events[-1].type == EventType.ERROR
+    assert provider.models_called == ["gemini:first"]
+
+
+def test_bare_openai_models_share_the_openai_provider(tmp_path):
+    provider = FlakyProvider({"gpt-5.6-sol": QUOTA_EXC})
+    engine = _engine(
+        tmp_path,
+        provider,
+        model="gpt-5.6-sol",
+        fallbacks=["gpt-5.6-sol", "gemini:fast", "gpt-5.6-terra"],
+    )
+
+    events = _collect(engine)
+
+    assert EventType.ERROR not in _types(events)
+    assert provider.models_called == ["gpt-5.6-sol", "gpt-5.6-terra"]
+
+
+def test_manual_override_is_applied_at_next_request_boundary(tmp_path):
+    provider = FlakyProvider({})
+    engine = _engine(
+        tmp_path,
+        provider,
+        model="gemini:first",
+        fallbacks=["gemini:first", "gemini:second"],
+    )
+    assert engine.request_model_switch("groq:user-choice") is True
+
+    events = _collect(engine)
+
+    assert EventType.MODEL_CHANGED in _types(events)
+    assert provider.models_called == ["groq:user-choice"]
+    assert engine.model == "groq:user-choice"
+
+
+def test_manual_override_wakes_a_quota_parked_turn(tmp_path, monkeypatch):
+    monkeypatch.setattr("coworker.engine._QUOTA_BACKOFF_SEC", (30,))
+    provider = FlakyProvider({"gemini:first": QUOTA_EXC})
+    engine = _engine(
+        tmp_path,
+        provider,
+        model="gemini:first",
+        fallbacks=["gemini:first"],
+    )
+
+    async def _run():
+        events = []
+        async for event in engine.run("hi"):
+            events.append(event)
+            if event.type == EventType.MODEL_WAITING:
+                assert engine.request_model_switch("groq:user-choice") is True
+        return events
+
+    events = asyncio.run(asyncio.wait_for(_run(), timeout=2))
+
+    assert EventType.ERROR not in _types(events)
+    assert EventType.MODEL_CHANGED in _types(events)
+    assert provider.models_called == ["gemini:first", "groq:user-choice"]
+
+
+def test_failover_walks_the_whole_list(tmp_path):
+    provider = FlakyProvider({"a:one": QUOTA_EXC, "a:two": QUOTA_EXC})
+    engine = _engine(
+        tmp_path, provider, model="a:one", fallbacks=["a:one", "a:two", "a:three"]
     )
     events = _collect(engine)
 
     assert _types(events).count(EventType.MODEL_FAILOVER) == 2
-    assert provider.models_called == ["a:one", "b:two", "c:three"]
-    assert engine.model == "c:three"
+    assert provider.models_called == ["a:one", "a:two", "a:three"]
+    assert engine.model == "a:three"
 
 
 def test_failover_does_not_consume_the_iteration_budget(tmp_path):
     provider = FlakyProvider({"a:one": QUOTA_EXC})
-    engine = _engine(tmp_path, provider, model="a:one", fallbacks=["a:one", "b:two"])
+    engine = _engine(tmp_path, provider, model="a:one", fallbacks=["a:one", "a:two"])
     engine.max_iterations = 1  # one real model call is all the budget allows
     events = _collect(engine)
 
@@ -199,7 +293,7 @@ async def _collect_async(engine, text="hi"):
 
 def test_ordinary_errors_still_end_the_turn(tmp_path):
     provider = FlakyProvider({"a:one": RuntimeError("connection reset by peer")})
-    engine = _engine(tmp_path, provider, model="a:one", fallbacks=["a:one", "b:two"])
+    engine = _engine(tmp_path, provider, model="a:one", fallbacks=["a:one", "a:two"])
     events = _collect(engine)
 
     assert EventType.MODEL_FAILOVER not in _types(events)
@@ -228,8 +322,8 @@ def test_no_fallback_resolver_still_waits(tmp_path, monkeypatch):
 )
 def test_quota_shapes_all_trigger_failover(tmp_path, message):
     provider = FlakyProvider({"a:one": RuntimeError(message)})
-    engine = _engine(tmp_path, provider, model="a:one", fallbacks=["a:one", "b:two"])
+    engine = _engine(tmp_path, provider, model="a:one", fallbacks=["a:one", "a:two"])
     events = _collect(engine)
 
     assert EventType.MODEL_FAILOVER in _types(events)
-    assert engine.model == "b:two"
+    assert engine.model == "a:two"

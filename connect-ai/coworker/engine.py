@@ -149,6 +149,11 @@ class TurnEngine:
         self._exhausted_models: set[str] = set()
         self._quota_waited = 0.0  # seconds this turn spent parked on a limit
         self._quota_attempts = 0
+        # A manual picker change received while a provider call is running. It is
+        # applied only before the next provider request so one streamed response
+        # can never be attributed to two different models.
+        self._requested_model: Optional[str] = None
+        self._model_change_event = asyncio.Event()
         self.agent_family: Optional[str] = None
 
     # -- external controls ------------------------------------------------------
@@ -241,6 +246,26 @@ class TurnEngine:
         self._append_notice("model_switch", text)
         return text
 
+    def request_model_switch(self, model: str) -> bool:
+        """Queue an explicit model override for the next safe request boundary.
+
+        This is used by the live model picker while a turn is running. Returning
+        False means the requested model is already active/pending.
+        """
+        model = str(model or "").strip()
+        if not model or model == (self._requested_model or self.model):
+            return False
+        self._requested_model = model
+        self._exhausted_models.discard(model)
+        self._model_change_event.set()
+        return True
+
+    def _take_requested_model(self) -> Optional[str]:
+        model = self._requested_model
+        self._requested_model = None
+        self._model_change_event.clear()
+        return model
+
     def _history_has_images(self) -> bool:
         return any(
             isinstance(p, dict) and p.get("type") == "image_url"
@@ -271,16 +296,29 @@ class TurnEngine:
 
     # -- quota / rate-limit recovery (connect-AI patch) -------------------------
     def _next_model(self) -> Optional[str]:
-        """The best configured model this turn hasn't already burned, or None."""
+        """Return the best unburned model from the current provider only."""
         if self.fallback_models is None:
             return None
         try:
             candidates = self.fallback_models() or []
         except Exception:  # a broken resolver must never break the turn
             return None
-        for candidate in candidates:
-            if candidate and candidate not in self._exhausted_models:
-                return candidate
+        def provider_of(model: str) -> str:
+            return model.partition(":")[0].lower() if ":" in model else "openai"
+
+        current_provider = provider_of(self.model)
+        available = [
+            candidate
+            for candidate in candidates
+            if candidate and candidate not in self._exhausted_models
+        ]
+        same_provider = [
+            candidate
+            for candidate in available
+            if provider_of(candidate) == current_provider
+        ]
+        for candidate in same_provider:
+            return candidate
         return None
 
     async def _recover_from_model_error(
@@ -291,9 +329,10 @@ class TurnEngine:
         Yields events to forward, then a `None` sentinel if the turn can be retried.
         Returning without the sentinel means "unrecoverable — surface the error".
 
-        Order matters: switching models is instant, so spend every configured model
-        first; only when they're all walled do we park the turn and wait for a limit
-        to lift (free tiers reset per minute, so the wait usually pays off).
+        Automatic switching stays inside the current provider so tool support,
+        request format, and account policy remain consistent. Cross-provider changes
+        happen only through an explicit manual override. When the provider's models
+        are all walled, park the turn until a limit lifts.
         """
         kind = classify_model_error(self.model, exc)
         if kind is None:
@@ -301,7 +340,8 @@ class TurnEngine:
 
         if kind in (QUOTA, NO_ACCESS):
             self._exhausted_models.add(self.model)
-            nxt = self._next_model()
+            # A user-selected override always wins over the automatic ladder.
+            nxt = self._take_requested_model() or self._next_model()
             if nxt:
                 failed, reason = self.model, friendly_model_error(self.model, exc)
                 self.switch_model(nxt)  # persists the "Model switched to X" notice
@@ -342,11 +382,22 @@ class TurnEngine:
                 "reason": friendly_model_error(self.model, exc) or str(exc),
             },
         )
+        cancel_wait = asyncio.create_task(self._cancel.wait())
+        model_wait = asyncio.create_task(self._model_change_event.wait())
         try:
-            await asyncio.wait_for(self._cancel.wait(), timeout=delay)
-            return  # stopped by the user — the caller handles the interrupt
-        except asyncio.TimeoutError:
-            pass
+            done, _ = await asyncio.wait(
+                {cancel_wait, model_wait}, timeout=delay,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if cancel_wait in done:
+                return  # stopped by the user — the caller handles the interrupt
+            if model_wait in done:
+                self._exhausted_models.clear()
+                yield None  # manual override wakes a quota-parked turn immediately
+                return
+        finally:
+            cancel_wait.cancel()
+            model_wait.cancel()
         self._quota_waited += delay
         self._quota_attempts += 1
         # The wait may have restored any model, not just this one — let the next
@@ -425,6 +476,15 @@ class TurnEngine:
                 )
                 return
             iterations += 1
+
+            requested_model = self._take_requested_model()
+            if requested_model:
+                notice = self.switch_model(requested_model)
+                if notice:
+                    yield Event(
+                        EventType.MODEL_CHANGED,
+                        {"model": requested_model, "text": notice, "manual": True},
+                    )
 
             turn: Optional[AssistantTurn] = None
             streamed: list[str] = []
