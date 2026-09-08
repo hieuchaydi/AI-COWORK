@@ -3774,7 +3774,7 @@ def _seed_runtime_state() -> None:
                 "name": "cohere",
                 "fields": {
                     "api_key": COHERE_KEY,
-                    "base_url": "https://api.cohere.com/compatibility/v1",
+                    "base_url": "https://api.cohere.com/v2",
                 },
             },
         )

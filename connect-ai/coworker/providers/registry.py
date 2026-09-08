@@ -23,6 +23,7 @@ from typing import Any, Callable, Optional
 from .anthropic_provider import AnthropicProvider
 from .base import ProviderClient
 from .bedrock_provider import BedrockProvider
+from .cohere_provider import CohereProvider
 from .gemini_provider import GeminiProvider
 from .openai_provider import OpenAIProvider
 from .vertex_provider import VertexProvider
@@ -182,7 +183,12 @@ def _build_ollama(profile: dict[str, Any], secrets: Any) -> ProviderClient:
     return OpenAIProvider(api_key="ollama", base_url=base_url)
 
 
-def _openai_compat(vendor: str, default_base_url: str, env_key: Optional[str] = None):
+def _openai_compat(
+    provider_name: str,
+    vendor: str,
+    default_base_url: str,
+    env_key: Optional[str] = None,
+):
     """Builder factory for vendors reached through their OpenAI-compatible API (Z AI, DeepSeek,
     Kimi, MiniMax, Qwen, xAI, Mistral). The key is resolved from the vendor's OWN profile (or its
     env var) — deliberately NOT from the OpenAI env/SecretStore fallback, so a configured OpenAI
@@ -199,7 +205,9 @@ def _openai_compat(vendor: str, default_base_url: str, env_key: Optional[str] = 
             raise RuntimeError(
                 f"No {vendor} API key configured — add it in Settings ▸ Models."
             )
-        return OpenAIProvider(api_key=api_key, base_url=base_url)
+        return OpenAIProvider(
+            api_key=api_key, base_url=base_url, provider_name=provider_name
+        )
 
     return build
 
@@ -238,7 +246,7 @@ def _compat(
                 or f"Prefilled with {vendor}'s official endpoint; edit only for a regional or proxy variant.",
             ),
         ],
-        build=_openai_compat(vendor, base_url, env_key),
+        build=_openai_compat(name, vendor, base_url, env_key),
         recommended_model=recommended_model,
         env_key=env_key,
         blurb=f"Uses {vendor}'s OpenAI-compatible API — the endpoint is prefilled, just add your key.",
@@ -532,14 +540,32 @@ DESCRIPTORS: list[ProviderDescriptor] = [
         recommended_model="openai/gpt-oss-120b",
         env_key="GROQ_API_KEY",
     ),
-    # Cohere — Command / Aya models via official OpenAI-compatible endpoint.
-    _compat(
-        "cohere",
-        "Cohere",
-        base_url="https://api.cohere.com/compatibility/v1",
+    # Cohere — native v2 Chat API, including multi-step tool use.
+    ProviderDescriptor(
+        name="cohere",
+        title="Cohere",
+        needs_key=True,
+        fields=[
+            ProviderField("api_key", "Cohere API key", secret=True),
+            ProviderField(
+                "base_url",
+                "Endpoint",
+                required=False,
+                default="https://api.cohere.com/v2",
+                placeholder="https://api.cohere.com/v2",
+                help="Cohere native v2 endpoint used for Chat and tool calling.",
+            ),
+        ],
+        build=lambda profile, secrets: CohereProvider(
+            api_key=((profile or {}).get("api_key") or "").strip()
+            or os.environ.get("COHERE_API_KEY", "").strip()
+            or None,
+            base_url=((profile or {}).get("base_url") or "").strip()
+            or "https://api.cohere.com/v2",
+        ),
         recommended_model="command-a-03-2025",
         env_key="COHERE_API_KEY",
-        endpoint_help="Prefilled with Cohere's official OpenAI-compatible endpoint: https://api.cohere.com/compatibility/v1",
+        blurb="Uses Cohere's native v2 Chat API with tool calling.",
     ),
     # Cerebras — wafer-scale inference, very fast. OpenAI-compatible. Free tier gives 65k
     # context (131k paid), enough to hold our ~200 tool schemas + a turn. Model ids as of
@@ -852,6 +878,15 @@ def verify_provider_key(
             resp = httpx.get(
                 "https://generativelanguage.googleapis.com/v1beta/models",
                 params={"key": key},
+                timeout=timeout,
+            )
+        elif name == "cohere":
+            # Chat uses /v2/chat, while Cohere's model catalog remains /v1/models.
+            configured = (base_url or "").strip().rstrip("/")
+            root = configured[:-3] if configured.endswith("/v2") else "https://api.cohere.com"
+            resp = httpx.get(
+                root + "/v1/models",
+                headers={"Authorization": f"Bearer {key}"},
                 timeout=timeout,
             )
         elif name == "ollama":

@@ -191,19 +191,19 @@ MATRIX: dict[str, ModelEntry] = {
         "GPT-OSS 20B · via Groq", _AGENTIC, 131_072
     ),
     "groq:groq/compound": ModelEntry(
-        "Compound · via Groq",
+        "Compound (text only) · via Groq",
         ModelCapabilities(tools=False, vision=False, streaming=True),
         131_072,
     ),
     "groq:groq/compound-mini": ModelEntry(
-        "Compound Mini · via Groq",
+        "Compound Mini (text only) · via Groq",
         ModelCapabilities(tools=False, vision=False, streaming=True),
         131_072,
     ),
     "groq:qwen/qwen3.6-27b": ModelEntry(
         "Qwen 3.6 27B · via Groq", _AGENTIC, 131_072
     ),
-    # Cohere — Command / Aya family via official OpenAI-compatible endpoint.
+    # Cohere — Command / Aya family via the native v2 Chat endpoint.
     # Free trial key: 20 RPM, 1,000 calls/month.
     "cohere:command-a-plus-05-2026": ModelEntry(
         "Command A+ (218B) · Cohere", _AGENTIC_VISION, 128_000

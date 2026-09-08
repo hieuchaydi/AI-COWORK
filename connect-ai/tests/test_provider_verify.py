@@ -83,6 +83,16 @@ def test_verify_gemini_key_param(monkeypatch):
     assert cap["params"]["key"] == "AIza-x"
 
 
+def test_verify_cohere_uses_v1_catalog_while_chat_uses_v2(monkeypatch):
+    cap: dict = {}
+    _patch_get(monkeypatch, status=200, capture=cap)
+    verify_provider_key(
+        "cohere", api_key="co-x", base_url="https://api.cohere.com/v2"
+    )
+    assert cap["url"] == "https://api.cohere.com/v1/models"
+    assert cap["headers"]["Authorization"] == "Bearer co-x"
+
+
 def test_verify_ollama_uses_v1_models_no_key(monkeypatch):
     cap: dict = {}
     _patch_get(monkeypatch, status=200, capture=cap)

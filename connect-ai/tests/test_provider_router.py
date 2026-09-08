@@ -45,6 +45,33 @@ def test_base_url_omitted_when_none(monkeypatch):
     assert "base_url" not in captured
 
 
+def test_groq_compound_drops_unsupported_tools_after_router_prefix_is_stripped():
+    captured: dict = {}
+
+    class FakeClient:
+        def __init__(self):
+            message = SimpleNamespace(content="text only", tool_calls=[])
+            response = SimpleNamespace(
+                choices=[SimpleNamespace(message=message, finish_reason="stop")],
+                usage=None,
+            )
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=lambda **kwargs: captured.update(kwargs) or response
+                )
+            )
+
+    provider = OpenAIProvider(client=FakeClient(), provider_name="groq")
+    turn = provider.complete(
+        model="groq/compound",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=_TODO_TOOLS,
+    )
+    assert turn.text == "text only"
+    assert captured["model"] == "groq/compound"
+    assert "tools" not in captured
+
+
 # -- ollama URL normalization ---------------------------------------------------
 def test_normalize_ollama_url():
     assert _normalize_ollama_url(None) == "http://localhost:11434/v1"
@@ -393,7 +420,7 @@ def test_set_provider_skips_recommended_when_not_pulled(tmp_path, monkeypatch):
 def test_provider_builders(monkeypatch):
     import pytest
 
-    from coworker.providers import AnthropicProvider, GeminiProvider
+    from coworker.providers import AnthropicProvider, CohereProvider, GeminiProvider
     from coworker.providers.registry import build_provider_client
 
     # anthropic and gemini are native: key resolution deferred to first call
@@ -416,6 +443,14 @@ def test_provider_builders(monkeypatch):
     )
     assert o._base_url == "https://my.azure.example/openai/v1"
     assert build_provider_client("openai", {}, None)._base_url is None
+
+    c = build_provider_client("cohere", {"api_key": "co-x"}, None)
+    assert isinstance(c, CohereProvider)
+    assert c._base_url == "https://api.cohere.com/v2"
+
+    groq = build_provider_client("groq", {"api_key": "gsk-x"}, None)
+    assert isinstance(groq, OpenAIProvider)
+    assert groq._provider_name == "groq"
 
 
 def test_anthropic_gemini_capabilities():

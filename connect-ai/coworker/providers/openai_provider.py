@@ -283,6 +283,7 @@ class OpenAIProvider(ProviderClient):
         base_url: Optional[str] = None,
         secrets: Any = None,
         default_max_tokens: Optional[int] = None,
+        provider_name: Optional[str] = None,
     ):
         # The SDK client is built lazily on first use, NOT at construction. This lets an engine
         # be assembled before any key exists — the desktop app lets you enter the key in Settings
@@ -298,6 +299,7 @@ class OpenAIProvider(ProviderClient):
         self._base_url = base_url
         self._secrets = secrets
         self._default_max_tokens = default_max_tokens
+        self._provider_name = (provider_name or "").lower() or None
         self.default_model = default_model
 
     def _apply_output_budget(self, kwargs: dict[str, Any]) -> None:
@@ -394,7 +396,12 @@ class OpenAIProvider(ProviderClient):
         )
 
     def capabilities(self, model: str) -> ModelCapabilities:
-        return capabilities_for(model)
+        qualified = model
+        if self._provider_name and self._provider_name != "openai":
+            prefix = model.split(":", 1)[0].lower() if ":" in model else ""
+            if prefix != self._provider_name:
+                qualified = f"{self._provider_name}:{model}"
+        return capabilities_for(qualified)
 
     def stream(
         self,

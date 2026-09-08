@@ -8,6 +8,7 @@ from .base import (
     ToolCall,
 )
 from .capabilities import capabilities_for
+from .cohere_provider import CohereProvider
 from .gemini_provider import GeminiProvider
 from .openai_provider import OpenAIProvider, resolve_api_key
 from .registry import (
@@ -37,6 +38,7 @@ __all__ = [
     "VertexProvider",
     "resolve_api_key",
     "capabilities_for",
+    "CohereProvider",
     "ProviderRouter",
     "ProviderDescriptor",
     "ProviderField",
