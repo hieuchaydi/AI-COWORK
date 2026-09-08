@@ -390,4 +390,9 @@ def models_for_provider(provider: str) -> list[str]:
     if provider == "openai":
         return [mid for mid in MATRIX if ":" not in mid]
     prefix = provider + ":"
-    return [mid[len(prefix) :] for mid in MATRIX if mid.startswith(prefix)]
+    aliases = {mid for mid in COHERE_ALIASES if mid.startswith(prefix)}
+    return [
+        mid[len(prefix) :]
+        for mid in MATRIX
+        if mid.startswith(prefix) and mid not in aliases
+    ]

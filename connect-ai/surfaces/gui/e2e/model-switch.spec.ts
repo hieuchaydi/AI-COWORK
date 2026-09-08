@@ -19,6 +19,7 @@ test("mid-session model switch shows the marker and later turns use the new mode
   const picker = page.locator(".dd").filter({ hasText: "Claude Opus 4.8" });
   await expect(picker).toBeVisible();
   await picker.locator(".pill").click();
+  await picker.locator('[data-provider="openai"]').click();
   await page.locator(".dd-item").filter({ hasText: "GPT-5.5" }).click();
 
   // The switch marker lands in the transcript…

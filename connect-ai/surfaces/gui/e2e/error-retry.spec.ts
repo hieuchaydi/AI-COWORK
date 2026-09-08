@@ -38,6 +38,7 @@ test("Retry survives a model switch — the intended recovery path", async ({ pa
   // (owner-hit 2026-07-23: the switch notices consumed it).
   const picker = page.locator(".dd").filter({ hasText: "Claude Opus 4.8" });
   await picker.locator(".pill").click();
+  await picker.locator('[data-provider="openai"]').click();
   await page.locator(".dd-item").filter({ hasText: "GPT-5.5" }).click();
   await expect(page.getByText(/Model switched to gpt-5.5/).first()).toBeVisible();
   const retry = page.getByTestId("notice-retry");

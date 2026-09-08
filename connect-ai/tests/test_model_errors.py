@@ -23,6 +23,12 @@ def test_new_flagships_in_matrix_with_labels():
     assert "claude-fable-5" in models_for_provider("anthropic")
 
 
+def test_models_for_provider_omits_cohere_alias_duplicates():
+    models = models_for_provider("cohere")
+    assert "command-a-03-2025" in models
+    assert "command-a" not in models
+
+
 def test_flagships_are_the_defaults():
     assert Config().model == "gpt-5.6-sol"
     assert get_descriptor("openai").recommended_model == "gpt-5.6-sol"

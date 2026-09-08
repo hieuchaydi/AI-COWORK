@@ -3,8 +3,9 @@ import type { Attachment, SessionUsage } from "../types";
 import { isPdfFile, readFile } from "../attach";
 import { getSettings, inspectPdf } from "../api";
 import { formatTokens, totalTokens } from "../usage";
-import { Dropdown, type Option } from "./Dropdown";
+import type { Option } from "./Dropdown";
 import { Icon } from "./Icon";
+import { ModelPicker } from "./ModelPicker";
 import { Toggle } from "./Toggle";
 import {
   cancelDictation,
@@ -328,13 +329,6 @@ export function Composer(props: Props) {
   };
 
   const modelsLoaded = !!(props.models && props.models.length);
-  const modelOptions: Option[] = Array.from(
-    new Set([props.model, ...(props.models || [])]),
-  ).map((m) => ({
-    value: m,
-    label: props.modelLabels?.[m] || shortModel(m),
-  }));
-
   const iconBtn =
     "w-7 h-7 grid place-items-center rounded-md text-muted hover:text-ink hover:bg-paper shrink-0";
 
@@ -495,7 +489,8 @@ export function Composer(props: Props) {
               <span className="model-warn-ico" aria-hidden>⚠</span>
             </button>
           ) : modelsLoaded ? (
-            <Dropdown value={props.model} options={modelOptions} onChange={props.onModelChange} align="right" />
+            <ModelPicker value={props.model} models={props.models || []}
+              modelLabels={props.modelLabels} onChange={props.onModelChange} />
           ) : (
             <button
               className="pill chip text-faint cursor-default"
