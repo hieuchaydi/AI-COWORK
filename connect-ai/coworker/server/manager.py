@@ -1811,10 +1811,15 @@ class SessionManager:
             if self.model in selectable
             else (selectable[0] if selectable else "")
         )
-        from ..providers.matrix import model_context_windows, model_labels
+        from ..providers.matrix import (
+            model_context_windows,
+            model_labels,
+            model_rate_limits,
+        )
 
         labels = model_labels()
         contexts = model_context_windows()
+        limits = model_rate_limits()
 
         return {
             "provider": "openai",
@@ -1829,6 +1834,10 @@ class SessionManager:
             # drives the composer's context-fill meter (absent id → meter hides).
             "model_context_windows": {
                 model: contexts[model] for model in selectable if model in contexts
+            },
+            # {full id → {"tpm": ..., "rpm": ...}}, rate limit specs for models that define them.
+            "model_rate_limits": {
+                model: limits[model] for model in selectable if model in limits
             },
             "has_key": env_key or stored,
             # Provider-agnostic "can this default model actually run?" — true when the default

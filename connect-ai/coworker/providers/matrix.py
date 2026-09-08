@@ -54,6 +54,8 @@ class ModelEntry:
     # Max context length in tokens (prompt side), for the GUI's context-fill meter.
     # None = not verified against the vendor spec yet; the meter hides.
     context_window: Optional[int] = None
+    tpm: Optional[int] = None
+    rpm: Optional[int] = None
 
 
 MATRIX: dict[str, ModelEntry] = {
@@ -65,6 +67,13 @@ MATRIX: dict[str, ModelEntry] = {
     "gpt-5.6-terra": ModelEntry("GPT-5.6 Terra · OpenAI", _AGENTIC_VISION, 400_000),
     "gpt-5.6-luna": ModelEntry("GPT-5.6 Luna · OpenAI", _AGENTIC_VISION, 400_000),
     "gpt-5.5": ModelEntry("GPT-5.5 · OpenAI", _AGENTIC_VISION, 400_000),
+    "gpt-5-mini": ModelEntry(
+        "GPT-5 Mini · OpenAI",
+        _AGENTIC_VISION,
+        400_000,
+        tpm=500_000,
+        rpm=500,
+    ),
     # Fable 5 (2026-06-09) is GA; its Mythos 5 sibling is approved-orgs-only, so it
     # stays out of a picker meant for the public.
     "anthropic:claude-fable-5": ModelEntry(
@@ -423,3 +432,13 @@ def models_for_provider(provider: str) -> list[str]:
         for mid in MATRIX
         if mid.startswith(prefix) and mid not in aliases
     ]
+
+
+def model_rate_limits() -> dict[str, dict[str, int]]:
+    """Full-id → rate limit specs (tpm/rpm) for entries that specify them."""
+    return {
+        mid: {k: v for k, v in (("tpm", e.tpm), ("rpm", e.rpm)) if v is not None}
+        for mid, e in MATRIX.items()
+        if e.tpm is not None or e.rpm is not None
+    }
+

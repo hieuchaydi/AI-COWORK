@@ -588,3 +588,28 @@ def test_under_cap_is_noop():
     tools = [_tool(f"builtin_{i}") for i in range(10)]
     provider.complete(model="llama-3.3-70b-versatile", messages=[], tools=tools)
     assert len(client.chat.completions.calls[0]["tools"]) == 10
+
+
+def test_gpt_5_mini_matrix_and_rate_limits():
+    from coworker.providers.matrix import (
+        MATRIX,
+        model_rate_limits,
+        models_for_provider,
+    )
+
+    assert "gpt-5-mini" in MATRIX
+    entry = MATRIX["gpt-5-mini"]
+    assert entry.label == "GPT-5 Mini · OpenAI"
+    assert entry.tpm == 500_000
+    assert entry.rpm == 500
+    assert entry.context_window == 400_000
+
+    openai_models = models_for_provider("openai")
+    assert "gpt-5-mini" in openai_models
+
+    limits = model_rate_limits()
+    assert limits["gpt-5-mini"] == {"tpm": 500_000, "rpm": 500}
+
+    caps = capabilities_for("gpt-5-mini")
+    assert caps.tools and caps.vision and caps.pdf and caps.streaming
+

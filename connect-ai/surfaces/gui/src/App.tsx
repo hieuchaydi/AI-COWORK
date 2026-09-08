@@ -166,6 +166,7 @@ export function App() {
   // {full model id → context window in tokens} from the curated matrix (verified only);
   // drives the composer usage chip's context-fill meter.
   const [modelContextWindows, setModelContextWindows] = useState<Record<string, number>>({});
+  const [modelRateLimits, setModelRateLimits] = useState<Record<string, { tpm?: number; rpm?: number }>>({});
   // Per-session token usage (OPE-42): rebuilt from the transcript on session load,
   // accumulated live from assistant_message events, reset with the transcript.
   const [usage, setUsage] = useState<SessionUsage>(emptyUsage());
@@ -503,6 +504,7 @@ export function App() {
         setModels(s.models || []);
         setModelLabels(s.model_labels || {});
         setModelContextWindows(s.model_context_windows || {});
+        setModelRateLimits(s.model_rate_limits || {});
         setModelReady(s.model_ready);
         if (s.surfaces) setSurfaces(s.surfaces);
       })
@@ -1591,6 +1593,7 @@ export function App() {
               model={model}
               models={models}
               modelLabels={modelLabels}
+              modelRateLimits={modelRateLimits}
               running={running}
               connected={connected}
               modelReady={modelReady}

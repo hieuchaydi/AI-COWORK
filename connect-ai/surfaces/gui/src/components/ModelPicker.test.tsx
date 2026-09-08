@@ -53,5 +53,34 @@ describe("ModelPicker", () => {
     fireEvent.click(screen.getByText("Nemotron 3.5 Lightning 30B · NVIDIA NIM"));
     expect(onChange).toHaveBeenCalledWith("nvidia:nvidia/nemotron-3.5-lightning-30b-a3b");
   });
+
+  it("renders rate limit badge and searches by rate limit terms", () => {
+    const onChange = vi.fn();
+    const extendedModels = [...models, "gpt-5-mini"];
+    const extendedLabels = {
+      ...labels,
+      "gpt-5-mini": "GPT-5 Mini · OpenAI",
+    };
+    const rateLimits = {
+      "gpt-5-mini": { tpm: 500000, rpm: 500 },
+    };
+    render(
+      <ModelPicker
+        value={models[0]}
+        models={extendedModels}
+        modelLabels={extendedLabels}
+        modelRateLimits={rateLimits}
+        onChange={onChange}
+      />
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Model" }));
+    fireEvent.click(screen.getByRole("button", { name: /OpenAI/ }));
+    expect(screen.getByText("500K TPM · 500 RPM")).toBeTruthy();
+
+    const searchInput = screen.getByPlaceholderText(/Search models or providers/i);
+    fireEvent.change(searchInput, { target: { value: "500k" } });
+    expect(screen.getByText("GPT-5 Mini · OpenAI")).toBeTruthy();
+    expect(screen.getByText("500K TPM · 500 RPM")).toBeTruthy();
+  });
 });
 

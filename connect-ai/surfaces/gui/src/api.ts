@@ -718,6 +718,8 @@ export interface ModelSettings {
   // {full id → context window in tokens}, verified matrix entries only — drives the
   // composer's context-fill meter (absent id → the meter hides). Optional for older backends.
   model_context_windows?: Record<string, number>;
+  // {full id → { tpm?: number, rpm?: number }}, verified rate limits (e.g. gpt-5-mini)
+  model_rate_limits?: Record<string, { tpm?: number; rpm?: number }>;
   // Token savings (PDF attachments): fallback for models without native PDF support,
   // and attach-time thresholds. Optional so the GUI is robust to an older backend.
   pdf_fallback?: "text" | "images";

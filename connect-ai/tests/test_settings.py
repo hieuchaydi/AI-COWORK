@@ -200,5 +200,22 @@ def test_model_picker_only_returns_configured_providers(tmp_path, monkeypatch):
     assert all(model.startswith("gemini:") for model in settings["models"])
     assert set(settings["model_labels"]) <= set(settings["models"])
     assert set(settings["model_context_windows"]) <= set(settings["models"])
+    assert set(settings["model_rate_limits"]) <= set(settings["models"])
     assert "gemini:gemini-3.5-flash" in settings["models"]
     assert "gemini:gemini-3.8-flash" in settings["models"]
+
+
+def test_settings_openai_includes_gpt_5_mini_and_rate_limits(tmp_path, monkeypatch):
+    from coworker.server.manager import SessionManager
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    manager = SessionManager(data_dir=tmp_path / "data")
+
+    settings = manager.get_settings()
+    assert "gpt-5-mini" in settings["models"]
+    assert settings["model_rate_limits"].get("gpt-5-mini") == {
+        "tpm": 500_000,
+        "rpm": 500,
+    }
+

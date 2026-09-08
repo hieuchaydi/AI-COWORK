@@ -50,6 +50,7 @@ interface Props {
   model: string;
   models?: string[];
   modelLabels?: Record<string, string>; // curated display names (raw id when absent)
+  modelRateLimits?: Record<string, { tpm?: number; rpm?: number }>;
   // The model is FIXED once the session has history (§17): the picker renders ONLY on a fresh
   // session; after the first turn the fact lives in the topbar subtitle (§22) — no
   // interactive-then-disabled control.
@@ -490,7 +491,8 @@ export function Composer(props: Props) {
             </button>
           ) : modelsLoaded ? (
             <ModelPicker value={props.model} models={props.models || []}
-              modelLabels={props.modelLabels} onChange={props.onModelChange} />
+              modelLabels={props.modelLabels} modelRateLimits={props.modelRateLimits}
+              onChange={props.onModelChange} />
           ) : (
             <button
               className="pill chip text-faint cursor-default"

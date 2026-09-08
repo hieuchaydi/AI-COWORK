@@ -35,6 +35,19 @@ export const isOneMillionModel = (value: string, label: string = "") => {
   );
 };
 
+export const formatRateLimits = (limits?: { tpm?: number; rpm?: number }) => {
+  if (!limits) return "";
+  const parts: string[] = [];
+  if (limits.tpm !== undefined && limits.tpm !== null) {
+    const tpmStr = limits.tpm >= 1000 ? `${(limits.tpm / 1000).toLocaleString("en-US")}K TPM` : `${limits.tpm} TPM`;
+    parts.push(tpmStr);
+  }
+  if (limits.rpm !== undefined && limits.rpm !== null) {
+    parts.push(`${limits.rpm} RPM`);
+  }
+  return parts.join(" · ");
+};
+
 /** Build the visible list and collapse aliases which have the same display label. */
 export function groupModelChoices(
   models: string[], labels: Record<string, string>, selected: string,
@@ -56,10 +69,11 @@ interface Props {
   value: string;
   models: string[];
   modelLabels?: Record<string, string>;
+  modelRateLimits?: Record<string, { tpm?: number; rpm?: number }>;
   onChange: (value: string) => void;
 }
 
-export function ModelPicker({ value, models, modelLabels = {}, onChange }: Props) {
+export function ModelPicker({ value, models, modelLabels = {}, modelRateLimits = {}, onChange }: Props) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
   const groups = useMemo(() => groupModelChoices(models, modelLabels, value), [models, modelLabels, value]);
@@ -75,13 +89,17 @@ export function ModelPicker({ value, models, modelLabels = {}, onChange }: Props
   const filteredChoices = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return null;
-    return allChoices.filter((c) =>
-      c.label.toLowerCase().includes(q) ||
-      c.value.toLowerCase().includes(q) ||
-      providerLabel(c.provider).toLowerCase().includes(q) ||
-      (q === "1m" && isOneMillionModel(c.value, c.label))
-    );
-  }, [allChoices, search]);
+    return allChoices.filter((c) => {
+      const limitsStr = formatRateLimits(modelRateLimits[c.value]).toLowerCase();
+      return (
+        c.label.toLowerCase().includes(q) ||
+        c.value.toLowerCase().includes(q) ||
+        providerLabel(c.provider).toLowerCase().includes(q) ||
+        (limitsStr && limitsStr.includes(q)) ||
+        (q === "1m" && isOneMillionModel(c.value, c.label))
+      );
+    });
+  }, [allChoices, search, modelRateLimits]);
 
   return (
     <div className="dd model-picker">
@@ -128,6 +146,7 @@ export function ModelPicker({ value, models, modelLabels = {}, onChange }: Props
                 ) : (
                   filteredChoices.map((choice) => {
                     const is1M = isOneMillionModel(choice.value, choice.label);
+                    const limitsStr = formatRateLimits(modelRateLimits[choice.value]);
                     const rawId = choice.value.includes(":") ? choice.value.split(":")[1] : choice.value;
                     return (
                       <button
@@ -141,6 +160,7 @@ export function ModelPicker({ value, models, modelLabels = {}, onChange }: Props
                             <span className="model-choice-header">
                               <span className="model-choice-title">{choice.label}</span>
                               {is1M && <span className="model-badge-1m">1M Context</span>}
+                              {limitsStr && <span className="model-badge-limits">{limitsStr}</span>}
                             </span>
                             <span className="model-choice-id">{providerLabel(choice.provider)} · {rawId}</span>
                           </span>
@@ -175,6 +195,7 @@ export function ModelPicker({ value, models, modelLabels = {}, onChange }: Props
                   <div className="model-picker-heading">{providerLabel(provider)} models</div>
                   {choices.map((choice) => {
                     const is1M = isOneMillionModel(choice.value, choice.label);
+                    const limitsStr = formatRateLimits(modelRateLimits[choice.value]);
                     const rawId = choice.value.includes(":") ? choice.value.split(":")[1] : choice.value;
                     return (
                       <button
@@ -188,6 +209,7 @@ export function ModelPicker({ value, models, modelLabels = {}, onChange }: Props
                             <span className="model-choice-header">
                               <span className="model-choice-title">{choice.label}</span>
                               {is1M && <span className="model-badge-1m">1M</span>}
+                              {limitsStr && <span className="model-badge-limits">{limitsStr}</span>}
                             </span>
                             <span className="model-choice-id">{rawId}</span>
                           </span>

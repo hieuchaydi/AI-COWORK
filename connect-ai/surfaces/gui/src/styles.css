@@ -598,6 +598,15 @@ button.btn.danger { color: var(--accent); }
 html[data-theme="dark"] .model-badge-1m {
   background: rgba(5, 150, 105, 0.18); border-color: rgba(5, 150, 105, 0.35); color: #34d399;
 }
+.model-badge-limits {
+  display: inline-flex; align-items: center; gap: 3px;
+  font-size: 10px; font-weight: 600; color: #2563eb;
+  background: #eff6ff; border: 1px solid #bfdbfe;
+  padding: 1px 5px; border-radius: 6px; line-height: 1.2;
+}
+html[data-theme="dark"] .model-badge-limits {
+  background: rgba(37, 99, 235, 0.18); border-color: rgba(37, 99, 235, 0.35); color: #60a5fa;
+}
 .model-choice-id {
   font-family: var(--mono); font-size: 10.5px; color: var(--faint);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
