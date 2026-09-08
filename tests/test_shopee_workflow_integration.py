@@ -419,7 +419,9 @@ def test_shopee_workflow_verification_required_and_resume(setup_shopee_environme
             "type": "verification.resolved",
             "params": {"jobId": job_id, "retry": True},
         })
-        time.sleep(0.1)
+        deadline = time.time() + 2.0
+        while server.transport.is_paused() and time.time() < deadline:
+            time.sleep(0.02)
 
         # Server unpauses verification
         assert server.transport.is_paused() is False

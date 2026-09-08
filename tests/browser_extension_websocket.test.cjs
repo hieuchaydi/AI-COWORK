@@ -457,6 +457,37 @@ test('ratings preflight and pagination execute in the Shopee page MAIN world', a
   assert.equal(vm.runInContext('PACE_MS', context), 1200);
 });
 
+test('Shopee job creates a browser window when MV3 worker has no current window', async () => {
+  const { context } = await worker();
+  vm.runInContext(`
+    globalThis.createdWindow = null;
+    chrome.tabs = {
+      query: async (query) => query && query.windowId
+        ? [{ id: 77, windowId: query.windowId, status: "complete", url: "https://shopee.vn/product/111/222" }]
+        : [],
+      create: async () => { throw new Error("No current window"); },
+      get: async (id) => ({ id, windowId: 9, status: "complete", url: "https://shopee.vn/product/111/222" }),
+      onUpdated: { addListener() {}, removeListener() {} },
+    };
+    chrome.windows = {
+      create: async options => {
+        createdWindow = options;
+        return {
+          id: 9,
+          tabs: [{ id: 77, windowId: 9, status: "complete", url: options.url }],
+        };
+      },
+    };
+  `, context);
+
+  const tab = await vm.runInContext(`
+    findOrOpenShopeeTab("https://shopee.vn/product/111/222", "222")
+  `, context);
+  assert.equal(tab.id, 77);
+  assert.equal(tab.url, 'https://shopee.vn/product/111/222');
+  assert.equal(vm.runInContext('createdWindow.focused', context), false);
+});
+
 test('ratings script retries when Chrome transiently returns no result', async () => {
   const { context, timeouts } = await worker();
   vm.runInContext(`

@@ -384,8 +384,22 @@ async function findOrOpenShopeeTab(targetUrl, itemid) {
   let tab = tabs.find((t) => t.url && isValidShopeeUrl(t.url) && itemid && t.url.includes(String(itemid)));
   // 2. Or create a new tab if none exists with this item
   if (!tab) {
-    tab = await chrome.tabs.create({ url: targetUrl, active: false });
-    await new Promise((resolve) => {
+    try {
+      tab = await chrome.tabs.create({ url: targetUrl, active: false });
+    } catch (err) {
+      // An MV3 service worker has no "current window". This happens after Chrome
+      // restores only background processes: the socket is connected, but tabs.create
+      // rejects until a real browser window exists. Create one and continue the same job.
+      const noWindow = /no current window|window/i.test(String(err?.message || err));
+      if (!noWindow || !chrome.windows?.create) throw err;
+      const win = await chrome.windows.create({ url: targetUrl, focused: false });
+      tab = win?.tabs?.[0] || null;
+      if (!tab && win?.id) {
+        const windowTabs = await chrome.tabs.query({ windowId: win.id });
+        tab = windowTabs[0] || null;
+      }
+    }
+    if (tab && tab.status !== "complete") await new Promise((resolve) => {
       let timer = null;
       const listener = (tid, changeInfo) => {
         if (tid === tab.id && changeInfo.status === "complete") {
@@ -1212,8 +1226,6 @@ async function handleAction(action, params) {
     }
 
     case "tab.open": {
-      const tab = await chrome.tabs.create({ url: params.url, active: params.active !== false });
-      return { tabId: tab.id, url: tab.url };
       try {
         const tab = await chrome.tabs.create({ url: params.url, active: params.active !== false });
         return { tabId: tab.id, url: tab.url };
