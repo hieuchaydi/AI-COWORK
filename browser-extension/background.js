@@ -17,6 +17,7 @@ const HELPER = "http://127.0.0.1:8766";
 const PAGE_SIZE = 6;
 const MAX_REVIEWS = 20000;
 const PACE_MS = 1200;
+const RATING_TYPES = [0, 5, 4, 3, 2, 1];
 
 // ── State Variables ──────────────────────────────────────────────────────────
 let bridgeSocket = null;
@@ -199,6 +200,7 @@ function buildTraceEntry(job, event, details = {}) {
   if (typeof details.rowsCount === "number") entry.rowsCount = details.rowsCount;
   if (typeof details.batchSize === "number") entry.batchSize = details.batchSize;
   if (typeof details.totalTarget === "number") entry.totalTarget = details.totalTarget;
+  if (typeof details.ratingType === "number") entry.ratingType = details.ratingType;
 
   return entry;
 }
@@ -228,6 +230,8 @@ async function uploadIngestResult(body) {
       source: body.source,
       itemid: body.itemid,
       max_zip_mb: body.max_zip_mb,
+      crawl_summary: body.crawl_summary,
+      partial: body.partial,
     }, { timeoutMs: 30 * 60 * 1000 });
   }
 
@@ -251,6 +255,8 @@ async function rememberCompletedResult(job, savedResult) {
     source: job?.url || null,
     completedAt: Date.now(),
     count: Number(savedResult.count) || 0,
+    partial: savedResult.partial === true,
+    crawl_summary: savedResult.crawl_summary || null,
     csv: savedResult.csv || null,
     media_dir: savedResult.media_dir || null,
     manifest: savedResult.manifest || null,
@@ -578,15 +584,15 @@ async function executeScriptResultWithRetry(options) {
   };
 }
 
-async function fetchRatingsFromTab(tabId, itemid, shopid, offset, limit, referer) {
+async function fetchRatingsFromTab(tabId, itemid, shopid, offset, limit, referer, ratingType = 0) {
   return executeScriptResultWithRetry({
     target: { tabId },
     // Run as the Shopee page itself. The default ISOLATED world gives the
     // request an extension/content-script initiator that Shopee's WAF rejects
     // even when the tab has a valid logged-in cookie.
     world: "MAIN",
-    func: async (iid, sid, off, lim, ref) => {
-      const path = `/api/v2/item/get_ratings?filter=0&flag=1&itemid=${iid}&limit=${lim}&offset=${off}&shopid=${sid}&type=0`;
+    func: async (iid, sid, off, lim, ref, type) => {
+      const path = `/api/v2/item/get_ratings?filter=0&flag=1&itemid=${iid}&limit=${lim}&offset=${off}&shopid=${sid}&type=${type}`;
       const controller = new AbortController();
       const tid = setTimeout(() => controller.abort(new Error("TIMEOUT")), 15000);
       try {
@@ -619,8 +625,21 @@ async function fetchRatingsFromTab(tabId, itemid, shopid, offset, limit, referer
         return { ok: false, error: err.message, isTimeout: err.name === "AbortError" || err.message === "TIMEOUT" };
       }
     },
-    args: [itemid, shopid, offset, limit, referer],
+    args: [itemid, shopid, offset, limit, referer, ratingType],
   });
+}
+
+function reviewFingerprint(review) {
+  if (!review || typeof review !== "object") return "";
+  return [
+    review.user || "",
+    review.thoi_gian || "",
+    review.sao || "",
+    review.noi_dung || "",
+    review.phan_loai || "",
+    review.anh_urls || "",
+    review.video_urls || "",
+  ].join("\u001f");
 }
 
 function shopeeLoginState(fetchRes) {
@@ -822,13 +841,19 @@ async function extractShopeeReviews(job, progress) {
     throw err;
   }
 
-  let all = [];
+  const all = [];
+  const seen = new Set();
+  let ratingType = (job.checkpoint && Number.isInteger(job.checkpoint.rating_type))
+    ? job.checkpoint.rating_type
+    : 0;
+  let typeIndex = Math.max(0, RATING_TYPES.indexOf(ratingType));
   let offset = (job.checkpoint && typeof job.checkpoint.next_offset === "number")
     ? job.checkpoint.next_offset
     : ((job.checkpoint && typeof job.checkpoint.offset === "number") ? job.checkpoint.offset : 0);
   let resumedRowsCount = (job.checkpoint && typeof job.checkpoint.rows_count === "number")
     ? job.checkpoint.rows_count
-    : 0;
+    : offset;
+  let durableRowsCount = resumedRowsCount;
   let total = (job.checkpoint && typeof job.checkpoint.total === "number") ? job.checkpoint.total : null;
 
   if (offset === 0) {
@@ -838,25 +863,31 @@ async function extractShopeeReviews(job, progress) {
       if (chk && typeof chk.next_offset === "number") {
         offset = chk.next_offset;
         resumedRowsCount = typeof chk.rows_count === "number" ? chk.rows_count : chk.next_offset;
+        durableRowsCount = resumedRowsCount;
+        if (Number.isInteger(chk.rating_type) && RATING_TYPES.includes(chk.rating_type)) {
+          ratingType = chk.rating_type;
+          typeIndex = RATING_TYPES.indexOf(ratingType);
+        }
         if (chk.shopid && !shopid) shopid = chk.shopid;
         if (chk.total && total === null) total = chk.total;
       }
     } catch {}
   }
 
-  while (resumedRowsCount + all.length < MAX_REVIEWS) {
+  while (durableRowsCount < MAX_REVIEWS) {
     const requestStarted = Date.now();
     const requestStartIso = new Date(requestStarted).toISOString();
     await traceJob(job, progress, "ratings-request", {
       itemid,
       shopid,
       offset,
+      ratingType,
       limit: PAGE_SIZE,
       tabId: tab.id,
       tabUrl: tab.url || "",
       requestStart: requestStartIso,
     });
-    let fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, tab.url || job.url);
+    let fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, tab.url || job.url, ratingType);
     if (!fetchRes.ok && (fetchRes.retryableTabError || fetchRes.isTimeout)) {
       const recoveredTab = await findOrOpenShopeeTab(job.url, itemid);
       if (recoveredTab?.id) {
@@ -869,10 +900,11 @@ async function extractShopeeReviews(job, progress) {
           tabId: tab.id,
           tabUrl: tab.url || job.url,
           offset,
+          ratingType,
           limit: PAGE_SIZE,
           error: fetchRes.error,
         });
-        fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, tab.url || job.url);
+        fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, tab.url || job.url, ratingType);
       }
     }
     const requestEnded = Date.now();
@@ -884,6 +916,7 @@ async function extractShopeeReviews(job, progress) {
       itemid,
       shopid,
       offset,
+      ratingType,
       limit: PAGE_SIZE,
       tabId: tab.id,
       tabUrl: tab.url || "",
@@ -912,17 +945,72 @@ async function extractShopeeReviews(job, progress) {
     }
 
     const batch = (json && (json.data?.ratings || json.ratings || json.items)) || [];
-    if (!Array.isArray(batch) || batch.length === 0) break;
+    if (!Array.isArray(batch) || batch.length === 0) {
+      // Shopee silently truncates the unfiltered type=0 feed at roughly 3,000
+      // reviews while still advertising the full rating_total. Continue through
+      // the five star buckets and let the checkpoint store deduplicate overlaps.
+      if (total && durableRowsCount < total && typeIndex + 1 < RATING_TYPES.length) {
+        typeIndex += 1;
+        ratingType = RATING_TYPES[typeIndex];
+        offset = 0;
+        const segmentCheckpoint = await sendCheckpoint({
+          job: job.id,
+          offset: 0,
+          next_offset: 0,
+          rating_type: ratingType,
+          itemid,
+          shopid,
+          rows: [],
+          total,
+        });
+        durableRowsCount = Number(segmentCheckpoint?.rows_count) || durableRowsCount;
+        await chrome.storage.local.set({
+          [`checkpoint_${job.id}`]: {
+            next_offset: 0,
+            rating_type: ratingType,
+            rows_count: durableRowsCount,
+            itemid,
+            shopid,
+            total,
+            updated_at: Date.now(),
+          },
+        });
+        await traceJob(job, progress, "ratings-segment", {
+          itemid,
+          shopid,
+          ratingType,
+          rowsCount: durableRowsCount,
+          totalTarget: total,
+        });
+        await progress({
+          status: "running",
+          stage: "fetch",
+          message: `Shopee giới hạn luồng tổng; đang cào tiếp nhóm ${ratingType} sao`,
+          rows: durableRowsCount,
+          percent: crawlPercent(durableRowsCount, total, 10, 80),
+        });
+        continue;
+      }
+      break;
+    }
 
-    const normalised = batch.map(normaliseRating);
+    const normalised = batch
+      .map(normaliseRating)
+      .filter((review) => {
+        const key = reviewFingerprint(review);
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
     all.push(...normalised);
     if (total === null) total = ratingTotal(json);
-    const completedRows = resumedRowsCount + all.length;
+    const completedRows = durableRowsCount + normalised.length;
     const pct = crawlPercent(completedRows, total, 10, 80);
     await traceJob(job, progress, "ratings-batch", {
       itemid,
       shopid,
       offset,
+      ratingType,
       limit: PAGE_SIZE,
       tabId: tab.id,
       tabUrl: tab.url || "",
@@ -943,15 +1031,18 @@ async function extractShopeeReviews(job, progress) {
       job: job.id,
       offset: nextOffset,
       next_offset: nextOffset,
+      rating_type: ratingType,
       itemid,
       shopid,
       rows: normalised,
       total,
     });
+    durableRowsCount = Number(savedCheckpoint?.rows_count) || completedRows;
     await chrome.storage.local.set({
       [`checkpoint_${job.id}`]: {
         next_offset: nextOffset,
-        rows_count: Number(savedCheckpoint?.rows_count) || completedRows,
+        rating_type: ratingType,
+        rows_count: durableRowsCount,
         itemid,
         shopid,
         total,
@@ -959,11 +1050,46 @@ async function extractShopeeReviews(job, progress) {
       },
     });
 
-    if (batch.length < PAGE_SIZE) break;
-    offset += PAGE_SIZE;
+    if (batch.length < PAGE_SIZE) {
+      if (total && durableRowsCount < total && typeIndex + 1 < RATING_TYPES.length) {
+        typeIndex += 1;
+        ratingType = RATING_TYPES[typeIndex];
+        offset = 0;
+        const segmentCheckpoint = await sendCheckpoint({
+          job: job.id,
+          offset: 0,
+          next_offset: 0,
+          rating_type: ratingType,
+          itemid,
+          shopid,
+          rows: [],
+          total,
+        });
+        durableRowsCount = Number(segmentCheckpoint?.rows_count) || durableRowsCount;
+        await chrome.storage.local.set({
+          [`checkpoint_${job.id}`]: {
+            next_offset: 0,
+            rating_type: ratingType,
+            rows_count: durableRowsCount,
+            itemid,
+            shopid,
+            total,
+            updated_at: Date.now(),
+          },
+        });
+        continue;
+      }
+      break;
+    }
     offset = nextOffset;
     await new Promise((s) => setTimeout(s, PACE_MS));
   }
+  job._crawlSummary = {
+    expected: total,
+    collected: durableRowsCount,
+    complete: !total || durableRowsCount >= total,
+    finalRatingType: ratingType,
+  };
   try { await chrome.storage.local.remove([`checkpoint_${job.id}`]); } catch {}
   return all;
 }
@@ -987,6 +1113,7 @@ async function runJob(job) {
     }
     const parsed = idsFrom(job.url);
     const itemid = parsed.itemid || job.itemid;
+    const crawlSummary = job._crawlSummary || null;
     const outputName = itemid ? "shopee_" + itemid + "_reviews" : (job.name || "shopee_" + job.id);
     await traceJob(job, progress, "upload-start", {
       itemid,
@@ -994,10 +1121,29 @@ async function runJob(job) {
       tabId: job._targetTabId,
       tabUrl: job._targetTabUrl,
       rowsCount: rows.length,
+      totalTarget: crawlSummary?.expected || null,
       outputName,
     });
-    await progress({ status: "saving", stage: "upload", message: `Đang lưu ${rows.length} dòng`, rows: rows.length, percent: 95 });
-    const savedResult = await uploadIngestResult({ job: job.id, name: outputName, source: job.url, rows });
+    const partial = Boolean(crawlSummary && !crawlSummary.complete);
+    await progress({
+      status: "saving",
+      stage: partial ? "partial-upload" : "upload",
+      message: partial
+        ? `Đã lấy tối đa ${crawlSummary.collected}/${crawlSummary.expected} đánh giá Shopee cho phép; đang lưu kết quả một phần`
+        : `Đang lưu ${rows.length} dòng`,
+      rows: crawlSummary?.collected || rows.length,
+      total: crawlSummary?.expected || null,
+      partial,
+      percent: 95,
+    });
+    const savedResult = await uploadIngestResult({
+      job: job.id,
+      name: outputName,
+      source: job.url,
+      rows,
+      crawl_summary: crawlSummary,
+      partial,
+    });
     await rememberCompletedResult(job, savedResult);
     await traceJob(job, progress, "upload-complete", {
       itemid,
@@ -2238,7 +2384,9 @@ if (typeof module !== "undefined" && module.exports) {
     evaluatePreflightResult,
     extractShopeeReviews,
     normaliseRating,
+    reviewFingerprint,
     ratingTotal,
+    RATING_TYPES,
     crawlPercent,
     classifyShopeeFailure,
     formatShopeeFailure,

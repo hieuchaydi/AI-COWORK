@@ -81,7 +81,11 @@ function renderCompletedResult(result, wsUrl) {
   resultSection.style.display = "block";
   const completed = result.completedAt ? new Date(result.completedAt).toLocaleString("vi-VN") : "";
   const count = Number(result.count).toLocaleString("vi-VN");
-  resultSummary.textContent = `Đã lưu ${count} đánh giá${completed ? ` · ${completed}` : ""}`;
+  const expected = Number(result.crawl_summary?.expected) || 0;
+  const partial = result.partial === true;
+  resultSummary.textContent = partial && expected
+    ? `Đã lưu tối đa ${count}/${expected.toLocaleString("vi-VN")} đánh giá (kết quả một phần)${completed ? ` · ${completed}` : ""}`
+    : `Đã lưu ${count} đánh giá${completed ? ` · ${completed}` : ""}`;
 
   setResultLink(downloadCsv, result.csv, wsUrl);
   const allZipUrls = Array.isArray(result.zip_urls) && result.zip_urls.length

@@ -113,6 +113,8 @@ test('completed ingest result is persisted for popup download links', async () =
     {
       ok: true,
       count: 6789,
+      partial: true,
+      crawl_summary: { expected: 6819, collected: 6789, complete: false },
       csv: "outputs/csv/shopee_1546910319_reviews.csv",
       media_dir: "outputs/media/shopee_1546910319_reviews",
       manifest: "outputs/media/shopee_1546910319_reviews/manifest.json",
@@ -132,6 +134,8 @@ test('completed ingest result is persisted for popup download links', async () =
   )`, context);
 
   assert.equal(result.count, 6789);
+  assert.equal(result.partial, true);
+  assert.equal(result.crawl_summary.expected, 6819);
   assert.equal(result.zip_urls.length, 2);
   assert.equal(stored.lastCompletedResult.jobId, 'job-downloads');
   assert.equal(stored.lastCompletedResult.rows, undefined);
@@ -708,13 +712,46 @@ test('service worker restart resume dung offset tu checkpoint', async () => {
     extractShopeeReviews({
       id: "job-chk-resume",
       url: "https://shopee.vn/product/111/222",
-      checkpoint: { next_offset: 3000, shopid: "111", total: 5000 }
+      checkpoint: { next_offset: 3000, rows_count: 3000, shopid: "111", total: 5000 }
     }, () => {})
   `, context);
 
   const offsets = Array.from(vm.runInContext('globalThis.recordedOffsets', context));
-  assert.ok(offsets.includes(3000), "Should start crawling at offset 3000");
-  assert.ok(!offsets.includes(0), "Should not crawl offset 0");
+  assert.equal(offsets[0], 3000, "Should resume the interrupted segment at offset 3000");
+  assert.ok(offsets.slice(1).includes(0), "Should continue with star buckets after the aggregate feed ends");
+});
+
+test('fetchRatingsFromTab forwards the selected star bucket to Shopee', async () => {
+  const { context } = await worker();
+  vm.runInContext(`
+    globalThis.capturedRatingType = null;
+    chrome.scripting = {
+      executeScript: async (opts) => {
+        capturedRatingType = opts.args[5];
+        return [{ result: { ok: true, status: 200, json: { data: { ratings: [] } } } }];
+      }
+    };
+  `, context);
+
+  const result = await vm.runInContext(`
+    fetchRatingsFromTab(1, "123", "456", 0, 6, "https://shopee.vn/product/456/123", 5)
+  `, context);
+
+  assert.equal(result.ok, true);
+  assert.equal(vm.runInContext('capturedRatingType', context), 5);
+});
+
+test('reviewFingerprint deduplicates the same review across rating segments', async () => {
+  const { context } = await worker();
+  const keys = vm.runInContext(`(() => {
+    const review = {
+      user: "buyer", thoi_gian: "2026-09-08 10:00:00", sao: 5,
+      noi_dung: "tot", phan_loai: "den", anh_urls: "a.jpg", video_urls: ""
+    };
+    return [reviewFingerprint(review), reviewFingerprint({ ...review })];
+  })()`, context);
+  assert.equal(keys[0], keys[1]);
+  assert.ok(keys[0].length > 0);
 });
 
 

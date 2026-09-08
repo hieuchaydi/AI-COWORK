@@ -917,6 +917,7 @@ def test_checkpoint_does_not_create_premature_zip_or_csv(server):
         job_id,
         {
             "next_offset": 30,
+            "rating_type": 5,
             "itemid": "222",
             "shopid": "111",
             "rows": [
@@ -928,6 +929,7 @@ def test_checkpoint_does_not_create_premature_zip_or_csv(server):
     )
     assert res["ok"] is True
     assert res["next_offset"] == 30
+    assert res["rating_type"] == 5
     assert res["rows_count"] == 30
 
     # Verify no CSV, no ZIP, and job is still in progress, NOT done
@@ -940,6 +942,7 @@ def test_checkpoint_does_not_create_premature_zip_or_csv(server):
     assert prog["ok"] is True
     assert prog["progress"]["status"] == "running"
     assert prog["progress"]["rows"] == 30
+    assert prog["progress"]["checkpoint"]["rating_type"] == 5
 
     # A result inquiry does NOT show premature completion
     r = _get(base, f"/ingest/result?id={job_id}")
@@ -980,10 +983,18 @@ def test_checkpoint_resumes_and_merges_full_dataset(server):
             "job": job_id,
             "source": "https://shopee.vn/product/111/333",
             "rows": final_rows,
+            "partial": True,
+            "crawl_summary": {"expected": 60, "collected": 50, "complete": False},
         },
     )
     assert status == 200 and out["ok"]
     assert out["count"] == 50  # 30 from checkpoint + 20 from final batch = 50 total!
+    assert out["partial"] is True
+    assert out["crawl_summary"]["expected"] == 60
+
+    result = _get(base, f"/ingest/result?id={job_id}")
+    assert result["result"]["partial"] is True
+    assert result["result"]["crawl_summary"]["collected"] == 50
 
     csv_path = outputs / "csv" / "shopee_333_reviews.csv"
     assert csv_path.is_file()

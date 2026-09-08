@@ -298,6 +298,7 @@ def _save_ingest_checkpoint(job_id: str, params: dict) -> dict:
             "rows": [],
             "seen_keys": set(),
             "next_offset": 0,
+            "rating_type": 0,
             "itemid": None,
             "shopid": None,
             "total": None,
@@ -323,6 +324,8 @@ def _save_ingest_checkpoint(job_id: str, params: dict) -> dict:
             offset = params.get("offset")
         if offset is not None:
             chk["next_offset"] = _safe_int(offset)
+        if params.get("rating_type") is not None:
+            chk["rating_type"] = _safe_int(params["rating_type"])
         if params.get("itemid"):
             chk["itemid"] = str(params["itemid"])
         if params.get("shopid"):
@@ -333,6 +336,7 @@ def _save_ingest_checkpoint(job_id: str, params: dict) -> dict:
 
         current_rows_count = len(chk["rows"])
         next_offset = chk["next_offset"]
+        rating_type = chk.get("rating_type", 0)
         total = chk.get("total")
         itemid = chk.get("itemid")
         shopid = chk.get("shopid")
@@ -347,6 +351,7 @@ def _save_ingest_checkpoint(job_id: str, params: dict) -> dict:
             "offset": next_offset,
             "checkpoint": {
                 "next_offset": next_offset,
+                "rating_type": rating_type,
                 "rows_count": current_rows_count,
                 "itemid": itemid,
                 "shopid": shopid,
@@ -359,6 +364,7 @@ def _save_ingest_checkpoint(job_id: str, params: dict) -> dict:
         "ok": True,
         "job": job_id,
         "next_offset": next_offset,
+        "rating_type": rating_type,
         "rows_count": current_rows_count,
     }
 
@@ -664,6 +670,7 @@ def _queue_ingest_job(url: str, kind: str) -> dict:
                     job_msg["checkpoint"] = {
                         "next_offset": chk.get("next_offset", 0),
                         "offset": chk.get("next_offset", 0),
+                        "rating_type": chk.get("rating_type", 0),
                         "itemid": chk.get("itemid"),
                         "shopid": chk.get("shopid"),
                         "total": chk.get("total"),
@@ -751,6 +758,7 @@ def _on_browser_ws_connect() -> None:
                 job_msg["checkpoint"] = {
                     "next_offset": chk.get("next_offset", 0),
                     "offset": chk.get("next_offset", 0),
+                    "rating_type": chk.get("rating_type", 0),
                     "itemid": chk.get("itemid"),
                     "shopid": chk.get("shopid"),
                     "total": chk.get("total"),
@@ -1072,6 +1080,8 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
     print(f"[ingest] {len(rows)} rows → {target}", file=sys.stderr)
     result = {
         "ok": True,
+        "partial": bool(body.get("partial")) if isinstance(body, dict) else False,
+        "crawl_summary": body.get("crawl_summary") if isinstance(body, dict) else None,
         "count": len(rows),
         "path": f"outputs/inbox/{name}",
         "url": f"/outputs/inbox/{name}",
@@ -1099,6 +1109,8 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
                 "message": f"Đã lưu {len(rows)} dòng" + (f", đóng gói {zip_rel}" if zip_rel else ""),
                 "rows": len(rows),
                 "count": len(rows),
+                "partial": result["partial"],
+                "crawl_summary": result["crawl_summary"],
                 "path": result["path"],
                 "csv": csv_rel,
                 "media_dir": result.get("media_dir"),
