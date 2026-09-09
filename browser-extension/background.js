@@ -2362,6 +2362,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     });
     return true;
   }
+  if (msg.action === "clearCompletedResult") {
+    lastCompletedResult = null;
+    chrome.storage.local.remove("lastCompletedResult", () => {
+      sendResponse({ ok: !chrome.runtime.lastError });
+    });
+    return true;
+  }
   if (msg.action === "connect" || msg.action === "disconnect") {
     configureConnection(msg).then(() => sendResponse({ ok: true }), error => sendResponse({ ok: false, error: error.message }));
     return true;

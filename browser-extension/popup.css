@@ -210,6 +210,33 @@ button {
   color: #3c4043;
 }
 
+.result-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.result-heading .section-title { margin-bottom: 6px; }
+
+.dismiss-result {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #5f6368;
+  font-size: 19px;
+  font-weight: 400;
+  line-height: 18px;
+}
+
+.dismiss-result:hover,
+.dismiss-result:focus-visible {
+  background: #d8f0dd;
+  color: #137333;
+}
+
 .job-progress {
   margin-top: 7px;
   padding: 8px;

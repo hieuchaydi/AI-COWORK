@@ -28,6 +28,7 @@ const downloadZip = document.getElementById("downloadZip");
 const openManifest = document.getElementById("openManifest");
 const openReport = document.getElementById("openReport");
 const zipParts = document.getElementById("zipParts");
+const btnDismissResult = document.getElementById("btnDismissResult");
 
 let currentVerification = null;
 let currentJobId = null;
@@ -363,6 +364,11 @@ btnAutoPair.addEventListener("click", () => changeConnection("connect"));
 btnConnect.addEventListener("click", () => changeConnection("connect"));
 btnDisconnect.addEventListener("click", () => changeConnection("disconnect"));
 btnExportSnapshot.addEventListener("click", exportSnapshot);
+btnDismissResult.addEventListener("click", async () => {
+  // Only dismisses the notification card. The generated CSV/ZIP files remain intact.
+  resultSection.style.display = "none";
+  await chrome.runtime.sendMessage({ action: "clearCompletedResult" });
+});
 
 if (btnOpenVerificationTab) {
   btnOpenVerificationTab.addEventListener("click", async () => {
