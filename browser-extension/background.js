@@ -262,6 +262,7 @@ async function uploadIngestResult(body) {
 
 async function rememberCompletedResult(job, savedResult) {
   if (!savedResult || savedResult.ok !== true) return null;
+  await cleanupPendingJobState(job?.id, { clearVerification: true });
   const result = {
     jobId: job?.id || null,
     source: job?.url || null,
@@ -1846,6 +1847,27 @@ let apiBlockedWatcherInterval = null;
 let activeApiBlockedTabListener = null;
 let lastApiBlockedCheckTime = 0;
 
+async function cleanupPendingJobState(jobId, { clearVerification = false } = {}) {
+  if (!jobId) return;
+  pendingVerificationJobs.delete(jobId);
+  notifiedVerificationJobIds.delete(jobId);
+  resumeInFlightMap.delete(jobId);
+  if (lastVerificationJob && lastVerificationJob.id === jobId) {
+    lastVerificationJob = null;
+  }
+  if (verificationInfo?.job_id === jobId) {
+    if (verificationInfo.kind === "api_blocked") stopApiBlockedWatcher();
+    if (verificationInfo.kind === "verification") stopVerificationWatcher();
+    if (clearVerification) {
+      verificationInfo = null;
+      updateState(bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN ? "connected" : "disconnected");
+    }
+  }
+  try {
+    await chrome.storage.local.remove([`pending_job_${jobId}`]);
+  } catch {}
+}
+
 function stopApiBlockedWatcher() {
   if (apiBlockedWatcherInterval) {
     clearTimeout(apiBlockedWatcherInterval);
@@ -1889,6 +1911,12 @@ function startApiBlockedWatcher(details) {
     try {
       preflightRes = await preflightRatingsInTab(targetTabId, itemid, shopid, referer);
     } catch (err) {
+      updateState("api_blocked", {
+        ...verificationInfo,
+        auto_recheck_active: true,
+        last_recheck_at: new Date().toISOString(),
+        last_recheck_status: "network_error",
+      });
       console.warn("[bridge] Smart preflight error:", err?.message || err);
       return;
     }
@@ -1940,7 +1968,9 @@ function startApiBlockedWatcher(details) {
       });
       return;
     }
-    const delay = backoffDelays[backoffIndex++];
+    const baseDelay = backoffDelays[backoffIndex++];
+    const jitter = Math.floor(Math.random() * Math.min(5000, Math.max(1000, baseDelay * 0.1)));
+    const delay = baseDelay + jitter;
     updateState("api_blocked", {
       ...verificationInfo,
       auto_recheck_active: true,
@@ -2814,6 +2844,7 @@ async function handleAction(action, params) {
 
     case "job.cancel": {
       const jobId = params.jobId;
+      await cleanupPendingJobState(jobId, { clearVerification: true });
       if (activeJobs.has(jobId)) {
         activeJobs.delete(jobId);
         return { cancelled: true, jobId };
@@ -3035,6 +3066,9 @@ async function dispatchEnvelope(envelope) {
     if (targetId && activeJobs.has(targetId)) {
       activeJobs.delete(targetId);
       cancelled = true;
+    }
+    if (targetId) {
+      await cleanupPendingJobState(targetId, { clearVerification: true });
     }
     bridgeSend({
       v: 1,

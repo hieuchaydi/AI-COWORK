@@ -48,6 +48,9 @@ async function worker(options = {}) {
           return Promise.resolve(result);
         },
         set: async value => { Object.assign(stored, value); },
+        remove: async keys => {
+          for (const key of Array.isArray(keys) ? keys : [keys]) delete stored[key];
+        },
       } },
       runtime: {
         onInstalled: listener,
@@ -1608,4 +1611,41 @@ test('startApiBlockedWatcher auto-resumes job on tab reload when preflight ratin
   assert.equal(resolvedFrame.params.recheck, true);
 
   vm.runInContext('stopApiBlockedWatcher()', context);
+});
+
+test('job.cancel cleans api_blocked watcher and pending job state', async () => {
+  const { context, stored, timeouts } = await worker();
+
+  let tabListener = null;
+  context.chrome.tabs = {
+    onUpdated: {
+      addListener: (fn) => { tabListener = fn; },
+      removeListener: () => { tabListener = null; },
+    },
+  };
+
+  await context.chrome.storage.local.set({
+    pending_job_cancelled: { id: "cancelled", url: "https://shopee.vn/product/123/456" },
+  });
+
+  const baselineTimeouts = timeouts.size;
+  vm.runInContext(`
+    pendingVerificationJobs.set("cancelled", { id: "cancelled", url: "https://shopee.vn/product/123/456" });
+    verificationInfo = { job_id: "cancelled", kind: "api_blocked" };
+    startApiBlockedWatcher({
+      job_id: "cancelled",
+      tab_id: 99,
+      url: "https://shopee.vn/product/123/456",
+    });
+  `, context);
+
+  assert.ok(tabListener, 'api_blocked watcher should register a tab listener');
+  assert.equal(timeouts.size, baselineTimeouts + 1);
+
+  const result = await vm.runInContext('handleAction("job.cancel", { jobId: "cancelled" })', context);
+  assert.equal(result.cancelled, false);
+  assert.equal(tabListener, null);
+  assert.equal(timeouts.size, baselineTimeouts);
+  assert.equal(vm.runInContext('pendingVerificationJobs.has("cancelled")', context), false);
+  assert.equal(stored.pending_job_cancelled, undefined);
 });
