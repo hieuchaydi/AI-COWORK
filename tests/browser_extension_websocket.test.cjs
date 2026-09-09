@@ -479,6 +479,23 @@ test('usable ratings preflight rejects 200 responses without review payload', as
     isUsableRatingsPreflight({
       ok: true,
       status: 200,
+      json: { data: {} },
+    })
+  `, context), false);
+
+  assert.equal(vm.runInContext(`
+    isUsableRatingsPreflight({
+      ok: true,
+      status: 200,
+      json: { data: { ratings: [] } },
+      textSample: "captcha challenge",
+    })
+  `, context), false);
+
+  assert.equal(vm.runInContext(`
+    isUsableRatingsPreflight({
+      ok: true,
+      status: 200,
       json: { data: { ratings: [] } },
     })
   `, context), true);
@@ -1648,4 +1665,41 @@ test('job.cancel cleans api_blocked watcher and pending job state', async () => 
   assert.equal(timeouts.size, baselineTimeouts);
   assert.equal(vm.runInContext('pendingVerificationJobs.has("cancelled")', context), false);
   assert.equal(stored.pending_job_cancelled, undefined);
+});
+
+test('restorePendingVerificationWatchers restarts api_blocked watcher from storage', async () => {
+  const targetJobId = "job-restore-api-blocked";
+  const { context, stored, timeouts } = await worker({ stored: {
+    verificationInfo: {
+      job_id: targetJobId,
+      kind: "api_blocked",
+      tab_id: 101,
+      url: "https://shopee.vn/product/123/456",
+      checkpoint: { version: 2, next_offset: 30, itemid: "456", shopid: "123" },
+    },
+    [`pending_job_${targetJobId}`]: {
+      id: targetJobId,
+      url: "https://shopee.vn/product/123/456",
+      checkpoint: { version: 2, next_offset: 30 },
+    },
+  } });
+
+  let tabListener = null;
+  context.chrome.tabs = {
+    onUpdated: {
+      addListener: (fn) => { tabListener = fn; },
+      removeListener: () => { tabListener = null; },
+    },
+  };
+
+  const baselineTimeouts = timeouts.size;
+  await vm.runInContext('restorePendingVerificationWatchers()', context);
+
+  assert.ok(tabListener, 'restored api_blocked watcher should register a tab listener');
+  assert.equal(timeouts.size, baselineTimeouts + 1);
+  assert.equal(vm.runInContext(`pendingVerificationJobs.has("${targetJobId}")`, context), true);
+  assert.equal(stored.verificationInfo.auto_recheck_active, true);
+  assert.equal(stored.verificationInfo.auto_recheck_exhausted, false);
+
+  vm.runInContext('stopApiBlockedWatcher()', context);
 });

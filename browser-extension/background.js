@@ -819,6 +819,10 @@ function evaluatePreflightResult(fetchRes) {
 
 function isUsableRatingsPreflight(fetchRes) {
   if (!fetchRes?.ok || fetchRes.status !== 200) return false;
+  const sample = String(fetchRes.textSample || fetchRes.error || "").toLowerCase();
+  if (sample.includes("access denied") || sample.includes("/verify/traffic") || sample.includes("captcha") || sample.includes("challenge")) {
+    return false;
+  }
   const json = fetchRes.json;
   if (!json || typeof json !== "object" || json.error) return false;
   const data = json.data;
@@ -830,7 +834,7 @@ function isUsableRatingsPreflight(fetchRes) {
   ];
   if (candidateArrays.some((value) => Array.isArray(value))) return true;
   const total = Number(data?.item_rating_summary?.rating_total ?? data?.total ?? json.total);
-  return Number.isFinite(total) && total >= 0 && data !== null && typeof data === "object";
+  return Number.isFinite(total) && total >= 0 && data !== null && typeof data === "object" && Object.keys(data).length > 0;
 }
 
 const CANDIDATE_FILTERS = [1, 2, 3, 4, 5];
@@ -1878,6 +1882,30 @@ function stopApiBlockedWatcher() {
       chrome.tabs.onUpdated.removeListener(activeApiBlockedTabListener);
     } catch {}
     activeApiBlockedTabListener = null;
+  }
+}
+
+async function restorePendingVerificationWatchers() {
+  let stored = {};
+  try {
+    stored = await chrome.storage.local.get(null);
+  } catch {
+    return;
+  }
+  const info = stored.verificationInfo;
+  if (!info || !info.job_id || info.kind === "login") return;
+  const storedJob = stored[`pending_job_${info.job_id}`];
+  if (storedJob && !pendingVerificationJobs.has(info.job_id)) {
+    pendingVerificationJobs.set(info.job_id, storedJob);
+    lastVerificationJob = storedJob;
+  }
+  if (!info.tab_id) return;
+  verificationInfo = info;
+  updateState(stateForVerification(info), info);
+  if (info.kind === "verification") {
+    startVerificationWatcher(info);
+  } else if (info.kind === "api_blocked" && !info.auto_recheck_exhausted) {
+    startApiBlockedWatcher(info);
   }
 }
 
@@ -3266,6 +3294,7 @@ async function connectBridge() {
           ? stateForVerification(verificationInfo)
           : (activeJobs.size ? "busy" : "connected");
         updateState(restoredState, verificationInfo);
+        restorePendingVerificationWatchers().catch((error) => console.warn("[bridge] restore watcher failed:", error?.message || error));
         for (const pending of pendingIngestRequests.values()) bridgeSend(pending.message);
         if (bridgeHeartbeat) clearInterval(bridgeHeartbeat);
         bridgeHeartbeat = setInterval(() => {
@@ -3407,8 +3436,14 @@ chrome.runtime.onInstalled.addListener(() => {
   connectBridge();
 });
 
-chrome.runtime.onStartup.addListener(connectBridge);
-chrome.alarms.onAlarm.addListener(connectBridge);
+chrome.runtime.onStartup.addListener(() => {
+  connectBridge();
+  restorePendingVerificationWatchers().catch(() => {});
+});
+chrome.alarms.onAlarm.addListener(() => {
+  connectBridge();
+  restorePendingVerificationWatchers().catch(() => {});
+});
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === "getStatus") {
@@ -3509,6 +3544,8 @@ if (typeof module !== "undefined" && module.exports) {
     stopVerificationWatcher,
     startApiBlockedWatcher,
     stopApiBlockedWatcher,
+    restorePendingVerificationWatchers,
+    cleanupPendingJobState,
     probeFilterCandidates,
     normalizeCheckpointV2,
     extractRatingSummary,
