@@ -1308,6 +1308,90 @@ test('extractShopeeReviews traverses multi-scopes independently with deduplicati
   assert.ok(lastChk.scopes);
 });
 
+test('extractShopeeReviews advances rating buckets for comment scope when aggregate feed caps early', async () => {
+  const { context } = await worker();
+  const requests = [];
+  context.__recordRequest = (entry) => requests.push(entry);
+  context.setTimeout = (fn) => { queueMicrotask(fn); return 1; };
+
+  context.chrome.tabs = {
+    query: async () => [{ id: 56, url: 'https://shopee.vn/product/111/333', active: true }],
+    create: async () => ({ id: 56, url: 'https://shopee.vn/product/111/333' }),
+  };
+
+  const firstPage = Array.from({ length: 6 }, (_, idx) => ({
+    cmid: `comment-all-${idx}`,
+    author_username: `buyer-all-${idx}`,
+    rating_star: 5,
+    comment: `aggregate comment ${idx}`,
+    images: [],
+  }));
+  const fiveStarPage = Array.from({ length: 6 }, (_, idx) => ({
+    cmid: `comment-five-${idx}`,
+    author_username: `buyer-five-${idx}`,
+    rating_star: 5,
+    comment: `five star comment ${idx}`,
+    images: [],
+  }));
+  context.__firstPage = firstPage;
+  context.__fiveStarPage = fiveStarPage;
+
+  vm.runInContext(`
+    sendCheckpoint = async () => {};
+    preflightRatingsInTab = async () => ({
+      ok: true,
+      status: 200,
+      json: {
+        data: {
+          total: 12,
+          item_rating_summary: {
+            rating_total: 12,
+            rcount_with_context: 12,
+            rcount_with_media: 0,
+          },
+        },
+      },
+    });
+    fetchRatingsFromTab = async (tabId, itemid, shopid, offset, limit, referer, ratingType, filter) => {
+      __recordRequest({ offset, limit, ratingType, filter });
+      if (filter === 1 && ratingType === 0 && offset === 0) {
+        return { ok: true, status: 200, json: { data: { ratings: __firstPage } } };
+      }
+      if (filter === 1 && ratingType === 5 && offset === 0) {
+        return { ok: true, status: 200, json: { data: { ratings: __fiveStarPage } } };
+      }
+      return { ok: true, status: 200, json: { data: { ratings: [] } } };
+    };
+  `, context);
+
+  const job = {
+    id: 'job-comment-cap-wall',
+    url: 'https://shopee.vn/product/111/333',
+    checkpoint: {
+      version: 2,
+      active_scope: 'comment',
+      scopes: {
+        all: { key: 'all', label: 'Tất cả', filter: 0, completed: true, discovered: true, rows_count: 0 },
+        comment: { key: 'comment', label: 'Có bình luận', filter: 1, rating_type: 0, next_offset: 0, completed: false, discovered: true, rows_count: 0 },
+        media: { key: 'media', label: 'Có hình ảnh / Video', filter: null, completed: true, discovered: false, rows_count: 0 },
+      },
+      itemid: '333',
+      shopid: '111',
+      total: 12,
+      ui_reference: { total: 12, rating_total: 12, rcount_with_context: 12, rcount_with_media: 0 },
+    },
+  };
+  context.testJob = job;
+
+  const results = await vm.runInContext('extractShopeeReviews(testJob, async () => {})', context);
+
+  assert.equal(results.length, 12);
+  assert.ok(requests.some((r) => r.filter === 1 && r.ratingType === 0 && r.offset === 6), 'should hit the capped aggregate offset');
+  assert.ok(requests.some((r) => r.filter === 1 && r.ratingType === 5 && r.offset === 0), 'should continue through star buckets for comment scope');
+  assert.equal(job._crawlSummary.scopes.comment.completed, true);
+  assert.equal(job._crawlSummary.scopes.comment.rows_count, 12);
+});
+
 test('handleRecheckApi runs preflight and resumes job from checkpoint on HTTP 200', async () => {
   const { context, frames, sockets } = await worker();
   sockets[0].onopen();

@@ -354,6 +354,25 @@ function crawlPercent(rows, total, base, span) {
   return Math.min(95, base + Math.floor((rows / MAX_REVIEWS) * span));
 }
 
+function scopeTarget(scopeKey, uiReference, total) {
+  if (scopeKey === "comment") {
+    const n = Number(uiReference?.rcount_with_context);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+  if (scopeKey === "media") {
+    const n = Number(uiReference?.rcount_with_media);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+  return total || null;
+}
+
+function shouldAdvanceRatingType(scopeKey, scope, uiReference, total, typeIndex) {
+  if (typeIndex + 1 >= RATING_TYPES.length) return false;
+  const target = scopeTarget(scopeKey, uiReference, total);
+  if (!target) return true;
+  return (Number(scope?.rows_count) || 0) < target;
+}
+
 function normalizeShopeeUrl(url) {
   if (!url) return "";
   return String(url)
@@ -1211,11 +1230,16 @@ async function extractShopeeReviews(job, progress) {
     }
 
     activeScopeKey = scopeKey;
+    scope.target = scopeTarget(scopeKey, uiReference, total);
+    if (!Array.isArray(scope.used_rating_buckets)) scope.used_rating_buckets = [];
     let offset = scope.next_offset || 0;
     let ratingType = scope.rating_type || 0;
     let typeIndex = Math.max(0, RATING_TYPES.indexOf(ratingType));
 
     while (uniqueReviewsMap.size < MAX_REVIEWS) {
+      if (!scope.used_rating_buckets.includes(ratingType)) {
+        scope.used_rating_buckets.push(ratingType);
+      }
       const requestStarted = Date.now();
       const requestStartIso = new Date(requestStarted).toISOString();
       await traceJob(job, progress, "ratings-request", {
@@ -1346,7 +1370,7 @@ async function extractShopeeReviews(job, progress) {
 
       const batch = (json && (json.data?.ratings || json.ratings || json.items)) || [];
       if (!Array.isArray(batch) || batch.length === 0) {
-        if (scopeKey === "all" && total && uniqueReviewsMap.size < total && typeIndex + 1 < RATING_TYPES.length) {
+        if (shouldAdvanceRatingType(scopeKey, scope, uiReference, total, typeIndex)) {
           typeIndex += 1;
           ratingType = RATING_TYPES[typeIndex];
           scope.rating_type = ratingType;
@@ -1388,6 +1412,7 @@ async function extractShopeeReviews(job, progress) {
             ratingType,
             rowsCount: uniqueReviewsMap.size,
             totalTarget: total,
+            scopeTarget: scopeTarget(scopeKey, uiReference, total),
           });
           await progress({
             status: "running",
@@ -1395,7 +1420,7 @@ async function extractShopeeReviews(job, progress) {
             active_scope: scopeKey,
             scope_label: scope.label,
             scopes,
-            message: `Shopee giới hạn luồng tổng; đang cào tiếp nhóm ${ratingType} sao`,
+            message: `Shopee giới hạn luồng ${scope.label}; đang cào tiếp nhóm ${ratingType} sao`,
             rows: uniqueReviewsMap.size,
             percent: crawlPercent(uniqueReviewsMap.size, total, 10, 80),
           });
@@ -1487,7 +1512,7 @@ async function extractShopeeReviews(job, progress) {
       });
 
       if (batch.length < PAGE_SIZE) {
-        if (scopeKey === "all" && total && uniqueReviewsMap.size < total && typeIndex + 1 < RATING_TYPES.length) {
+        if (shouldAdvanceRatingType(scopeKey, scope, uiReference, total, typeIndex)) {
           typeIndex += 1;
           ratingType = RATING_TYPES[typeIndex];
           scope.rating_type = ratingType;
