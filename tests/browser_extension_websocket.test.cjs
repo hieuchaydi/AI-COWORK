@@ -1899,3 +1899,154 @@ test('restorePendingVerificationWatchers restarts api_blocked watcher from stora
 
   vm.runInContext('stopApiBlockedWatcher()', context);
 });
+
+test('classifyShopeeFailure classifies /verify/captcha and captcha samples as verification', async () => {
+  const { context } = await worker();
+
+  const res403Captcha = {
+    status: 403,
+    url: "https://shopee.vn/verify/captcha?anti_bot_tracking_id=xyz",
+    textSample: "xác nhận để tiếp tục, kéo qua để hoàn thiện bức hình",
+  };
+  assert.equal(vm.runInContext(`classifyShopeeFailure(${JSON.stringify(res403Captcha)})`, context), "verification");
+
+  const res200Captcha = {
+    status: 200,
+    url: "https://shopee.vn/verify/captcha?anti_bot_tracking_id=abc",
+    textSample: "kéo thanh trượt để hoàn thành",
+  };
+  assert.equal(vm.runInContext(`classifyShopeeFailure(${JSON.stringify(res200Captcha)})`, context), "verification");
+
+  const res403General = {
+    status: 403,
+    url: "https://shopee.vn/api/v2/item/get_ratings",
+    textSample: "error 90309999",
+  };
+  assert.equal(vm.runInContext(`classifyShopeeFailure(${JSON.stringify(res403General)})`, context), "api_blocked");
+});
+
+test('detectCaptchaInTab identifies active challenge from Image 1 phrases and classes', async () => {
+  const { context } = await worker();
+
+  vm.runInContext(`
+    chrome.scripting = {
+      executeScript: async ({ func }) => {
+        globalThis.location = { href: "https://shopee.vn/verify/captcha?anti_bot_tracking_id=123" };
+        globalThis.document = {
+          body: { innerText: "Xác nhận để tiếp tục. Kéo qua để hoàn thiện bức hình." },
+          querySelector: (sel) => null,
+          querySelectorAll: () => [],
+        };
+        return [{ result: func() }];
+      },
+    };
+  `, context);
+
+  const detection = await vm.runInContext('detectCaptchaInTab(301)', context);
+  assert.equal(detection.detected, true);
+  assert.equal(detection.resolved, false);
+  assert.ok(detection.type === 'dom_text' || detection.type === 'slider_pending');
+});
+
+test('detectCaptchaInTab identifies resolved state from Image 2 (green checkmark / passed slider)', async () => {
+  const { context } = await worker();
+
+  vm.runInContext(`
+    chrome.scripting = {
+      executeScript: async ({ func }) => {
+        globalThis.location = { href: "https://shopee.vn/verify/captcha?anti_bot_tracking_id=123" };
+        globalThis.document = {
+          body: { innerText: "Xác nhận để tiếp tục" },
+          querySelector: (sel) => sel === ".shopee-captcha-slider__btn--success" ? { offsetWidth: 50, offsetHeight: 50 } : null,
+          querySelectorAll: (sel) => [
+            {
+              innerText: "✔",
+              children: [],
+            }
+          ],
+        };
+        globalThis.window = {
+          getComputedStyle: (el) => ({ backgroundColor: "rgb(38, 170, 153)", color: "white" }),
+        };
+        return [{ result: func() }];
+      },
+    };
+  `, context);
+
+  const detection = await vm.runInContext('detectCaptchaInTab(302)', context);
+  assert.equal(detection.detected, false);
+  assert.equal(detection.resolved, true);
+  assert.equal(detection.type, 'slider_passed');
+});
+
+test('startVerificationWatcher immediately triggers preflight when slider_passed is detected', async () => {
+  const jobId = "job-slider-passed-immediate";
+  const { context, stored } = await worker();
+
+  let tabUpdateListener = null;
+  let updateTabUrl = null;
+
+  context.chrome.tabs = {
+    get: async (id) => ({ id, url: "https://shopee.vn/verify/captcha?anti_bot_tracking_id=test" }),
+    update: async (id, opts) => { updateTabUrl = opts.url; },
+    onUpdated: {
+      addListener: (fn) => { tabUpdateListener = fn; },
+      removeListener: () => { tabUpdateListener = null; },
+    },
+    onRemoved: { addListener: () => {}, removeListener: () => {} },
+  };
+
+  let preflightCalled = false;
+  let enqueued = false;
+
+  vm.runInContext(`
+    var preflightCalled = false;
+    var enqueued = false;
+
+    pendingVerificationJobs.set("${jobId}", {
+      id: "${jobId}",
+      itemid: "123",
+      shopid: "456",
+      url: "https://shopee.vn/product/456/123",
+      checkpoint: { next_offset: 10 }
+    });
+
+    preflightRatingsInTab = async () => {
+      preflightCalled = true;
+      return { ok: true, status: 200, json: { data: { ratings: [{ cmid: 999 }] } } };
+    };
+
+    detectCaptchaInTab = async () => {
+      return { detected: false, resolved: true, type: "slider_passed" };
+    };
+
+    enqueueLegacyJob = (j) => {
+      enqueued = true;
+    };
+  `, context);
+
+  await vm.runInContext(`
+    verificationInfo = { job_id: "${jobId}", kind: "verification" };
+    startVerificationWatcher({
+      job_id: "${jobId}",
+      tab_id: 88,
+      itemid: "123",
+      shopid: "456",
+      referer: "https://shopee.vn/product/456/123",
+      checkpoint: { next_offset: 10 }
+    })
+  `, context);
+
+  const listener = tabUpdateListener || vm.runInContext('activeTabUpdateListener', context);
+  assert.ok(listener, 'tab update listener must be registered');
+
+  // Trigger once: even with 1st check, resolved: true should immediately trigger preflight
+  await listener(88, { status: 'complete' }, { url: 'https://shopee.vn/verify/captcha?anti_bot_tracking_id=test' });
+
+  assert.equal(vm.runInContext('preflightCalled', context), true, "preflight should be called immediately on slider_passed");
+  assert.equal(vm.runInContext('enqueued', context), true, "job should be resumed immediately");
+  assert.equal(updateTabUrl, "https://shopee.vn/product/456/123", "tab should be redirected back to product url");
+
+  vm.runInContext('stopVerificationWatcher()', context);
+});
+

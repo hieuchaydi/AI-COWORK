@@ -734,6 +734,20 @@ function shopeeLoginState(fetchRes) {
   return null;
 }
 
+function isShopeeChallenge(url = "", pageUrl = "", sample = "") {
+  const combined = `${url} ${pageUrl} ${sample}`.toLowerCase();
+  return (
+    combined.includes("/verify/") ||
+    combined.includes("anti_bot_tracking_id") ||
+    combined.includes("captcha") ||
+    combined.includes("challenge") ||
+    combined.includes("xác nhận để tiếp tục") ||
+    combined.includes("hoàn thiện bức hình") ||
+    combined.includes("kéo thanh trượt") ||
+    combined.includes("trượt để hoàn thành")
+  );
+}
+
 function classifyShopeeFailure(fetchRes) {
   const json = fetchRes?.json || {};
   const url = String(fetchRes?.url || "").toLowerCase();
@@ -741,20 +755,11 @@ function classifyShopeeFailure(fetchRes) {
   const sample = String(fetchRes?.textSample || fetchRes?.error || "").toLowerCase();
   if (shopeeLoginState(fetchRes) === false) return "login";
 
-  const loginState = shopeeLoginState(fetchRes);
-  if (loginState === true) {
-    const isChallenge = url.includes("/verify/traffic") || pageUrl.includes("/verify/traffic") ||
-                        sample.includes("captcha") ||
-                        sample.includes("challenge") || sample.includes("verify/traffic");
-    if (isChallenge) return "verification";
-    return "api_blocked";
-  }
-  if (loginState === false) return "login";
-
-  const isChallenge = url.includes("/verify/traffic") || pageUrl.includes("/verify/traffic") ||
-                      sample.includes("captcha") ||
-                      sample.includes("challenge") || sample.includes("verify/traffic");
+  const isChallenge = isShopeeChallenge(url, pageUrl, sample);
   if (isChallenge) return "verification";
+
+  const loginState = shopeeLoginState(fetchRes);
+  if (loginState === false) return "login";
 
   if (fetchRes?.status === 403 || json?.error === 90309999 || sample.includes("90309999") ||
       sample.includes("403") || sample.includes("access denied") || sample.includes("api_blocked")) {
@@ -780,17 +785,18 @@ function formatShopeeFailure(fetchRes) {
 
 function extractVerificationUrl(input) {
   if (!input) return "";
+  const isTarget = (str) => typeof str === "string" && (str.includes("/verify/") || str.includes("anti_bot_tracking_id"));
   if (typeof input === "object") {
-    if (typeof input.verification_url === "string" && input.verification_url.includes("/verify/traffic")) return input.verification_url.replace(/[;,.)]+$/, "");
-    if (typeof input.target_url === "string" && input.target_url.includes("/verify/traffic")) return input.target_url.replace(/[;,.)]+$/, "");
-    if (typeof input.pageUrl === "string" && input.pageUrl.includes("/verify/traffic")) return input.pageUrl.replace(/[;,.)]+$/, "");
-    if (typeof input.url === "string" && input.url.includes("/verify/traffic")) return input.url.replace(/[;,.)]+$/, "");
-    if (typeof input.responseUrl === "string" && input.responseUrl.includes("/verify/traffic")) return input.responseUrl.replace(/[;,.)]+$/, "");
+    if (isTarget(input.verification_url)) return input.verification_url.replace(/[;,.)]+$/, "");
+    if (isTarget(input.target_url)) return input.target_url.replace(/[;,.)]+$/, "");
+    if (isTarget(input.pageUrl)) return input.pageUrl.replace(/[;,.)]+$/, "");
+    if (isTarget(input.url)) return input.url.replace(/[;,.)]+$/, "");
+    if (isTarget(input.responseUrl)) return input.responseUrl.replace(/[;,.)]+$/, "");
     const str = `${input.reason || ""} ${input.error || ""} ${input.message || ""} ${input.textSample || ""}`;
-    const match = str.match(/https?:\/\/[^\s"'`<>]+verify\/traffic[^\s"'`<>;,)]*/);
+    const match = str.match(/https?:\/\/[^\s"'`<>]+(?:verify\/(?:traffic|captcha|slider|[a-zA-Z0-9_-]+)|anti_bot_tracking_id)[^\s"'`<>;,)]*/);
     if (match) return match[0].replace(/[;,.)]+$/, "");
   } else if (typeof input === "string") {
-    const match = input.match(/https?:\/\/[^\s"'`<>]+verify\/traffic[^\s"'`<>;,)]*/);
+    const match = input.match(/https?:\/\/[^\s"'`<>]+(?:verify\/(?:traffic|captcha|slider|[a-zA-Z0-9_-]+)|anti_bot_tracking_id)[^\s"'`<>;,)]*/);
     if (match) return match[0].replace(/[;,.)]+$/, "");
   }
   return "";
@@ -2091,16 +2097,63 @@ async function captureTabEvidence(tabId) {
 
 async function detectCaptchaInTab(tabId) {
   try {
-    if (!tabId || !chrome.scripting?.executeScript) return { detected: false };
+    if (!tabId || !chrome.scripting?.executeScript) return { detected: false, resolved: false };
     const [res] = await chrome.scripting.executeScript({
       target: { tabId },
       world: "MAIN",
       func: () => {
         const url = location.href.toLowerCase();
-        if (url.includes("/verify/traffic") || url.includes("/verify/slider") || url.includes("captcha")) {
-          return { detected: true, type: "url", details: location.href };
+        const isVerifyPage = url.includes("/verify/") || url.includes("anti_bot_tracking_id") || url.includes("captcha");
+        const bodyText = document.body ? document.body.innerText.toLowerCase() : "";
+
+        // 1. Kiểm tra dấu hiệu ĐÃ GIẢI XONG (Ảnh 2 - Success / Resolved):
+        // Nút kéo chuyển sang màu xanh ngọc với dấu check ✔, hoặc class/style thành công
+        const checkPassedSelectors = [
+          ".shopee-captcha-slider__btn--success",
+          ".captcha-passed",
+          ".verify-passed",
+          ".slider--success",
+          ".slider-btn--success",
+          "[class*='success']",
+          "[class*='passed']",
+        ];
+
+        let isResolved = false;
+        if (typeof document.querySelectorAll === "function") {
+          try {
+            const hasGreenCheck = Array.from(document.querySelectorAll("svg, i, div, span, button")).some((el) => {
+              const text = el.innerText || "";
+              const hasCheckChar = text.includes("✔") || text.includes("✓");
+              let isGreen = false;
+              try {
+                const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(el) : null;
+                const bg = style?.backgroundColor || "";
+                const color = style?.color || "";
+                isGreen = bg.includes("38, 170, 153") || bg.includes("32, 178, 170") || color.includes("38, 170, 153");
+              } catch {}
+              return hasCheckChar || isGreen;
+            });
+            if (hasGreenCheck) isResolved = true;
+          } catch {}
         }
-        const selectors = [
+        if (!isResolved) {
+          for (const s of checkPassedSelectors) {
+            try {
+              const el = document.querySelector(s);
+              if (el && (el.offsetWidth > 0 || el.offsetHeight > 0)) {
+                isResolved = true;
+                break;
+              }
+            } catch {}
+          }
+        }
+
+        if (isResolved) {
+          return { detected: false, resolved: true, type: "slider_passed", pageUrl: location.href };
+        }
+
+        // 2. Kiểm tra các selector CAPTCHA hoạt động và cuộn vào màn hình:
+        const activeSelectors = [
           ".shopee-captcha-slider",
           ".captcha_container",
           ".geetest_radar_btn",
@@ -2116,17 +2169,26 @@ async function detectCaptchaInTab(tabId) {
           "div[class*='traffic-verify']",
           "div[class*='puzzle-verify']",
         ];
-        for (const sel of selectors) {
-          const el = document.querySelector(sel);
-          if (el && (el.offsetWidth > 0 || el.offsetHeight > 0)) {
-            try {
-              el.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
-            } catch {}
-            return { detected: true, type: "dom_selector", selector: sel, elementFound: true };
-          }
+
+        for (const sel of activeSelectors) {
+          try {
+            const el = document.querySelector(sel);
+            if (el && (el.offsetWidth > 0 || el.offsetHeight > 0)) {
+              try {
+                if (typeof el.scrollIntoView === "function") {
+                  el.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+                }
+              } catch {}
+              return { detected: true, resolved: false, type: "dom_selector", selector: sel, elementFound: true, pageUrl: location.href };
+            }
+          } catch {}
         }
-        const text = document.body ? document.body.innerText.toLowerCase() : "";
+
+        // 3. Kiểm tra cụm từ văn bản trên trang (Ảnh 1 - Active Challenge text):
         const phrases = [
+          "kéo qua để hoàn thiện bức hình",
+          "hoàn thiện bức hình",
+          "xác nhận để tiếp tục",
           "trượt để hoàn thành",
           "kéo thanh trượt",
           "xác minh bạn không phải là người máy",
@@ -2134,25 +2196,33 @@ async function detectCaptchaInTab(tabId) {
           "slide to verify",
           "drag the slider",
         ];
+
         for (const p of phrases) {
-          if (text.includes(p)) {
+          if (bodyText.includes(p)) {
             try {
-              const matchingEl = Array.from(document.querySelectorAll("div, p, span, h1, h2, h3, label, a, button, section, form")).find(
-                (e) => e.innerText && e.innerText.toLowerCase().includes(p) && e.children.length === 0
-              );
-              if (matchingEl) {
-                matchingEl.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+              if (typeof document.querySelectorAll === "function") {
+                const matchingEl = Array.from(document.querySelectorAll("div, p, span, h1, h2, h3, label, a, button, section, form")).find(
+                  (e) => e.innerText && e.innerText.toLowerCase().includes(p) && e.children?.length === 0
+                );
+                if (matchingEl && typeof matchingEl.scrollIntoView === "function") {
+                  matchingEl.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+                }
               }
             } catch {}
-            return { detected: true, type: "dom_text", phrase: p, elementFound: true };
+            return { detected: true, resolved: false, type: "dom_text", phrase: p, elementFound: true, pageUrl: location.href };
           }
         }
-        return { detected: false };
+
+        if (isVerifyPage) {
+          return { detected: true, resolved: false, type: "slider_pending", pageUrl: location.href };
+        }
+
+        return { detected: false, resolved: false, pageUrl: location.href };
       },
     });
-    return res?.result || { detected: false };
+    return res?.result || { detected: false, resolved: false };
   } catch (err) {
-    return { detected: false, error: err?.message };
+    return { detected: false, resolved: false, error: err?.message };
   }
 }
 
@@ -2188,17 +2258,17 @@ function startVerificationWatcher(details) {
       return;
     }
     const check = await detectCaptchaInTab(targetTabId);
-    if (!check || !check.detected) {
+    if (check?.resolved || !check?.detected) {
       consecutiveAbsentCount++;
-      console.log(`[bridge] CAPTCHA absent count: ${consecutiveAbsentCount}/2 for job ${jid}`);
-      if (consecutiveAbsentCount >= 2) {
+      console.log(`[bridge] CAPTCHA absent/resolved count: ${consecutiveAbsentCount}/2 (type: ${check?.type || "none"}) for job ${jid}`);
+      if (consecutiveAbsentCount >= 2 || check?.resolved) {
         if (resumeInFlightMap.get(jid)) {
           console.log("[bridge] Resume already in-flight for job:", jid);
           return;
         }
         resumeInFlightMap.set(jid, true);
 
-        console.log("[bridge] Challenge absent 2 times consecutively! Running preflight API in tab...");
+        console.log("[bridge] Challenge resolved/absent! Running preflight API in tab...");
         let preflightRes = null;
         try {
           preflightRes = await preflightRatingsInTab(targetTabId, itemid, shopid, referer);
@@ -2212,6 +2282,13 @@ function startVerificationWatcher(details) {
         if (hasValidRatings) {
           console.log("[bridge] ✔ Preflight succeeded (HTTP 200 & valid ratings)! Resuming job:", jid);
           stopVerificationWatcher();
+          try {
+            const currentTab = await chrome.tabs.get(targetTabId);
+            if (currentTab?.url && (currentTab.url.includes("/verify/") || currentTab.url.includes("captcha"))) {
+              await chrome.tabs.update(targetTabId, { url: referer || details?.url });
+            }
+          } catch {}
+
           const currentCycle = (verificationCycles.get(jid) || 0) + 1;
           verificationCycles.set(jid, currentCycle);
           resumeVerification(jid, {
@@ -2225,29 +2302,33 @@ function startVerificationWatcher(details) {
           consecutiveAbsentCount = 0;
 
           // Nếu API trả 403 mà tab không có challenge -> Chuyển sang api_blocked và DỪNG watcher để tránh loop!
-          if (preflightRes?.status === 403 || evalRes.error?.includes("403")) {
-            console.warn("[bridge] Tab has no challenge but API is 403 -> transitioning to api_blocked");
-            stopVerificationWatcher();
-            const reason = evalRes.error || "Shopee chặn API đánh giá (HTTP 403 / API Blocked)";
-            updateState("api_blocked", {
-              job_id: jid,
-              tab_id: targetTabId,
-              reason,
-              kind: "api_blocked",
-              checkpoint: details?.checkpoint,
-            });
-            if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
-              bridgeSend({
-                v: 1,
-                type: "api_blocked",
-                id: "blocked-" + Date.now(),
-                params: {
-                  job_id: jid,
-                  status: 403,
-                  reason,
-                  checkpoint: details?.checkpoint,
-                },
+          if (!check?.resolved && (preflightRes?.status === 403 || evalRes.error?.includes("403"))) {
+            const currentTab = await chrome.tabs.get(targetTabId).catch(() => null);
+            const isStillVerify = currentTab?.url && (currentTab.url.includes("/verify/") || currentTab.url.includes("captcha"));
+            if (!isStillVerify) {
+              console.warn("[bridge] Tab has no challenge and is not on verify page, but API is 403 -> transitioning to api_blocked");
+              stopVerificationWatcher();
+              const reason = evalRes.error || "Shopee chặn API đánh giá (HTTP 403 / API Blocked)";
+              updateState("api_blocked", {
+                job_id: jid,
+                tab_id: targetTabId,
+                reason,
+                kind: "api_blocked",
+                checkpoint: details?.checkpoint,
               });
+              if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+                bridgeSend({
+                  v: 1,
+                  type: "api_blocked",
+                  id: "blocked-" + Date.now(),
+                  params: {
+                    job_id: jid,
+                    status: 403,
+                    reason,
+                    checkpoint: details?.checkpoint,
+                  },
+                });
+              }
             }
           }
         }
@@ -2260,7 +2341,8 @@ function startVerificationWatcher(details) {
 
   const tabUpdateListener = async (tabId, changeInfo, tab) => {
     if (tabId !== targetTabId) return;
-    if (changeInfo.status === "complete" || (tab.url && !tab.url.includes("/verify/traffic"))) {
+    const isVerify = tab.url && (tab.url.includes("/verify/") || tab.url.includes("anti_bot_tracking_id") || tab.url.includes("captcha"));
+    if (changeInfo.status === "complete" || (tab.url && !isVerify)) {
       await performCheckAndPreflight();
     }
   };
