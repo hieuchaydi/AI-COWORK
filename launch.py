@@ -22,6 +22,7 @@ from __future__ import annotations
 import atexit
 import csv
 import hashlib
+import html
 import io
 import json
 import os
@@ -585,6 +586,7 @@ def _generate_shopee_report(
     zip_parts: list[str] | None = None,
     manifest_rel: str = "",
     manifest_data: dict | None = None,
+    crawl_summary: dict | None = None,
 ) -> str:
     text_dir = _outputs_root() / "text"
     text_dir.mkdir(parents=True, exist_ok=True)
@@ -635,6 +637,40 @@ def _generate_shopee_report(
         f"- **Đánh giá có ảnh/video**: {reviews_with_media}",
         f"- **Đánh giá không có media**: {reviews_without_media}",
         "",
+        "## Tóm tắt crawl",
+    ]
+
+    if isinstance(crawl_summary, dict):
+        expected = crawl_summary.get("expected")
+        collected = crawl_summary.get("collected", total_reviews)
+        complete = crawl_summary.get("complete")
+        lines.extend([
+            f"- **Dự kiến theo Shopee**: {expected if expected is not None else 'N/A'}",
+            f"- **Đã thu được**: {collected}",
+            f"- **Đầy đủ**: {'Có' if complete else 'Không' if complete is False else 'N/A'}",
+        ])
+        scopes = crawl_summary.get("scopes")
+        if isinstance(scopes, dict):
+            for scope_key in ("all", "comment", "media"):
+                scope = scopes.get(scope_key)
+                if not isinstance(scope, dict):
+                    continue
+                label = scope.get("label") or scope_key
+                buckets = scope.get("used_rating_buckets") or []
+                lines.append(
+                    f"- **Scope {label}**: rows={scope.get('rows_count', 0)}, "
+                    f"target={scope.get('target', 'N/A')}, "
+                    f"filter={scope.get('filter', 'N/A')}, "
+                    f"buckets={','.join(str(x) for x in buckets) if buckets else 'N/A'}, "
+                    f"completed={scope.get('completed')}"
+                )
+    else:
+        lines.append("- **Dự kiến theo Shopee**: N/A")
+        lines.append("- **Đã thu được**: " + str(total_reviews))
+        lines.append("- **Đầy đủ**: N/A")
+
+    lines.extend([
+        "",
         "## Phân bố số sao",
         f"- ⭐⭐⭐⭐⭐ (5 sao): {star_counts[5]}",
         f"- ⭐⭐⭐⭐ (4 sao): {star_counts[4]}",
@@ -652,7 +688,7 @@ def _generate_shopee_report(
         f"- **Số file lỗi tải**: {failed_count}",
         "",
         "## Tệp kết quả",
-    ]
+    ])
     if csv_rel:
         lines.append(f"- [Tải file CSV](http://localhost:8766/{csv_rel})")
 
@@ -1148,6 +1184,8 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
     rows = body.get("rows") if isinstance(body, dict) else body
     if not isinstance(rows, list):
         return 400, {"ok": False, "error": "expected {rows: [...]} or a JSON array"}
+    if all(isinstance(r, dict) for r in rows):
+        rows = [r for r in rows if any(str(v or "").strip() for v in r.values())]
 
     chk = None
     if job_id:
@@ -1301,6 +1339,7 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
         zip_rel=zip_rel or "",
         zip_parts=zip_parts,
         manifest_rel=manifest_rel or "",
+        crawl_summary=body.get("crawl_summary") if isinstance(body, dict) else None,
     ) if (name.lower().startswith("shopee_") or "shopee.vn" in source_text.lower() or "shoppe.vn" in source_text.lower()) else None
 
     print(f"[ingest] {len(rows)} rows → {target}", file=sys.stderr)
@@ -1354,6 +1393,44 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
     return 200, result
 
 
+def _clean_csv_cell(value: object, key: str = "") -> object:
+    if value is None:
+        return ""
+    if isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, (list, tuple, set)):
+        cleaned_items = [_clean_csv_cell(x, key) for x in value if x is not None]
+        cleaned_items = [str(x) for x in cleaned_items if str(x).strip()]
+        if not cleaned_items:
+            return ""
+        if any("http" in str(x) or "/" in str(x) or "\\" in str(x) for x in cleaned_items):
+            return " | ".join(cleaned_items)
+        return ", ".join(cleaned_items)
+
+    text = str(value)
+    if not text:
+        return ""
+
+    text = html.unescape(text)
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+
+    k = str(key or "").lower().strip()
+    is_multi_line = any(m in k for m in ("noi_dung", "content", "body", "comment", "review", "description", "summary", "mo_ta", "tom_tat"))
+    is_single_line_override = any(s in k for s in ("title", "tieu_de", "name", "ten", "url", "link", "time", "date", "thoi_gian", "user", "author", "category", "phan_loai"))
+
+    if not is_multi_line or is_single_line_override:
+        text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ").replace("\t", " ")
+        text = re.sub(r" {2,}", " ", text).strip()
+    else:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
+        text = "\n".join(lines).strip()
+
+    return text
+
+
 def _write_ingest_csv(json_name: str, rows: list) -> str | None:
     """Flat list-of-dicts → outputs/csv/<name>.csv. Returns the relative path, or None
     when the shape isn't tabular (nested payloads stay JSON-only).
@@ -1364,8 +1441,11 @@ def _write_ingest_csv(json_name: str, rows: list) -> str | None:
     """
     if not rows or not all(isinstance(r, dict) for r in rows):
         return None
+    valid_rows = [r for r in rows if isinstance(r, dict) and any(str(v or "").strip() for v in r.values())]
+    if not valid_rows:
+        return None
     cols: list[str] = []
-    for r in rows:
+    for r in valid_rows:
         for k in r:
             if k not in cols:
                 cols.append(k)
@@ -1374,8 +1454,8 @@ def _write_ingest_csv(json_name: str, rows: list) -> str | None:
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore", lineterminator="\r\n")
     w.writeheader()
-    for r in rows:
-        w.writerow({k: r.get(k, "") for k in cols})
+    for r in valid_rows:
+        w.writerow({k: _clean_csv_cell(r.get(k, ""), key=k) for k in cols})
     out_dir = _outputs_root() / "csv"
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = json_name[:-5] if json_name.endswith(".json") else json_name

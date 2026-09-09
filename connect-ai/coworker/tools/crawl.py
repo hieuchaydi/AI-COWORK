@@ -18,6 +18,7 @@ and truncate large responses so a single tool call can't flood the LLM context.
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import os
 import re
@@ -544,26 +545,164 @@ def _save_artifact_binary(data: bytes, filename: str) -> dict[str, Any]:
     }
 
 
-def _rows_to_csv(rows: list, headers: list = None) -> str:
-    """Convert list-of-dicts (or list-of-lists) to CSV string with proper quoting.
-    Cell values get escaped so commas, quotes, and newlines inside cells don't
-    break the file when Excel parses it."""
+_PREFERRED_COLUMN_ORDER = [
+    # 1. Index / ID
+    "stt", "no", "id", "itemid", "review_id",
+    # 2. Tiêu đề / Tên chính
+    "title", "tieu_de", "product_name", "name", "ten", "product", "san_pham",
+    # 3. Thời gian
+    "thoi_gian", "time", "date", "created_at", "ctime", "ngay",
+    # 4. Người dùng / Tác giả
+    "user", "author", "tac_gia", "nguoi_dung", "reviewer",
+    # 5. Đánh giá / Điểm / Giá
+    "sao", "rating", "score", "price", "gia",
+    # 6. Phân loại / Danh mục
+    "phan_loai", "category", "danh_muc", "type",
+    # 7. Tóm tắt / Mô tả
+    "summary", "tom_tat", "description", "mo_ta",
+    # 8. Nội dung chính
+    "noi_dung", "content", "body", "comment", "review",
+    # 9. Chỉ số thống kê
+    "huu_ich", "likes", "views", "comments_count", "so_anh", "anh", "so_video", "video",
+    # 10. Liên kết URL
+    "url", "link", "source", "anh_urls", "video_urls", "media_urls",
+    # 11. Tệp tin cục bộ đã tải
+    "image_files", "image_names", "video_files", "video_names", "media_files", "media_names",
+    # 12. Thư mục / Lỗi
+    "media_dir", "media_errors",
+]
+
+
+def _clean_csv_cell(value: Any, key: str = "") -> Any:
+    """Clean and sanitize a single CSV cell value:
+    - Decodes HTML entities (&quot;, &amp;, &lt;, &gt;, &#39;, &nbsp;, etc.)
+    - Removes non-printable control characters
+    - Normalizes erratic whitespace and line breaks cleanly
+    """
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (list, tuple, set)):
+        cleaned_items = [_clean_csv_cell(x, key) for x in value if x is not None]
+        cleaned_items = [str(x) for x in cleaned_items if str(x).strip()]
+        if not cleaned_items:
+            return ""
+        if any("http" in str(x) or "/" in str(x) or "\\" in str(x) for x in cleaned_items):
+            return " | ".join(cleaned_items)
+        return ", ".join(cleaned_items)
+
+    text = str(value)
+    if not text:
+        return ""
+
+    # Decode HTML entities
+    text = html.unescape(text)
+    text = text.replace("\xa0", " ")
+
+    # Strip control characters except newline and tab
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+
+    k = str(key or "").lower().strip()
+    is_multi_line = any(m in k for m in ("noi_dung", "content", "body", "comment", "review", "description", "summary", "mo_ta", "tom_tat"))
+    is_single_line_override = any(s in k for s in ("title", "tieu_de", "name", "ten", "url", "link", "time", "date", "thoi_gian", "user", "author", "category", "phan_loai"))
+
+    if not is_multi_line or is_single_line_override:
+        text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ").replace("\t", " ")
+        text = re.sub(r" {2,}", " ", text).strip()
+    else:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
+        text = "\n".join(lines).strip()
+
+    return text
+
+
+def _rows_to_csv(rows: list, headers: list = None, add_stt: bool = True) -> str:
+    """Convert list-of-dicts (or list-of-lists) to an Excel-safe, aesthetically formatted CSV.
+    - Resolves HTML entities (&quot; -> \", &amp; -> &, etc.)
+    - Cleans irregular whitespace and preserves clean formatting
+    - Intelligently orders columns (titles, times, summaries before long URLs and technical paths)
+    - Adds an STT (No.) column (1, 2, 3...) when not explicitly specified
+    - Filters out completely empty rows
+    - Complies with RFC 4180 quoting and Excel UTF-8 BOM requirements
+    """
     import csv, io
     if not rows:
         return ""
+
+    # Filter out completely empty rows
+    valid_rows = []
+    for r in rows:
+        if not r:
+            continue
+        if isinstance(r, dict):
+            if any(str(v or "").strip() for v in r.values()):
+                valid_rows.append(r)
+        elif isinstance(r, (list, tuple)):
+            if any(str(v or "").strip() for v in r):
+                valid_rows.append(r)
+        else:
+            valid_rows.append(r)
+
+    if not valid_rows:
+        return ""
+
     buf = io.StringIO()
-    if isinstance(rows[0], dict):
+
+    if isinstance(valid_rows[0], dict):
+        raw_cols: list[str] = []
+        if headers:
+            raw_cols = list(headers)
+        else:
+            seen = set()
+            for r in valid_rows:
+                if isinstance(r, dict):
+                    for k in r.keys():
+                        if k not in seen:
+                            seen.add(k)
+                            raw_cols.append(k)
+
+        has_stt = any(c.lower() in ("stt", "no", "no.", "index") for c in raw_cols)
+
         if not headers:
-            headers = list(rows[0].keys())
-        w = csv.DictWriter(buf, fieldnames=headers, quoting=csv.QUOTE_MINIMAL,
+            def _col_priority(col_name: str) -> tuple[int, int]:
+                c_low = col_name.lower().strip()
+                for idx, pref in enumerate(_PREFERRED_COLUMN_ORDER):
+                    if c_low == pref:
+                        return (0, idx)
+                return (1, 0)
+
+            ordered_cols = sorted(raw_cols, key=_col_priority)
+        else:
+            ordered_cols = list(raw_cols)
+
+        should_prepend_stt = add_stt and not has_stt and not headers and len(valid_rows) > 0
+        final_cols = (["stt"] + ordered_cols) if should_prepend_stt else ordered_cols
+
+        w = csv.DictWriter(buf, fieldnames=final_cols, quoting=csv.QUOTE_MINIMAL,
                            extrasaction="ignore", lineterminator="\r\n")
         w.writeheader()
-        w.writerows(rows)
+
+        for idx, r in enumerate(valid_rows, start=1):
+            cleaned_row = {}
+            if should_prepend_stt:
+                cleaned_row["stt"] = idx
+            for k in ordered_cols:
+                raw_val = r.get(k, "")
+                cleaned_row[k] = _clean_csv_cell(raw_val, key=k)
+            w.writerow(cleaned_row)
+
     else:
         w = csv.writer(buf, quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
         if headers:
-            w.writerow(headers)
-        w.writerows(rows)
+            w.writerow([_clean_csv_cell(h) for h in headers])
+        for row in valid_rows:
+            w.writerow([_clean_csv_cell(c) for c in row])
+
     return buf.getvalue()
 
 
@@ -572,6 +711,7 @@ def _save_csv(
     filename: str,
     headers: list = None,
     output_dir: str = "",
+    add_stt: bool = True,
 ) -> dict[str, Any]:
     """One-shot: convert list of dicts / rows → CSV → save to artifacts folder
     with UTF-8 BOM + CRLF line endings. Returns the public URL. Use this
@@ -579,7 +719,7 @@ def _save_csv(
     encoding + quoting are Excel-safe."""
     if not isinstance(rows, list):
         return {"error": "rows must be a list"}
-    csv_text = _rows_to_csv(rows, headers=headers)
+    csv_text = _rows_to_csv(rows, headers=headers, add_stt=add_stt)
     if not filename.lower().endswith(".csv"):
         filename += ".csv"
     r = _save_artifact(csv_text, filename, encoding="utf-8", add_utf8_bom=True, output_dir=output_dir)

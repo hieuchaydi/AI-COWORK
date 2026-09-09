@@ -74,6 +74,26 @@ def test_ingest_writes_json_and_excel_ready_csv(server):
     assert '"hàng ngon, giao nhanh"' in text  # embedded comma quoted, not column-split
 
 
+def test_ingest_csv_cleans_cells_and_skips_empty_rows(server):
+    base, outputs = server
+    rows = [
+        {"user": " an\nbuyer ", "sao": 5, "noi_dung": "Rất&nbsp;ổn\r\n\r\nGiao nhanh", "anh_urls": ["https://img/1.jpg", "https://img/2.jpg"]},
+        {"user": "", "sao": "", "noi_dung": "", "anh_urls": ""},
+    ]
+    status, out = _post(base, "/ingest?name=shopee_456", {"source": "https://shopee.vn/x", "rows": rows})
+    assert status == 200 and out["ok"] and out["count"] == 1
+
+    raw = (outputs / "csv" / "shopee_456.csv").read_bytes()
+    assert raw[:3] == b"\xef\xbb\xbf"
+    text = raw.decode("utf-8-sig")
+    assert text.count("\r\n") == 2  # header plus one data row; multiline content stays inside the quoted cell
+    assert " an buyer " not in text
+    assert "an buyer" in text
+    assert "Rất\xa0ổn" not in text
+    assert "Rất ổn" in text
+    assert "https://img/1.jpg | https://img/2.jpg" in text
+
+
 def test_shopee_ingest_adds_local_media_paths(tmp_path, monkeypatch):
     monkeypatch.setenv("COWORKER_OUTPUT_DIR", str(tmp_path))
     import launch
@@ -1110,6 +1130,16 @@ def test_e2e_ingest_job_to_csv_media_and_zip_complete(server, monkeypatch):
             "job": job_id,
             "name": "shopee_202_reviews",
             "source": "https://shopee.vn/product/101/202",
+            "crawl_summary": {
+                "expected": 12,
+                "collected": 2,
+                "complete": False,
+                "scopes": {
+                    "all": {"label": "Tất cả", "rows_count": 2, "target": 12, "filter": 0, "used_rating_buckets": [0, 5], "completed": True},
+                    "comment": {"label": "Có bình luận", "rows_count": 2, "target": 8, "filter": 1, "used_rating_buckets": [0, 5], "completed": True},
+                    "media": {"label": "Có hình ảnh / Video", "rows_count": 1, "target": 1, "filter": 2, "used_rating_buckets": [0], "completed": True},
+                },
+            },
             "rows": [
                 {
                     "user": "buyer_2",
@@ -1144,6 +1174,11 @@ def test_e2e_ingest_job_to_csv_media_and_zip_complete(server, monkeypatch):
 
     report_file = outputs / "text" / "shopee_202_reviews_report.md"
     assert report_file.is_file()
+    report_text = report_file.read_text(encoding="utf-8")
+    assert "**Dự kiến theo Shopee**: 12" in report_text
+    assert "**Đầy đủ**: Không" in report_text
+    assert "Scope Có bình luận" in report_text
+    assert "buckets=0,5" in report_text
 
 
 def test_ingest_resume_and_evidence_capture(server):
@@ -1382,5 +1417,3 @@ def test_ingest_verification_resolved_idempotent_by_cycle(server):
     })
     with launch._INGEST_RESOLVED_LOCK:
         assert 2 in launch._INGEST_RESOLVED_CYCLES.get(job_id, set())
-
-
