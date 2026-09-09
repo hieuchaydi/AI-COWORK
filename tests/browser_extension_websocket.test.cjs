@@ -838,6 +838,37 @@ test('detectCaptchaInTab flags verification URLs and captures evidence', async (
   assert.equal(evidence, 'data:image/png;base64,mocked_traffic_captcha');
 });
 
+test('detectCaptchaInTab scrolls visible captcha elements into view', async () => {
+  const { context } = await worker();
+  vm.runInContext(`
+    globalThis.__captchaScrollArg = null;
+    chrome.scripting = {
+      executeScript: async ({ func }) => {
+        globalThis.location = { href: "https://shopee.vn/product/111/222" };
+        globalThis.document = {
+          querySelector: (sel) => sel === ".shopee-captcha-slider" ? {
+            offsetWidth: 320,
+            offsetHeight: 80,
+            scrollIntoView: (arg) => { globalThis.__captchaScrollArg = arg; },
+          } : null,
+          body: { innerText: "" },
+        };
+        return [{ result: func() }];
+      },
+    };
+  `, context);
+
+  const detection = await vm.runInContext('detectCaptchaInTab(202)', context);
+  const scrollArg = vm.runInContext('__captchaScrollArg', context);
+
+  assert.equal(detection.detected, true);
+  assert.equal(detection.type, 'dom_selector');
+  assert.equal(detection.selector, '.shopee-captcha-slider');
+  assert.equal(scrollArg.behavior, 'smooth');
+  assert.equal(scrollArg.block, 'center');
+  assert.equal(scrollArg.inline, 'center');
+});
+
 test('runJob handles api_blocked: sends websocket event, focuses tab, saves state and does not retry', async () => {
   const { context, frames, sockets, getMessageListener } = await worker();
   sockets[0].onopen();
