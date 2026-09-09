@@ -132,7 +132,12 @@ async function sendCheckpoint(params) {
 }
 
 async function reportProgress(job, progress) {
-  if (job && job.id) await sendIngestRequest({ operation: "progress", job: job.id, progress });
+  if (job && job.id) {
+    // Keep the latest lightweight snapshot in the active job so the popup can
+    // render live progress without polling the helper or duplicating requests.
+    job._progress = { ...progress, updatedAt: Date.now() };
+    await sendIngestRequest({ operation: "progress", job: job.id, progress });
+  }
 }
 
 function sanitizeUrlForTrace(url) {

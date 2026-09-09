@@ -210,6 +210,46 @@ button {
   color: #3c4043;
 }
 
+.job-progress {
+  margin-top: 7px;
+  padding: 8px;
+  border: 1px solid #d2e3fc;
+  border-radius: 4px;
+  background: #f8fbff;
+}
+
+.job-progress-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 11px;
+  color: #3c4043;
+}
+
+.job-progress-head strong { color: #1a73e8; }
+
+.progress-track {
+  height: 7px;
+  margin: 6px 0 5px;
+  overflow: hidden;
+  background: #e8f0fe;
+  border-radius: 99px;
+}
+
+.progress-bar {
+  width: 0;
+  height: 100%;
+  background: #1a73e8;
+  border-radius: inherit;
+  transition: width 0.25s ease;
+}
+
+.job-progress-meta {
+  font-size: 11px;
+  color: #5f6368;
+}
+
 .alert-box {
   background: #fef7e0;
   border: 1px solid #f9ab00;

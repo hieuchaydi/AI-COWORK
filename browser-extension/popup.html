@@ -42,6 +42,16 @@
   <div class="section">
     <div class="section-title">Active Job & Verification</div>
     <div id="jobStatusText" class="status-info">No job currently running</div>
+    <div id="jobProgress" class="job-progress" style="display: none;">
+      <div class="job-progress-head">
+        <span id="jobProgressLabel">Đang chuẩn bị...</span>
+        <strong id="jobProgressPercent">0%</strong>
+      </div>
+      <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div id="jobProgressBar" class="progress-bar"></div>
+      </div>
+      <div id="jobProgressMeta" class="job-progress-meta"></div>
+    </div>
     <div id="verificationBox" class="alert-box" style="display: none;">
       <div id="verificationTitle" class="alert-title">⚠️ Yêu cầu xác minh danh tính / Đăng nhập</div>
       <div id="verificationReason" class="alert-reason" style="font-weight: bold; color: #b3261e; margin-bottom: 4px; word-break: break-word;"></div>

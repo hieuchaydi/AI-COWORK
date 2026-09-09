@@ -7,6 +7,11 @@ const btnAutoPair = document.getElementById("btnAutoPair");
 const btnConnect = document.getElementById("btnConnect");
 const btnDisconnect = document.getElementById("btnDisconnect");
 const jobStatusText = document.getElementById("jobStatusText");
+const jobProgress = document.getElementById("jobProgress");
+const jobProgressLabel = document.getElementById("jobProgressLabel");
+const jobProgressPercent = document.getElementById("jobProgressPercent");
+const jobProgressBar = document.getElementById("jobProgressBar");
+const jobProgressMeta = document.getElementById("jobProgressMeta");
 const verificationBox = document.getElementById("verificationBox");
 const verificationReason = document.getElementById("verificationReason");
 const verificationMsg = document.getElementById("verificationMsg");
@@ -218,9 +223,24 @@ function renderStatus(state, details) {
   }
 
   if (details && details.currentJob) {
-    jobStatusText.textContent = `Job: ${details.currentJob.id} (${details.currentJob.stage || "running"})`;
+    const job = details.currentJob;
+    const progress = job._progress || {};
+    jobStatusText.textContent = `Job: ${job.id} (${progress.stage || job.stage || "running"})`;
+    const percent = Math.max(0, Math.min(100, Number(progress.percent) || 0));
+    const rows = Number(progress.rows);
+    const total = Number(progress.total || progress.totalTarget);
+    const label = progress.message || "Đang xử lý...";
+    jobProgress.style.display = "block";
+    jobProgressLabel.textContent = label;
+    jobProgressPercent.textContent = `${percent}%`;
+    jobProgressBar.style.width = `${percent}%`;
+    jobProgressBar.parentElement.setAttribute("aria-valuenow", String(percent));
+    jobProgressMeta.textContent = Number.isFinite(rows) && rows > 0
+      ? `Đã lấy ${rows.toLocaleString("vi-VN")}${Number.isFinite(total) && total > 0 ? `/${total.toLocaleString("vi-VN")} đánh giá` : " đánh giá"}`
+      : "Đang kết nối và chuẩn bị dữ liệu";
   } else {
     jobStatusText.textContent = "No job currently running";
+    jobProgress.style.display = "none";
   }
 }
 
