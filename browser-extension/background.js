@@ -816,6 +816,22 @@ function evaluatePreflightResult(fetchRes) {
   };
 }
 
+function isUsableRatingsPreflight(fetchRes) {
+  if (!fetchRes?.ok || fetchRes.status !== 200) return false;
+  const json = fetchRes.json;
+  if (!json || typeof json !== "object" || json.error) return false;
+  const data = json.data;
+  const candidateArrays = [
+    data?.ratings,
+    data?.items,
+    json.ratings,
+    json.items,
+  ];
+  if (candidateArrays.some((value) => Array.isArray(value))) return true;
+  const total = Number(data?.item_rating_summary?.rating_total ?? data?.total ?? json.total);
+  return Number.isFinite(total) && total >= 0 && data !== null && typeof data === "object";
+}
+
 const CANDIDATE_FILTERS = [1, 2, 3, 4, 5];
 const PROBE_LIMIT = 6;
 
@@ -1878,12 +1894,7 @@ function startApiBlockedWatcher(details) {
     }
 
     const evalRes = evaluatePreflightResult(preflightRes);
-    const hasValidRatings = preflightRes?.ok && (
-      (preflightRes.json?.data && (Array.isArray(preflightRes.json.data.ratings) || Array.isArray(preflightRes.json.data.items))) ||
-      Array.isArray(preflightRes.json?.ratings) ||
-      Array.isArray(preflightRes.json?.items) ||
-      (preflightRes.status === 200 && !preflightRes.json?.error)
-    );
+    const hasValidRatings = isUsableRatingsPreflight(preflightRes);
 
     if (hasValidRatings) {
       console.log(`[bridge] ✔ Smart auto-recheck succeeded (HTTP 200)! Auto-resuming job: ${jid}`);
@@ -1895,7 +1906,13 @@ function startApiBlockedWatcher(details) {
         message: "Shopee đã hết chặn API (HTTP 200). Hệ thống tự động tiếp tục cào từ checkpoint.",
       });
     } else {
-      console.log(`[bridge] Smart preflight still blocked (status: ${preflightRes?.status}):`, evalRes.error);
+      updateState("api_blocked", {
+        ...verificationInfo,
+        auto_recheck_active: true,
+        last_recheck_at: new Date().toISOString(),
+        last_recheck_status: preflightRes?.status || "unknown",
+      });
+      console.log(`[bridge] Smart preflight still blocked (status: ${preflightRes?.status}):`, evalRes.error || "unusable ratings payload");
     }
   };
 
@@ -1909,12 +1926,28 @@ function startApiBlockedWatcher(details) {
   chrome.tabs.onUpdated?.addListener(tabListener);
   activeApiBlockedTabListener = tabListener;
 
-  // 2. Safe Backoff Timer: try at 15s, 45s, 90s (max 3 auto checks to avoid infinite looping)
+  // 2. Safe Backoff Timer: retry for a few minutes without looping forever.
   let backoffIndex = 0;
-  const backoffDelays = [15000, 30000, 45000];
+  const backoffDelays = [15000, 45000, 90000, 180000, 300000];
   const scheduleNextBackoff = () => {
-    if (backoffIndex >= backoffDelays.length) return;
+    if (backoffIndex >= backoffDelays.length) {
+      updateState("api_blocked", {
+        ...verificationInfo,
+        auto_recheck_active: false,
+        auto_recheck_exhausted: true,
+        auto_recheck_attempts: backoffIndex,
+        next_recheck_at: null,
+      });
+      return;
+    }
     const delay = backoffDelays[backoffIndex++];
+    updateState("api_blocked", {
+      ...verificationInfo,
+      auto_recheck_active: true,
+      auto_recheck_exhausted: false,
+      auto_recheck_attempts: backoffIndex,
+      next_recheck_at: new Date(Date.now() + delay).toISOString(),
+    });
     apiBlockedWatcherInterval = setTimeout(async () => {
       await checkAndAutoResume("backoff_timer");
       scheduleNextBackoff();
@@ -2064,12 +2097,7 @@ function startVerificationWatcher(details) {
         }
 
         const evalRes = evaluatePreflightResult(preflightRes);
-        const hasValidRatings = preflightRes?.ok && (
-          (preflightRes.json?.data && (Array.isArray(preflightRes.json.data.ratings) || Array.isArray(preflightRes.json.data.items))) ||
-          Array.isArray(preflightRes.json?.ratings) ||
-          Array.isArray(preflightRes.json?.items) ||
-          (preflightRes.status === 200 && !preflightRes.json?.error)
-        );
+        const hasValidRatings = isUsableRatingsPreflight(preflightRes);
 
         if (hasValidRatings) {
           console.log("[bridge] ✔ Preflight succeeded (HTTP 200 & valid ratings)! Resuming job:", jid);
@@ -2082,7 +2110,7 @@ function startVerificationWatcher(details) {
             message: "Thử thách CAPTCHA đã được giải và preflight API thành công (HTTP 200)",
           });
         } else {
-          console.warn("[bridge] ✘ Preflight failed after challenge disappeared:", evalRes.error || preflightRes?.status);
+          console.warn("[bridge] ✘ Preflight failed after challenge disappeared:", evalRes.error || preflightRes?.status || "unusable ratings payload");
           resumeInFlightMap.set(jid, false);
           consecutiveAbsentCount = 0;
 
@@ -2310,12 +2338,7 @@ async function handleRecheckApi(jobId) {
   }
 
   const evalRes = evaluatePreflightResult(preflightRes);
-  const hasValidRatings = preflightRes?.ok && (
-    (preflightRes.json?.data && (Array.isArray(preflightRes.json.data.ratings) || Array.isArray(preflightRes.json.data.items))) ||
-    Array.isArray(preflightRes.json?.ratings) ||
-    Array.isArray(preflightRes.json?.items) ||
-    (preflightRes.status === 200 && !preflightRes.json?.error)
-  );
+  const hasValidRatings = isUsableRatingsPreflight(preflightRes);
 
   if (hasValidRatings) {
     console.log("[bridge] Recheck API thành công (HTTP 200), resuming job:", job.id);
@@ -3421,6 +3444,7 @@ if (typeof module !== "undefined" && module.exports) {
     resolveShopId,
     preflightRatingsInTab,
     evaluatePreflightResult,
+    isUsableRatingsPreflight,
     extractShopeeReviews,
     normaliseRating,
     reviewFingerprint,

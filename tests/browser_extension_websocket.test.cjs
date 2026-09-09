@@ -461,6 +461,34 @@ test('ratings preflight and pagination execute in the Shopee page MAIN world', a
   assert.equal(vm.runInContext('PACE_MS', context), 1200);
 });
 
+test('usable ratings preflight rejects 200 responses without review payload', async () => {
+  const { context } = await worker();
+
+  assert.equal(vm.runInContext(`
+    isUsableRatingsPreflight({
+      ok: true,
+      status: 200,
+      json: { data: null },
+    })
+  `, context), false);
+
+  assert.equal(vm.runInContext(`
+    isUsableRatingsPreflight({
+      ok: true,
+      status: 200,
+      json: { data: { ratings: [] } },
+    })
+  `, context), true);
+
+  assert.equal(vm.runInContext(`
+    isUsableRatingsPreflight({
+      ok: true,
+      status: 200,
+      json: { data: { item_rating_summary: { rating_total: 0 } } },
+    })
+  `, context), true);
+});
+
 test('Shopee job creates a browser window when MV3 worker has no current window', async () => {
   const { context } = await worker();
   vm.runInContext(`
@@ -1322,6 +1350,40 @@ test('handleRecheckApi rejects and does not resume when preflight returns 403', 
 
   // No resolved frame sent
   const resolvedFrame = frames.find((f) => f.type === 'verification.resolved' && f.params?.job_id === 'job-recheck-403');
+  assert.equal(resolvedFrame, undefined);
+});
+
+test('handleRecheckApi rejects HTTP 200 when ratings payload is unusable', async () => {
+  const { context, frames, sockets } = await worker();
+  sockets[0].onopen();
+
+  vm.runInContext(`
+    findOrOpenShopeeTab = async () => ({ id: 77, url: "https://shopee.vn/product/111/222" });
+    preflightRatingsInTab = async () => ({
+      ok: true,
+      status: 200,
+      json: { data: null },
+      textSample: '{"data":null}',
+    });
+    enqueueLegacyJob = (j) => { throw new Error("Should not enqueue!"); };
+  `, context);
+
+  const testJob = {
+    id: 'job-recheck-200-null',
+    url: 'https://shopee.vn/product/111/222',
+    _targetTabId: 77,
+  };
+
+  vm.runInContext(`
+    pendingVerificationJobs.set("job-recheck-200-null", ${JSON.stringify(testJob)});
+    updateState("api_blocked", { job_id: "job-recheck-200-null", kind: "api_blocked" });
+  `, context);
+
+  const result = await vm.runInContext('handleRecheckApi("job-recheck-200-null")', context);
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 200);
+
+  const resolvedFrame = frames.find((f) => f.type === 'verification.resolved' && f.params?.job_id === 'job-recheck-200-null');
   assert.equal(resolvedFrame, undefined);
 });
 
