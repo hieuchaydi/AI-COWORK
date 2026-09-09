@@ -1638,6 +1638,8 @@ class SessionManager:
             prefix = model.split(":", 1)[0]
             if get_descriptor(prefix) is not None:
                 return prefix
+        if (model or "").startswith("aion-labs/"):
+            return "aionlabs"
         return "openai"
 
     def _provider_configured(self, name: str) -> bool:

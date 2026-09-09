@@ -109,6 +109,7 @@ CEREBRAS_KEY = os.environ.get("CEREBRAS_API_KEY", "")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
 COHERE_KEY = os.environ.get("COHERE_API_KEY", "")
+AION_KEY = os.environ.get("AION_API_KEY", "")
 CLOUDFLARE_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
 CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 API_TOKEN = os.environ.get("CONNECT_AI_API_TOKEN") or os.environ.get(
@@ -3835,6 +3836,15 @@ def _seed_runtime_state() -> None:
                 "cohere:c4ai-aya-vision-32b",
             ]
         )
+    if AION_KEY:
+        picker.extend(
+            [
+                "aionlabs:aion-labs/aion-2.0",
+                "aionlabs:aion-labs/aion-3.0",
+                "aionlabs:aion-labs/aion-3.0-mini",
+                "aionlabs:aion-labs/aion-rp-llama-3.1-8b",
+            ]
+        )
     # Cerebras — very fast OpenAI-compatible inference. Only seed when the key is present
     # (compat providers fail on first use without a key). Qwen has the largest account quota;
     # GPT-OSS and Gemma remain available for reasoning and vision-oriented work.
@@ -3893,7 +3903,9 @@ def _seed_runtime_state() -> None:
     # 1c. Select the strongest available model automatically. The picker keeps
     # faster/cheaper alternatives, but adding a provider key should immediately
     # make that provider usable without a second configuration step.
-    if ANTHROPIC_KEY:
+    if AION_KEY:
+        default_model = "aionlabs:aion-labs/aion-3.0"
+    elif ANTHROPIC_KEY:
         default_model = "anthropic:claude-opus-4-8"
     elif OPENAI_KEY:
         default_model = "openai:gpt-5.5"
@@ -4306,6 +4318,8 @@ def main() -> None:
         env["OPENAI_API_KEY"] = OPENAI_KEY
     if COHERE_KEY:
         env["COHERE_API_KEY"] = COHERE_KEY
+    if AION_KEY:
+        env["AION_API_KEY"] = AION_KEY
     env["CONNECT_AI_API_TOKEN"] = API_TOKEN
     env["COWORKER_API_TOKEN"] = API_TOKEN  # legacy readers (bridges, old scripts)
     # Pin state dir explicitly. Without this, if launch.py is invoked from a

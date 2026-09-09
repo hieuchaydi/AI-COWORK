@@ -681,6 +681,13 @@ DESCRIPTORS: list[ProviderDescriptor] = [
         recommended_model="z-ai/glm-5.2",
         env_key="OPENROUTER_API_KEY",
     ),
+    _compat(
+        "aionlabs",
+        "AionLabs",
+        base_url="https://api.aionlabs.ai/v1",
+        recommended_model="aion-labs/aion-3.0",
+        env_key="AION_API_KEY",
+    ),
     ProviderDescriptor(
         name="ollama",
         title="Ollama (local models)",

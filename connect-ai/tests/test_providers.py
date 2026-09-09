@@ -665,3 +665,53 @@ def test_gpt_5_mini_matrix_and_rate_limits():
     caps = capabilities_for("gpt-5-mini")
     assert caps.tools and caps.vision and caps.pdf and caps.streaming
 
+
+
+def test_aionlabs_descriptor_and_matrix():
+    from coworker.providers.capabilities import capabilities_for
+    from coworker.providers.matrix import (
+        MATRIX,
+        entry_for,
+        models_for_provider,
+        resolve_model_alias,
+    )
+    from coworker.providers.openai_provider import OpenAIProvider
+    from coworker.providers.registry import build_provider_client, get_descriptor
+
+    d = get_descriptor("aionlabs")
+    assert d is not None
+    assert d.title == "AionLabs"
+    assert d.env_key == "AION_API_KEY"
+    assert d.recommended_model == "aion-labs/aion-3.0"
+    base = next(f for f in d.fields if f.key == "base_url")
+    assert base.default == "https://api.aionlabs.ai/v1"
+
+    models = models_for_provider("aionlabs")
+    assert models == [
+        "aion-labs/aion-2.0",
+        "aion-labs/aion-3.0",
+        "aion-labs/aion-3.0-mini",
+        "aion-labs/aion-rp-llama-3.1-8b",
+    ]
+    assert d.recommended_model in models
+
+    # Test matrix entries and resolve_model_alias
+    for bare in models:
+        full = f"aionlabs:{bare}"
+        assert full in MATRIX
+        assert entry_for(bare) is not None
+        assert entry_for(full) is not None
+        assert resolve_model_alias(bare) == full
+        caps = capabilities_for(full)
+        assert caps.tools and caps.streaming
+
+    # Test wire model name stripping in OpenAIProvider
+    provider = OpenAIProvider(client=object())
+    assert provider._resolve_model_name("aionlabs:aion-labs/aion-3.0") == "aion-labs/aion-3.0"
+    assert provider._resolve_model_name("aion-labs/aion-3.0") == "aion-labs/aion-3.0"
+
+    # Test client builder
+    client = build_provider_client("aionlabs", {"api_key": "test-key"}, None)
+    assert isinstance(client, OpenAIProvider)
+    assert client._base_url == "https://api.aionlabs.ai/v1"
+    assert client._api_key == "test-key"

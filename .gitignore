@@ -89,3 +89,5 @@ tmp_test*
 tmp_*.py
 
 
+.csv
+.zip

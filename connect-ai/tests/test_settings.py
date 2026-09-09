@@ -187,6 +187,7 @@ def test_model_picker_only_returns_configured_providers(tmp_path, monkeypatch):
         "ANTHROPIC_API_KEY",
         "GROQ_API_KEY",
         "CEREBRAS_API_KEY",
+        "AION_API_KEY",
         "CLOUDFLARE_API_TOKEN",
         "NVIDIA_API_KEY",
     ):

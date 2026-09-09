@@ -341,7 +341,8 @@ class OpenAIProvider(ProviderClient):
             prefix, bare = resolved.split(":", 1)
             if prefix.lower() in (
                 "cohere", "groq", "cerebras", "openai", "deepseek", "together",
-                "fireworks", "openrouter", "mistral", "xai", "zai", "kimi", "minimax", "qwen"
+                "fireworks", "openrouter", "mistral", "xai", "zai", "kimi", "minimax", "qwen",
+                "aionlabs", "aion"
             ):
                 return bare
             return resolved

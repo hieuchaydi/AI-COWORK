@@ -8,12 +8,13 @@ const PROVIDER_LABELS: Record<string, string> = {
   together: "Together AI", fireworks: "Fireworks", cerebras: "Cerebras",
   deepseek: "DeepSeek", zai: "Z AI", kimi: "Kimi", minimax: "MiniMax",
   qwen: "Qwen", xai: "xAI", mistral: "Mistral", meta: "Meta",
+  aionlabs: "AionLabs",
 };
 
 export interface ModelChoice { value: string; label: string; provider: string; }
 
 export const providerForModel = (model: string) =>
-  model.includes(":") ? model.split(":", 1)[0] : "openai";
+  model.includes(":") ? model.split(":", 1)[0] : model.startsWith("aion-labs/") ? "aionlabs" : "openai";
 
 export const providerLabel = (provider: string) =>
   PROVIDER_LABELS[provider] || provider.charAt(0).toUpperCase() + provider.slice(1);

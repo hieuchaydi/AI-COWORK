@@ -53,6 +53,8 @@ class ProviderRouter(ProviderClient):
             prefix = model.split(":", 1)[0]
             if get_descriptor(prefix) is not None:
                 return prefix
+        if model.startswith("aion-labs/"):
+            return "aionlabs"
         return self._default
 
     def _client_for(self, model: str) -> ProviderClient:

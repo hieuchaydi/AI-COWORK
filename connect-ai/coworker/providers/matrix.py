@@ -203,6 +203,15 @@ MATRIX: dict[str, ModelEntry] = {
     "openrouter:meta-llama/llama-4-maverick": ModelEntry(
         "Llama 4 Maverick · via OpenRouter", _AGENTIC, 1_000_000
     ),
+    # AionLabs — OpenAI-compatible inference.
+    "aionlabs:aion-labs/aion-2.0": ModelEntry("Aion 2.0 · AionLabs", _AGENTIC, 128_000),
+    "aionlabs:aion-labs/aion-3.0": ModelEntry("Aion 3.0 · AionLabs", _AGENTIC, 128_000),
+    "aionlabs:aion-labs/aion-3.0-mini": ModelEntry(
+        "Aion 3.0 Mini · AionLabs", _AGENTIC, 128_000
+    ),
+    "aionlabs:aion-labs/aion-rp-llama-3.1-8b": ModelEntry(
+        "Aion RP Llama 3.1 8B · AionLabs", _AGENTIC, 128_000
+    ),
     # Groq — LPU inference, free tier. 131K context window across models.
     # Tool support: gpt-oss-120b, gpt-oss-20b, qwen3.6-27b support native tool calling.
     # compound & compound-mini are text-only completions (no function calling parameter).
@@ -409,8 +418,18 @@ COHERE_ALIASES: dict[str, str] = {
 }
 
 
+AION_ALIASES: dict[str, str] = {
+    "aion-labs/aion-2.0": "aionlabs:aion-labs/aion-2.0",
+    "aion-labs/aion-3.0": "aionlabs:aion-labs/aion-3.0",
+    "aion-labs/aion-3.0-mini": "aionlabs:aion-labs/aion-3.0-mini",
+    "aion-labs/aion-rp-llama-3.1-8b": "aionlabs:aion-labs/aion-rp-llama-3.1-8b",
+}
+
+
 def resolve_model_alias(model: str) -> str:
-    """Map human/short aliases to canonical model IDs (e.g. Cohere versioned IDs)."""
+    """Map human/short aliases to canonical model IDs (e.g. Cohere versioned IDs, AionLabs aliases)."""
+    if model in AION_ALIASES:
+        return AION_ALIASES[model]
     return COHERE_ALIASES.get(model, model)
 
 

@@ -32,6 +32,7 @@ export const KEY_HELP: Record<string, { url: string; label: string }> = {
   qwen: { url: "https://modelstudio.console.alibabacloud.com", label: "alibabacloud.com" },
   minimax: { url: "https://platform.minimax.io", label: "platform.minimax.io" },
   xai: { url: "https://console.x.ai", label: "console.x.ai" },
+  aionlabs: { url: "https://api.aionlabs.ai", label: "api.aionlabs.ai" },
 };
 
 export type Verify = { state: "idle" | "testing" | "ok" | "error"; msg?: string };

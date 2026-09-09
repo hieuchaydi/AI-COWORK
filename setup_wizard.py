@@ -96,6 +96,13 @@ FIELDS = [
         "prefix": "sk-",
     },
     {
+        "env_key": "AION_API_KEY",
+        "label": "AionLabs API Key",
+        "required": False,
+        "hint": "api.aionlabs.ai  (aion-2.0, aion-3.0, aion-3.0-mini, aion-rp-llama-3.1-8b)",
+        "link": "https://api.aionlabs.ai/",
+    },
+    {
         "env_key": "CEREBRAS_API_KEY",
         "label": "Cerebras API Key",
         "required": False,
