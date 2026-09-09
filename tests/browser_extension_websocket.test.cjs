@@ -940,6 +940,295 @@ test('runJob on 403 detects captcha slider, triggers verification.required and a
   vm.runInContext('stopVerificationWatcher()', context);
 });
 
+test('probeFilterCandidates discovers comment and media filters dynamically without hardcoding', async () => {
+  const { context } = await worker();
+  const traces = [];
+  context.traceCapture = (ev, d) => traces.push({ ev, d });
+
+  vm.runInContext(`
+    fetchRatingsFromTab = async (tabId, itemid, shopid, offset, limit, referer, ratingType, filter) => {
+      if (filter === 1) {
+        return {
+          ok: true,
+          status: 200,
+          json: {
+            data: {
+              ratings: [
+                { cmid: 'c1', comment: 'Rất ưng ý', images: [], videos: [] },
+                { cmid: 'c2', comment: 'Đẹp tuyệt vời', images: [], videos: [] },
+              ]
+            }
+          }
+        };
+      }
+      if (filter === 2) {
+        return {
+          ok: true,
+          status: 200,
+          json: {
+            data: {
+              ratings: [
+                { cmid: 'm1', comment: 'Có hình thật đây', images: ['https://shopee/img1.jpg'], videos: [] },
+                { cmid: 'm2', comment: 'Hàng chuẩn', images: ['https://shopee/img2.jpg'], videos: [{ url: 'v1.mp4' }] },
+              ]
+            }
+          }
+        };
+      }
+      return { ok: true, status: 200, json: { data: { ratings: [] } } };
+    };
+  `, context);
+
+  const job = { id: 'job-probe-test', url: 'https://shopee.vn/product/111/222' };
+  const res = await vm.runInContext(`
+    probeFilterCandidates(10, '222', '111', 'https://shopee.vn/product/111/222', ${JSON.stringify(job)}, async (p) => {
+      traceCapture(p.stage, p.trace);
+    })
+  `, context);
+
+  assert.equal(res.mediaFilter, 2, 'Filter 2 should be mapped to media (media_ratio = 1.0)');
+  assert.equal(res.commentFilter, 1, 'Filter 1 should be mapped to comment (comment_ratio = 1.0)');
+  assert.equal(res.mediaStat.media_ratio, 1);
+  assert.equal(res.commentStat.comment_ratio, 1);
+
+  // Check filter-probe traces
+  const probeTraces = traces.filter((t) => t.d?.event === 'filter-probe');
+  assert.ok(probeTraces.length >= 2, 'filter-probe trace events should be recorded');
+  const mediaTrace = probeTraces.find((t) => t.d?.filter === 2);
+  assert.equal(mediaTrace.d.mappedScope, 'media');
+});
+
+test('normalizeCheckpointV2 maintains V2 structures and migrates legacy V1 checkpoints', async () => {
+  const { context } = await worker();
+
+  // Test 1: V1 migration
+  const v1 = {
+    next_offset: 160,
+    rating_type: 4,
+    rows_count: 150,
+    total: 300,
+  };
+  const migrated = vm.runInContext(`normalizeCheckpointV2(${JSON.stringify(v1)}, '222', '111')`, context);
+  assert.equal(migrated.version, 2);
+  assert.equal(migrated.active_scope, 'all');
+  assert.equal(migrated.scopes.all.next_offset, 160);
+  assert.equal(migrated.scopes.all.rating_type, 4);
+  assert.equal(migrated.scopes.all.rows_count, 150);
+  assert.equal(migrated.scopes.comment.discovered, false);
+  assert.equal(migrated.scopes.media.discovered, false);
+
+  // Test 2: V2 preservation
+  const v2 = {
+    version: 2,
+    active_scope: 'comment',
+    scopes: {
+      all: { key: 'all', completed: true, next_offset: 200, rows_count: 200 },
+      comment: { key: 'comment', completed: false, next_offset: 40, rows_count: 40 },
+      media: { key: 'media', completed: false, next_offset: 0, rows_count: 0 },
+    },
+    ui_reference: { total: 500, rcount_with_context: 250, rcount_with_media: 80 },
+  };
+  const normalizedV2 = vm.runInContext(`normalizeCheckpointV2(${JSON.stringify(v2)}, '222', '111')`, context);
+  assert.equal(normalizedV2.version, 2);
+  assert.equal(normalizedV2.active_scope, 'comment');
+  assert.equal(normalizedV2.scopes.comment.next_offset, 40);
+  assert.equal(normalizedV2.ui_reference.rcount_with_context, 250);
+});
+
+test('mergeReview merges media URLs and longer text across scopes without data loss', async () => {
+  const { context } = await worker();
+
+  const merged = vm.runInContext(`(() => {
+    const existing = {
+      id: 'cmid-999',
+      cmid: 'cmid-999',
+      user: 'user_a',
+      noi_dung: 'Tốt',
+      sao: 5,
+      anh: 0,
+      so_anh: 0,
+      anh_urls: '',
+      video: 0,
+      so_video: 0,
+      video_urls: '',
+      media_urls: '',
+    };
+    const incoming = {
+      id: 'cmid-999',
+      cmid: 'cmid-999',
+      user: 'user_a',
+      noi_dung: 'Tốt, đóng gói cẩn thận giao hàng nhanh',
+      sao: 5,
+      anh: 1,
+      so_anh: 2,
+      anh_urls: 'https://shopee/p1.jpg|https://shopee/p2.jpg',
+      video: 1,
+      so_video: 1,
+      video_urls: 'https://shopee/v1.mp4',
+      media_urls: 'https://shopee/p1.jpg|https://shopee/p2.jpg|https://shopee/v1.mp4',
+      phan_loai: 'Màu đen, Size XL',
+    };
+    return mergeReview(existing, incoming);
+  })()`, context);
+
+  assert.equal(merged.id, 'cmid-999');
+  assert.equal(merged.noi_dung, 'Tốt, đóng gói cẩn thận giao hàng nhanh');
+  assert.equal(merged.anh, 1);
+  assert.equal(merged.so_anh, 2);
+  assert.equal(merged.anh_urls, 'https://shopee/p1.jpg|https://shopee/p2.jpg');
+  assert.equal(merged.video, 1);
+  assert.equal(merged.so_video, 1);
+  assert.equal(merged.video_urls, 'https://shopee/v1.mp4');
+  assert.equal(merged.phan_loai, 'Màu đen, Size XL');
+});
+
+test('extractShopeeReviews traverses multi-scopes independently with deduplication and checkpoints', async () => {
+  const { context } = await worker();
+  const checkpoints = [];
+  context.__testCheckpoint = (chk) => checkpoints.push(chk);
+
+  // Setup tab and DOM / API mocks
+  context.chrome.tabs = {
+    query: async () => [{ id: 55, url: 'https://shopee.vn/product/111/222', active: true }],
+    create: async () => ({ id: 55, url: 'https://shopee.vn/product/111/222' }),
+  };
+
+  vm.runInContext(`
+    sendCheckpoint = async (chk) => {
+      __testCheckpoint(chk);
+    };
+
+    preflightRatingsInTab = async () => ({
+      ok: true,
+      status: 200,
+      json: {
+        data: {
+          total: 3,
+          item_rating_summary: {
+            rating_total: 3,
+            rcount_with_context: 2,
+            rcount_with_media: 1,
+          }
+        }
+      }
+    });
+
+    fetchRatingsFromTab = async (tabId, itemid, shopid, offset, limit, referer, ratingType, filter) => {
+      // Filter 0 (all scope)
+      if (filter === 0) {
+        return {
+          ok: true,
+          status: 200,
+          json: {
+            data: {
+              ratings: [
+                { cmid: 'rev-1', author_username: 'buyer1', rating_star: 5, comment: 'Được', images: [] },
+                { cmid: 'rev-2', author_username: 'buyer2', rating_star: 4, comment: '', images: [] },
+              ]
+            }
+          }
+        };
+      }
+      // Probe filter 1 (comment candidate): 2 reviews with comments
+      if (filter === 1 && offset === 0 && limit === 6) {
+        return {
+          ok: true,
+          status: 200,
+          json: {
+            data: {
+              ratings: [
+                { cmid: 'rev-1', author_username: 'buyer1', rating_star: 5, comment: 'Được rất ưng', images: [] },
+                { cmid: 'rev-3', author_username: 'buyer3', rating_star: 5, comment: 'Quá đẹp', images: [] },
+              ]
+            }
+          }
+        };
+      }
+      // Probe filter 2 (media candidate): 1 review with photo
+      if (filter === 2 && offset === 0 && limit === 6) {
+        return {
+          ok: true,
+          status: 200,
+          json: {
+            data: {
+              ratings: [
+                { cmid: 'rev-1', author_username: 'buyer1', rating_star: 5, comment: 'Được', images: ['https://shopee/rev1.jpg'] },
+              ]
+            }
+          }
+        };
+      }
+      // Filter 1 (comment scope pagination)
+      if (filter === 1) {
+        return {
+          ok: true,
+          status: 200,
+          json: {
+            data: {
+              ratings: [
+                { cmid: 'rev-3', author_username: 'buyer3', rating_star: 5, comment: 'Quá đẹp', images: [] },
+              ]
+            }
+          }
+        };
+      }
+      // Filter 2 (media scope pagination)
+      if (filter === 2) {
+        return {
+          ok: true,
+          status: 200,
+          json: {
+            data: {
+              ratings: [
+                { cmid: 'rev-1', author_username: 'buyer1', rating_star: 5, comment: 'Được', images: ['https://shopee/rev1.jpg'] },
+              ]
+            }
+          }
+        };
+      }
+      return { ok: true, status: 200, json: { data: { ratings: [] } } };
+    };
+  `, context);
+
+  const job = {
+    id: 'job-multi-scope-test',
+    url: 'https://shopee.vn/product/111/222',
+  };
+  context.testJob = job;
+
+  const results = await vm.runInContext(`
+    extractShopeeReviews(testJob, async () => {})
+  `, context);
+
+  // Exactly 3 unique reviews (rev-1, rev-2, rev-3) deduplicated by cmid
+  assert.equal(results.length, 3);
+  const rev1 = results.find((r) => r.id === 'rev-1');
+  const rev2 = results.find((r) => r.id === 'rev-2');
+  const rev3 = results.find((r) => r.id === 'rev-3');
+  assert.ok(rev1, 'rev-1 must exist');
+  assert.ok(rev2, 'rev-2 must exist');
+  assert.ok(rev3, 'rev-3 must exist');
+
+  // Media merged into rev-1
+  assert.equal(rev1.anh, 1);
+  assert.ok(rev1.anh_urls.includes('rev1.jpg'));
+
+  // Crawl summary contains Checkpoint V2 scopes and UI reference
+  assert.equal(job._crawlSummary.version, 2);
+  assert.equal(job._crawlSummary.collected, 3);
+  assert.equal(job._crawlSummary.ui_reference.rcount_with_context, 2);
+  assert.equal(job._crawlSummary.ui_reference.rcount_with_media, 1);
+  assert.equal(job._crawlSummary.scopes.all.completed, true);
+  assert.equal(job._crawlSummary.scopes.comment.completed, true);
+  assert.equal(job._crawlSummary.scopes.media.completed, true);
+
+  // Checkpoints sent have version 2 and scopes
+  assert.ok(checkpoints.length > 0);
+  const lastChk = checkpoints[checkpoints.length - 1];
+  assert.equal(lastChk.version, 2);
+  assert.ok(lastChk.scopes);
+});
+
 
 
 

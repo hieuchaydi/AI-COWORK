@@ -1235,3 +1235,94 @@ def test_on_browser_ws_message_api_blocked_saves_checkpoint_and_log(server, monk
         assert chk["next_offset"] == 60
         assert chk["rating_type"] == 5
 
+
+def test_save_ingest_checkpoint_v2_and_multi_scope_dedup(server):
+    base, outputs = server
+    import launch
+
+    # 1. Enqueue job
+    job_res = _get(base, "/ingest/job?url=https://shopee.vn/product/123/456")
+    job_id = job_res["job"]["id"]
+
+    # 2. Save Checkpoint V2 with scopes and reviews
+    chk_v2 = {
+        "version": 2,
+        "active_scope": "comment",
+        "scopes": {
+            "all": {"key": "all", "completed": True, "rows_count": 10},
+            "comment": {"key": "comment", "completed": False, "rows_count": 5},
+            "media": {"key": "media", "completed": False, "rows_count": 0},
+        },
+        "ui_reference": {
+            "total": 100,
+            "rating_total": 100,
+            "rcount_with_context": 50,
+            "rcount_with_media": 20,
+        },
+        "itemid": "456",
+        "shopid": "123",
+        "total": 100,
+        "rows": [
+            {
+                "cmid": "cmid_001",
+                "user": "buyer_a",
+                "sao": 5,
+                "noi_dung": "Đẹp",
+                "thoi_gian": "2026-09-09 10:00:00",
+                "anh_urls": "",
+            },
+            {
+                "cmid": "cmid_002",
+                "user": "buyer_b",
+                "sao": 4,
+                "noi_dung": "Ổn",
+                "thoi_gian": "2026-09-09 10:05:00",
+                "anh_urls": "",
+            },
+        ],
+    }
+    saved = launch._save_ingest_checkpoint(job_id, chk_v2)
+    assert saved["ok"] is True
+    assert saved["version"] == 2
+    assert saved["active_scope"] == "comment"
+    assert saved["rows_count"] == 2
+
+    # 3. Check progress reflects Checkpoint V2
+    prog_res = _get(base, f"/ingest/progress?id={job_id}")
+    prog = prog_res["progress"]
+    assert prog["active_scope"] == "comment"
+    assert prog["checkpoint"]["version"] == 2
+    assert prog["ui_reference"]["rcount_with_media"] == 20
+
+    # 4. Finalize with overlapping review (cmid_001 has media now from media scope)
+    status, out = launch._store_ingest_payload({
+        "job": job_id,
+        "name": "shopee_456_reviews",
+        "rows": [
+            {
+                "cmid": "cmid_001",
+                "user": "buyer_a",
+                "sao": 5,
+                "noi_dung": "Đẹp và chắc chắn",
+                "thoi_gian": "2026-09-09 10:00:00",
+                "anh_urls": "https://shopee/cmid001.jpg",
+            },
+            {
+                "cmid": "cmid_003",
+                "user": "buyer_c",
+                "sao": 5,
+                "noi_dung": "Tuyệt",
+                "thoi_gian": "2026-09-09 10:10:00",
+            },
+        ],
+    })
+    assert status == 200 and out["ok"]
+    assert out["count"] == 3  # cmid_001 deduplicated, so 2 from checkpoint + 1 new = 3 total
+
+    # Check that cmid_001 in CSV has merged media
+    csv_file = outputs / "csv" / "shopee_456_reviews.csv"
+    assert csv_file.is_file()
+    content = csv_file.read_text(encoding="utf-8-sig")
+    assert "cmid001.jpg" in content
+    assert "Đẹp và chắc chắn" in content
+

@@ -206,6 +206,13 @@ function buildTraceEntry(job, event, details = {}) {
   if (typeof details.batchSize === "number") entry.batchSize = details.batchSize;
   if (typeof details.totalTarget === "number") entry.totalTarget = details.totalTarget;
   if (typeof details.ratingType === "number") entry.ratingType = details.ratingType;
+  if (details.filter !== undefined && details.filter !== null) entry.filter = details.filter;
+  if (typeof details.scope === "string") entry.scope = details.scope;
+  if (typeof details.mappedScope === "string" || details.mappedScope === null) entry.mappedScope = details.mappedScope;
+  if (typeof details.comment_ratio === "number") entry.comment_ratio = details.comment_ratio;
+  if (typeof details.media_ratio === "number") entry.media_ratio = details.media_ratio;
+  if (typeof details.reason === "string") entry.reason = details.reason;
+  if (typeof details.count === "number") entry.count = details.count;
 
   return entry;
 }
@@ -299,7 +306,12 @@ function normaliseRating(x) {
   const imageUrls = asList(x.images).map((v) => mediaUrl(v, "image")).filter(Boolean);
   const videoUrls = asList(x.videos || x.video).map((v) => mediaUrl(v, "video")).filter(Boolean);
   const mediaUrls = [...imageUrls, ...videoUrls];
+  const rawId = x.cmid != null ? x.cmid : (x.id != null ? x.id : (x.rating_id != null ? x.rating_id : ""));
+  const reviewId = rawId !== "" ? String(rawId).trim() : "";
   return {
+    id: reviewId,
+    cmid: x.cmid != null ? String(x.cmid).trim() : (reviewId || null),
+    orderid: x.orderid != null ? String(x.orderid).trim() : null,
     user: x.author_username || "",
     sao: x.rating_star,
     noi_dung: (x.comment || "").replace(/\s+/g, " ").trim(),
@@ -313,6 +325,18 @@ function normaliseRating(x) {
     video_urls: videoUrls.join("|"),
     media_urls: mediaUrls.join("|"),
     huu_ich: x.like_count || 0,
+  };
+}
+
+function extractRatingSummary(j) {
+  const data = j && j.data;
+  const summary = data && (data.item_rating_summary || data.product_rating_summary || data.rating_summary);
+  const total = ratingTotal(j);
+  return {
+    total: total ?? null,
+    rating_total: Number(summary?.rating_total || summary?.total_count || total || 0),
+    rcount_with_context: Number(summary?.rcount_with_context || 0),
+    rcount_with_media: Number(summary?.rcount_with_media || summary?.rcount_with_image || 0),
   };
 }
 
@@ -589,15 +613,15 @@ async function executeScriptResultWithRetry(options) {
   };
 }
 
-async function fetchRatingsFromTab(tabId, itemid, shopid, offset, limit, referer, ratingType = 0) {
+async function fetchRatingsFromTab(tabId, itemid, shopid, offset, limit, referer, ratingType = 0, filter = 0) {
   return executeScriptResultWithRetry({
     target: { tabId },
     // Run as the Shopee page itself. The default ISOLATED world gives the
     // request an extension/content-script initiator that Shopee's WAF rejects
     // even when the tab has a valid logged-in cookie.
     world: "MAIN",
-    func: async (iid, sid, off, lim, ref, type) => {
-      const path = `/api/v2/item/get_ratings?filter=0&flag=1&itemid=${iid}&limit=${lim}&offset=${off}&shopid=${sid}&type=${type}`;
+    func: async (iid, sid, off, lim, ref, type, filt) => {
+      const path = `/api/v2/item/get_ratings?filter=${filt ?? 0}&flag=1&itemid=${iid}&limit=${lim}&offset=${off}&shopid=${sid}&type=${type ?? 0}`;
       const controller = new AbortController();
       const tid = setTimeout(() => controller.abort(new Error("TIMEOUT")), 15000);
       try {
@@ -630,12 +654,15 @@ async function fetchRatingsFromTab(tabId, itemid, shopid, offset, limit, referer
         return { ok: false, error: err.message, isTimeout: err.name === "AbortError" || err.message === "TIMEOUT" };
       }
     },
-    args: [itemid, shopid, offset, limit, referer, ratingType],
+    args: [itemid, shopid, offset, limit, referer, ratingType, filter],
   });
 }
 
 function reviewFingerprint(review) {
   if (!review || typeof review !== "object") return "";
+  if (review.id) {
+    return `id:${review.id}`;
+  }
   return [
     review.user || "",
     review.thoi_gian || "",
@@ -645,6 +672,32 @@ function reviewFingerprint(review) {
     review.anh_urls || "",
     review.video_urls || "",
   ].join("\u001f");
+}
+
+function mergeReview(existing, incoming) {
+  if (!existing) return incoming;
+  if ((incoming.anh_urls && !existing.anh_urls) || (incoming.so_anh || 0) > (existing.so_anh || 0)) {
+    existing.anh = incoming.anh;
+    existing.so_anh = incoming.so_anh;
+    existing.anh_urls = incoming.anh_urls;
+  }
+  if ((incoming.video_urls && !existing.video_urls) || (incoming.so_video || 0) > (existing.so_video || 0)) {
+    existing.video = incoming.video;
+    existing.so_video = incoming.so_video;
+    existing.video_urls = incoming.video_urls;
+  }
+  if (incoming.media_urls && (!existing.media_urls || incoming.media_urls.length > existing.media_urls.length)) {
+    existing.media_urls = incoming.media_urls;
+  }
+  if ((incoming.noi_dung && !existing.noi_dung) || (incoming.noi_dung || "").length > (existing.noi_dung || "").length) {
+    existing.noi_dung = incoming.noi_dung;
+  }
+  if (incoming.phan_loai && !existing.phan_loai) {
+    existing.phan_loai = incoming.phan_loai;
+  }
+  if (incoming.cmid && !existing.cmid) existing.cmid = incoming.cmid;
+  if (incoming.orderid && !existing.orderid) existing.orderid = incoming.orderid;
+  return existing;
 }
 
 function shopeeLoginState(fetchRes) {
@@ -763,6 +816,200 @@ function evaluatePreflightResult(fetchRes) {
   };
 }
 
+const CANDIDATE_FILTERS = [1, 2, 3, 4, 5];
+const PROBE_LIMIT = 6;
+
+async function probeFilterCandidates(tabId, itemid, shopid, referer, job, progress) {
+  const probeStats = [];
+  const validCandidates = [];
+
+  for (const candidateFilter of CANDIDATE_FILTERS) {
+    const probeStart = Date.now();
+    let probeRes;
+    try {
+      probeRes = await fetchRatingsFromTab(tabId, itemid, shopid, 0, PROBE_LIMIT, referer, 0, candidateFilter);
+    } catch (err) {
+      probeRes = { ok: false, error: err?.message || String(err), status: 500 };
+    }
+    const probeElapsed = Date.now() - probeStart;
+    const httpStatus = typeof probeRes?.status === "number" ? probeRes.status : (probeRes?.ok ? 200 : 500);
+
+    if (!probeRes?.ok) {
+      probeStats.push({
+        filter: candidateFilter,
+        httpStatus,
+        count: 0,
+        comment_ratio: 0,
+        media_ratio: 0,
+        mappedScope: null,
+        reason: probeRes?.error || `HTTP ${httpStatus}`,
+        elapsedMs: probeElapsed,
+      });
+      continue;
+    }
+
+    const batch = (probeRes.json && (probeRes.json.data?.ratings || probeRes.json.ratings || probeRes.json.items)) || [];
+    if (!Array.isArray(batch) || batch.length === 0) {
+      probeStats.push({
+        filter: candidateFilter,
+        httpStatus,
+        count: 0,
+        comment_ratio: 0,
+        media_ratio: 0,
+        mappedScope: null,
+        reason: "Empty ratings batch returned by API",
+        elapsedMs: probeElapsed,
+      });
+      continue;
+    }
+
+    let commentCount = 0;
+    let mediaCount = 0;
+    for (const r of batch) {
+      const hasComment = typeof r.comment === "string" && r.comment.trim().length > 0;
+      if (hasComment) commentCount++;
+      const hasImages = Array.isArray(r.images) && r.images.length > 0;
+      const hasVideos = (Array.isArray(r.videos) && r.videos.length > 0) || (r.video && typeof r.video === "object");
+      if (hasImages || hasVideos) mediaCount++;
+    }
+
+    const commentRatio = Math.round((commentCount / batch.length) * 100) / 100;
+    const mediaRatio = Math.round((mediaCount / batch.length) * 100) / 100;
+
+    validCandidates.push({
+      filter: candidateFilter,
+      httpStatus,
+      count: batch.length,
+      comment_ratio: commentRatio,
+      media_ratio: mediaRatio,
+      elapsedMs: probeElapsed,
+    });
+  }
+
+  // Media filter: highest media_ratio >= 0.7
+  let mediaFilter = null;
+  let mediaStat = null;
+  const mediaCandidates = validCandidates.filter((c) => c.media_ratio >= 0.7);
+  if (mediaCandidates.length > 0) {
+    mediaCandidates.sort((a, b) => b.media_ratio - a.media_ratio || b.count - a.count);
+    mediaFilter = mediaCandidates[0].filter;
+    mediaStat = mediaCandidates[0];
+  }
+
+  // Comment filter: highest comment_ratio >= 0.7 among remaining
+  let commentFilter = null;
+  let commentStat = null;
+  const commentCandidates = validCandidates.filter((c) => c.filter !== mediaFilter && c.comment_ratio >= 0.7);
+  if (commentCandidates.length > 0) {
+    commentCandidates.sort((a, b) => b.comment_ratio - a.comment_ratio || b.count - a.count);
+    commentFilter = commentCandidates[0].filter;
+    commentStat = commentCandidates[0];
+  }
+
+  for (const c of validCandidates) {
+    let mappedScope = null;
+    let reason = "Evaluated";
+    if (c.filter === mediaFilter) {
+      mappedScope = "media";
+      reason = `Matched scope 'media' (media_ratio=${c.media_ratio})`;
+    } else if (c.filter === commentFilter) {
+      mappedScope = "comment";
+      reason = `Matched scope 'comment' (comment_ratio=${c.comment_ratio})`;
+    } else {
+      reason = `Not selected: comment_ratio=${c.comment_ratio}, media_ratio=${c.media_ratio}`;
+    }
+    probeStats.push({
+      ...c,
+      mappedScope,
+      reason,
+    });
+  }
+
+  for (const stat of probeStats) {
+    await traceJob(job, progress, "filter-probe", {
+      itemid,
+      shopid,
+      ...stat,
+    });
+  }
+
+  return {
+    commentFilter,
+    mediaFilter,
+    commentStat,
+    mediaStat,
+    probeStats,
+  };
+}
+
+function normalizeCheckpointV2(chk, defaultItemid, defaultShopid) {
+  if (!chk || typeof chk !== "object") return null;
+  if (chk.version === 2 && chk.scopes) {
+    return {
+      version: 2,
+      active_scope: chk.active_scope || "all",
+      scopes: chk.scopes,
+      itemid: chk.itemid || defaultItemid,
+      shopid: chk.shopid || defaultShopid,
+      total: chk.total ?? null,
+      ui_reference: chk.ui_reference || null,
+      updated_at: chk.updated_at || Date.now(),
+      next_offset: chk.next_offset || 0,
+      rows_count: chk.rows_count || 0,
+      rating_type: chk.rating_type || 0,
+    };
+  }
+
+  // V1 migration
+  const v1Offset = typeof chk.next_offset === "number" ? chk.next_offset : (chk.offset || 0);
+  const v1Rows = typeof chk.rows_count === "number" ? chk.rows_count : v1Offset;
+  const v1RatingType = Number.isInteger(chk.rating_type) ? chk.rating_type : 0;
+  return {
+    version: 2,
+    active_scope: "all",
+    scopes: {
+      all: {
+        key: "all",
+        label: "Tất cả",
+        filter: 0,
+        rating_type: v1RatingType,
+        next_offset: v1Offset,
+        rows_count: v1Rows,
+        completed: false,
+        discovered: true,
+      },
+      comment: {
+        key: "comment",
+        label: "Có bình luận",
+        filter: null,
+        rating_type: 0,
+        next_offset: 0,
+        rows_count: 0,
+        completed: false,
+        discovered: false,
+      },
+      media: {
+        key: "media",
+        label: "Có hình ảnh / Video",
+        filter: null,
+        rating_type: 0,
+        next_offset: 0,
+        rows_count: 0,
+        completed: false,
+        discovered: false,
+      },
+    },
+    itemid: chk.itemid || defaultItemid,
+    shopid: chk.shopid || defaultShopid,
+    total: chk.total ?? null,
+    ui_reference: null,
+    updated_at: chk.updated_at || Date.now(),
+    next_offset: v1Offset,
+    rows_count: v1Rows,
+    rating_type: v1RatingType,
+  };
+}
+
 async function extractShopeeReviews(job, progress) {
   job.url = normalizeShopeeUrl(job.url);
   if (!isValidShopeeUrl(job.url)) {
@@ -846,306 +1093,413 @@ async function extractShopeeReviews(job, progress) {
     throw err;
   }
 
-  const all = [];
-  const seen = new Set();
-  let ratingType = (job.checkpoint && Number.isInteger(job.checkpoint.rating_type))
-    ? job.checkpoint.rating_type
-    : 0;
-  let typeIndex = Math.max(0, RATING_TYPES.indexOf(ratingType));
-  let offset = (job.checkpoint && typeof job.checkpoint.next_offset === "number")
-    ? job.checkpoint.next_offset
-    : ((job.checkpoint && typeof job.checkpoint.offset === "number") ? job.checkpoint.offset : 0);
-  let resumedRowsCount = (job.checkpoint && typeof job.checkpoint.rows_count === "number")
-    ? job.checkpoint.rows_count
-    : offset;
-  let durableRowsCount = resumedRowsCount;
-  let total = (job.checkpoint && typeof job.checkpoint.total === "number") ? job.checkpoint.total : null;
+  // 5. Trích xuất số tham chiếu UI Shopee
+  const uiReference = extractRatingSummary(preflightRes.json);
+  let total = uiReference.total;
 
-  if (offset === 0) {
+  // 6. Nạp Checkpoint V2 (hỗ trợ migration từ V1)
+  let loadedCheckpoint = null;
+  if (job.checkpoint) {
+    loadedCheckpoint = normalizeCheckpointV2(job.checkpoint, itemid, shopid);
+  }
+  if (!loadedCheckpoint) {
     try {
       const stored = await chrome.storage.local.get([`checkpoint_${job.id}`]);
       const chk = stored[`checkpoint_${job.id}`];
-      if (chk && typeof chk.next_offset === "number") {
-        offset = chk.next_offset;
-        resumedRowsCount = typeof chk.rows_count === "number" ? chk.rows_count : chk.next_offset;
-        durableRowsCount = resumedRowsCount;
-        if (Number.isInteger(chk.rating_type) && RATING_TYPES.includes(chk.rating_type)) {
-          ratingType = chk.rating_type;
-          typeIndex = RATING_TYPES.indexOf(ratingType);
-        }
-        if (chk.shopid && !shopid) shopid = chk.shopid;
-        if (chk.total && total === null) total = chk.total;
-      }
+      if (chk) loadedCheckpoint = normalizeCheckpointV2(chk, itemid, shopid);
     } catch {}
   }
+  if (loadedCheckpoint?.total && total === null) {
+    total = loadedCheckpoint.total;
+  }
 
-  while (durableRowsCount < MAX_REVIEWS) {
-    const requestStarted = Date.now();
-    const requestStartIso = new Date(requestStarted).toISOString();
-    await traceJob(job, progress, "ratings-request", {
-      itemid,
-      shopid,
-      offset,
-      ratingType,
-      limit: PAGE_SIZE,
-      tabId: tab.id,
-      tabUrl: tab.url || "",
-      requestStart: requestStartIso,
-    });
-    let fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, tab.url || job.url, ratingType);
-    if (!fetchRes.ok && (fetchRes.retryableTabError || fetchRes.isTimeout)) {
-      const recoveredTab = await findOrOpenShopeeTab(job.url, itemid);
-      if (recoveredTab?.id) {
-        tab = recoveredTab;
-        job._targetTabId = tab.id;
-        job._targetTabUrl = tab.url || job.url;
-        await traceJob(job, progress, "tab-recovered", {
-          itemid,
-          shopid,
-          tabId: tab.id,
-          tabUrl: tab.url || job.url,
-          offset,
-          ratingType,
-          limit: PAGE_SIZE,
-          error: fetchRes.error,
-        });
-        fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, tab.url || job.url, ratingType);
+  // 7. Khởi tạo Scopes: all, comment, media
+  let scopes = loadedCheckpoint?.scopes ? { ...loadedCheckpoint.scopes } : null;
+  if (!scopes) {
+    scopes = {
+      all: {
+        key: "all",
+        label: "Tất cả",
+        filter: 0,
+        rating_type: 0,
+        next_offset: 0,
+        rows_count: 0,
+        completed: false,
+        discovered: true,
+        probe_stats: { count: null, comment_ratio: null, media_ratio: null },
+      },
+      comment: {
+        key: "comment",
+        label: "Có bình luận",
+        filter: null,
+        rating_type: 0,
+        next_offset: 0,
+        rows_count: 0,
+        completed: false,
+        discovered: false,
+      },
+      media: {
+        key: "media",
+        label: "Có hình ảnh / Video",
+        filter: null,
+        rating_type: 0,
+        next_offset: 0,
+        rows_count: 0,
+        completed: false,
+        discovered: false,
+      },
+    };
+  }
+
+  // 8. Unique reviews storage
+  const uniqueReviewsMap = new Map();
+  const SCOPE_KEYS = ["all", "comment", "media"];
+  let activeScopeKey = loadedCheckpoint?.active_scope || "all";
+  const startIdx = Math.max(0, SCOPE_KEYS.indexOf(activeScopeKey));
+
+  // 9. Vòng lặp duyệt từng scope độc lập
+  for (let sIdx = startIdx; sIdx < SCOPE_KEYS.length; sIdx++) {
+    const scopeKey = SCOPE_KEYS[sIdx];
+    const scope = scopes[scopeKey];
+
+    // Chạy probe nếu là scope comment/media và chưa được phát hiện
+    if ((scopeKey === "comment" || scopeKey === "media") && !scope.discovered && scope.filter == null && !scope.completed) {
+      const probe = await probeFilterCandidates(tab.id, itemid, shopid, tab.url || job.url, job, progress);
+      if (scopes.comment.filter == null && !scopes.comment.completed) {
+        scopes.comment.filter = probe.commentFilter;
+        scopes.comment.discovered = probe.commentFilter != null;
+        scopes.comment.probe_stats = probe.commentStat || null;
+        if (probe.commentFilter == null) {
+          scopes.comment.completed = true;
+          scopes.comment.unavailable_reason = "Không tìm thấy filter 'Có bình luận' từ probe";
+        }
+      }
+      if (scopes.media.filter == null && !scopes.media.completed) {
+        scopes.media.filter = probe.mediaFilter;
+        scopes.media.discovered = probe.mediaFilter != null;
+        scopes.media.probe_stats = probe.mediaStat || null;
+        if (probe.mediaFilter == null) {
+          scopes.media.completed = true;
+          scopes.media.unavailable_reason = "Không tìm thấy filter 'Có hình ảnh/video' từ probe";
+        }
       }
     }
-    const requestEnded = Date.now();
-    const requestEndIso = new Date(requestEnded).toISOString();
-    const elapsedMs = requestEnded - requestStarted;
-    const httpStatus = typeof fetchRes.status === "number" ? fetchRes.status : (fetchRes.ok ? 200 : 500);
 
-    await traceJob(job, progress, "ratings-response", {
-      itemid,
-      shopid,
-      offset,
-      ratingType,
-      limit: PAGE_SIZE,
-      tabId: tab.id,
-      tabUrl: tab.url || "",
-      requestStart: requestStartIso,
-      requestEnd: requestEndIso,
-      elapsedMs,
-      httpStatus,
-      responseUrl: fetchRes.url || null,
-      error: fetchRes.ok ? null : (fetchRes.error || "Shopee API request failed"),
-    });
-
-    if (!fetchRes.ok) {
-      const failureKind = classifyShopeeFailure(fetchRes);
-      let failureKind = classifyShopeeFailure(fetchRes);
-      if (failureKind === "api_blocked" && tab?.id) {
-        try {
-          const captchaCheck = await detectCaptchaInTab(tab.id);
-          if (captchaCheck?.detected) {
-            failureKind = "verification";
-          }
-        } catch {}
-      }
-      if (failureKind === "verification" || failureKind === "api_blocked") {
-        try {
-          await chrome.storage.local.set({
-            [`checkpoint_${job.id}`]: {
-              next_offset: offset,
-              rating_type: ratingType,
-              rows_count: durableRowsCount,
-              itemid,
-              shopid,
-              total,
-              updated_at: Date.now(),
-            },
-          });
-        } catch {}
-      }
-      const err = new Error(fetchRes.error ? `Shopee API request failed: ${fetchRes.error}` : formatShopeeFailure(fetchRes));
-      err.failureKind = failureKind;
-      err.fetchRes = fetchRes;
-      throw err;
+    if (scope.completed || !scope.discovered || scope.filter == null) {
+      continue;
     }
 
-    const json = fetchRes.json;
-    if (json && (json.error || json.is_login === false || (json.data && json.data.is_login === false))) {
-      const failureKind = classifyShopeeFailure(fetchRes);
-      let failureKind = classifyShopeeFailure(fetchRes);
-      if (failureKind === "api_blocked" && tab?.id) {
-        try {
-          const captchaCheck = await detectCaptchaInTab(tab.id);
-          if (captchaCheck?.detected) {
-            failureKind = "verification";
-          }
-        } catch {}
-      }
-      if (failureKind === "verification" || failureKind === "api_blocked") {
-        try {
-          await chrome.storage.local.set({
-            [`checkpoint_${job.id}`]: {
-              next_offset: offset,
-              rating_type: ratingType,
-              rows_count: durableRowsCount,
-              itemid,
-              shopid,
-              total,
-              updated_at: Date.now(),
-            },
-          });
-        } catch {}
-      }
-      const err = new Error(formatShopeeFailure(fetchRes));
-      err.failureKind = failureKind;
-      err.fetchRes = fetchRes;
-      throw err;
-    }
+    activeScopeKey = scopeKey;
+    let offset = scope.next_offset || 0;
+    let ratingType = scope.rating_type || 0;
+    let typeIndex = Math.max(0, RATING_TYPES.indexOf(ratingType));
 
-    const batch = (json && (json.data?.ratings || json.ratings || json.items)) || [];
-    if (!Array.isArray(batch) || batch.length === 0) {
-      // Shopee silently truncates the unfiltered type=0 feed at roughly 3,000
-      // reviews while still advertising the full rating_total. Continue through
-      // the five star buckets and let the checkpoint store deduplicate overlaps.
-      if (total && durableRowsCount < total && typeIndex + 1 < RATING_TYPES.length) {
-        typeIndex += 1;
-        ratingType = RATING_TYPES[typeIndex];
-        offset = 0;
-        const segmentCheckpoint = await sendCheckpoint({
-          job: job.id,
-          offset: 0,
-          next_offset: 0,
-          rating_type: ratingType,
-          itemid,
-          shopid,
-          rows: [],
-          total,
-        });
-        durableRowsCount = Number(segmentCheckpoint?.rows_count) || durableRowsCount;
-        await chrome.storage.local.set({
-          [`checkpoint_${job.id}`]: {
-            next_offset: 0,
-            rating_type: ratingType,
-            rows_count: durableRowsCount,
-            itemid,
-            shopid,
-            total,
-            updated_at: Date.now(),
-          },
-        });
-        await traceJob(job, progress, "ratings-segment", {
-          itemid,
-          shopid,
-          ratingType,
-          rowsCount: durableRowsCount,
-          totalTarget: total,
-        });
-        await progress({
-          status: "running",
-          stage: "fetch",
-          message: `Shopee giới hạn luồng tổng; đang cào tiếp nhóm ${ratingType} sao`,
-          rows: durableRowsCount,
-          percent: crawlPercent(durableRowsCount, total, 10, 80),
-        });
-        continue;
-      }
-      break;
-    }
-
-    const normalised = batch
-      .map(normaliseRating)
-      .filter((review) => {
-        const key = reviewFingerprint(review);
-        if (!key || seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
-    all.push(...normalised);
-    if (total === null) total = ratingTotal(json);
-    const completedRows = durableRowsCount + normalised.length;
-    const pct = crawlPercent(completedRows, total, 10, 80);
-    await traceJob(job, progress, "ratings-batch", {
-      itemid,
-      shopid,
-      offset,
-      ratingType,
-      limit: PAGE_SIZE,
-      tabId: tab.id,
-      tabUrl: tab.url || "",
-      batchSize: batch.length,
-      rowsCount: completedRows,
-      totalTarget: total,
-    });
-    await progress({
-      status: "running",
-      stage: "fetch",
-      message: `Đã cào ${completedRows}${total ? "/" + total : ""} đánh giá`,
-      rows: completedRows,
-      percent: pct,
-    });
-
-    const nextOffset = offset + batch.length;
-    const savedCheckpoint = await sendCheckpoint({
-      job: job.id,
-      offset: nextOffset,
-      next_offset: nextOffset,
-      rating_type: ratingType,
-      itemid,
-      shopid,
-      rows: normalised,
-      total,
-    });
-    durableRowsCount = Number(savedCheckpoint?.rows_count) || completedRows;
-    await chrome.storage.local.set({
-      [`checkpoint_${job.id}`]: {
-        next_offset: nextOffset,
-        rating_type: ratingType,
-        rows_count: durableRowsCount,
+    while (uniqueReviewsMap.size < MAX_REVIEWS) {
+      const requestStarted = Date.now();
+      const requestStartIso = new Date(requestStarted).toISOString();
+      await traceJob(job, progress, "ratings-request", {
         itemid,
         shopid,
-        total,
-        updated_at: Date.now(),
-      },
-    });
+        offset,
+        ratingType,
+        filter: scope.filter,
+        scope: scopeKey,
+        limit: PAGE_SIZE,
+        tabId: tab.id,
+        tabUrl: tab.url || "",
+        requestStart: requestStartIso,
+      });
 
-    if (batch.length < PAGE_SIZE) {
-      if (total && durableRowsCount < total && typeIndex + 1 < RATING_TYPES.length) {
-        typeIndex += 1;
-        ratingType = RATING_TYPES[typeIndex];
-        offset = 0;
-        const segmentCheckpoint = await sendCheckpoint({
-          job: job.id,
-          offset: 0,
-          next_offset: 0,
-          rating_type: ratingType,
-          itemid,
-          shopid,
-          rows: [],
-          total,
-        });
-        durableRowsCount = Number(segmentCheckpoint?.rows_count) || durableRowsCount;
-        await chrome.storage.local.set({
-          [`checkpoint_${job.id}`]: {
-            next_offset: 0,
-            rating_type: ratingType,
-            rows_count: durableRowsCount,
+      let fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, tab.url || job.url, ratingType, scope.filter);
+      if (!fetchRes.ok && (fetchRes.retryableTabError || fetchRes.isTimeout)) {
+        const recoveredTab = await findOrOpenShopeeTab(job.url, itemid);
+        if (recoveredTab?.id) {
+          tab = recoveredTab;
+          job._targetTabId = tab.id;
+          job._targetTabUrl = tab.url || job.url;
+          await traceJob(job, progress, "tab-recovered", {
             itemid,
             shopid,
-            total,
-            updated_at: Date.now(),
-          },
-        });
-        continue;
+            tabId: tab.id,
+            tabUrl: tab.url || job.url,
+            offset,
+            ratingType,
+            filter: scope.filter,
+            scope: scopeKey,
+            limit: PAGE_SIZE,
+            error: fetchRes.error,
+          });
+          fetchRes = await fetchRatingsFromTab(tab.id, itemid, shopid, offset, PAGE_SIZE, tab.url || job.url, ratingType, scope.filter);
+        }
       }
-      break;
+
+      const requestEnded = Date.now();
+      const requestEndIso = new Date(requestEnded).toISOString();
+      const elapsedMs = requestEnded - requestStarted;
+      const httpStatus = typeof fetchRes.status === "number" ? fetchRes.status : (fetchRes.ok ? 200 : 500);
+
+      await traceJob(job, progress, "ratings-response", {
+        itemid,
+        shopid,
+        offset,
+        ratingType,
+        filter: scope.filter,
+        scope: scopeKey,
+        limit: PAGE_SIZE,
+        tabId: tab.id,
+        tabUrl: tab.url || "",
+        requestStart: requestStartIso,
+        requestEnd: requestEndIso,
+        elapsedMs,
+        httpStatus,
+        responseUrl: fetchRes.url || null,
+        error: fetchRes.ok ? null : (fetchRes.error || "Shopee API request failed"),
+      });
+
+      if (!fetchRes.ok) {
+        let failureKind = classifyShopeeFailure(fetchRes);
+        if (failureKind === "api_blocked" && tab?.id) {
+          try {
+            const captchaCheck = await detectCaptchaInTab(tab.id);
+            if (captchaCheck?.detected) failureKind = "verification";
+          } catch {}
+        }
+        if (failureKind === "verification" || failureKind === "api_blocked") {
+          try {
+            await chrome.storage.local.set({
+              [`checkpoint_${job.id}`]: {
+                version: 2,
+                active_scope: scopeKey,
+                scopes,
+                next_offset: offset,
+                rating_type: ratingType,
+                rows_count: uniqueReviewsMap.size,
+                itemid,
+                shopid,
+                total,
+                ui_reference: uiReference,
+                updated_at: Date.now(),
+              },
+            });
+          } catch {}
+        }
+        const err = new Error(fetchRes.error ? `Shopee API request failed: ${fetchRes.error}` : formatShopeeFailure(fetchRes));
+        err.failureKind = failureKind;
+        err.fetchRes = fetchRes;
+        throw err;
+      }
+
+      const json = fetchRes.json;
+      if (json && (json.error || json.is_login === false || (json.data && json.data.is_login === false))) {
+        let failureKind = classifyShopeeFailure(fetchRes);
+        if (failureKind === "api_blocked" && tab?.id) {
+          try {
+            const captchaCheck = await detectCaptchaInTab(tab.id);
+            if (captchaCheck?.detected) failureKind = "verification";
+          } catch {}
+        }
+        if (failureKind === "verification" || failureKind === "api_blocked") {
+          try {
+            await chrome.storage.local.set({
+              [`checkpoint_${job.id}`]: {
+                version: 2,
+                active_scope: scopeKey,
+                scopes,
+                next_offset: offset,
+                rating_type: ratingType,
+                rows_count: uniqueReviewsMap.size,
+                itemid,
+                shopid,
+                total,
+                ui_reference: uiReference,
+                updated_at: Date.now(),
+              },
+            });
+          } catch {}
+        }
+        const err = new Error(formatShopeeFailure(fetchRes));
+        err.failureKind = failureKind;
+        err.fetchRes = fetchRes;
+        throw err;
+      }
+
+      const batch = (json && (json.data?.ratings || json.ratings || json.items)) || [];
+      if (!Array.isArray(batch) || batch.length === 0) {
+        if (scopeKey === "all" && total && uniqueReviewsMap.size < total && typeIndex + 1 < RATING_TYPES.length) {
+          typeIndex += 1;
+          ratingType = RATING_TYPES[typeIndex];
+          scope.rating_type = ratingType;
+          offset = 0;
+          scope.next_offset = 0;
+          await sendCheckpoint({
+            job: job.id,
+            version: 2,
+            active_scope: scopeKey,
+            scopes,
+            offset: 0,
+            next_offset: 0,
+            rating_type: ratingType,
+            itemid,
+            shopid,
+            rows: [],
+            total,
+            ui_reference: uiReference,
+          });
+          await chrome.storage.local.set({
+            [`checkpoint_${job.id}`]: {
+              version: 2,
+              active_scope: scopeKey,
+              scopes,
+              next_offset: 0,
+              rating_type: ratingType,
+              rows_count: uniqueReviewsMap.size,
+              itemid,
+              shopid,
+              total,
+              ui_reference: uiReference,
+              updated_at: Date.now(),
+            },
+          });
+          await traceJob(job, progress, "ratings-segment", {
+            itemid,
+            shopid,
+            scope: scopeKey,
+            ratingType,
+            rowsCount: uniqueReviewsMap.size,
+            totalTarget: total,
+          });
+          await progress({
+            status: "running",
+            stage: "fetch",
+            active_scope: scopeKey,
+            scope_label: scope.label,
+            scopes,
+            message: `Shopee giới hạn luồng tổng; đang cào tiếp nhóm ${ratingType} sao`,
+            rows: uniqueReviewsMap.size,
+            percent: crawlPercent(uniqueReviewsMap.size, total, 10, 80),
+          });
+          continue;
+        }
+        scope.completed = true;
+        break;
+      }
+
+      const newBatchRows = [];
+      for (const raw of batch) {
+        const review = normaliseRating(raw);
+        const key = reviewFingerprint(review);
+        if (!key) continue;
+        if (uniqueReviewsMap.has(key)) {
+          mergeReview(uniqueReviewsMap.get(key), review);
+        } else {
+          uniqueReviewsMap.set(key, review);
+          newBatchRows.push(review);
+        }
+      }
+
+      scope.rows_count = (scope.rows_count || 0) + batch.length;
+      const nextOffset = offset + batch.length;
+      scope.next_offset = nextOffset;
+
+      if (total === null) total = ratingTotal(json);
+      const completedRows = uniqueReviewsMap.size;
+      const pct = crawlPercent(completedRows, total, 10, 80);
+
+      await traceJob(job, progress, "ratings-batch", {
+        itemid,
+        shopid,
+        scope: scopeKey,
+        offset,
+        ratingType,
+        filter: scope.filter,
+        limit: PAGE_SIZE,
+        tabId: tab.id,
+        tabUrl: tab.url || "",
+        batchSize: batch.length,
+        scopeRows: scope.rows_count,
+        uniqueRowsCount: completedRows,
+        totalTarget: total,
+      });
+
+      await progress({
+        status: "running",
+        stage: "fetch",
+        active_scope: scopeKey,
+        scope_label: scope.label,
+        scopes,
+        rows: completedRows,
+        total,
+        ui_reference: uiReference,
+        message: `Đang cào [${scope.label}]: offset ${nextOffset}, unique ${completedRows}${total ? "/" + total : ""}`,
+        percent: pct,
+      });
+
+      await sendCheckpoint({
+        job: job.id,
+        version: 2,
+        active_scope: scopeKey,
+        scopes,
+        offset: nextOffset,
+        next_offset: nextOffset,
+        rating_type: ratingType,
+        itemid,
+        shopid,
+        rows: newBatchRows,
+        total,
+        ui_reference: uiReference,
+      });
+
+      await chrome.storage.local.set({
+        [`checkpoint_${job.id}`]: {
+          version: 2,
+          active_scope: scopeKey,
+          scopes,
+          next_offset: nextOffset,
+          rating_type: ratingType,
+          rows_count: completedRows,
+          itemid,
+          shopid,
+          total,
+          ui_reference: uiReference,
+          updated_at: Date.now(),
+        },
+      });
+
+      if (batch.length < PAGE_SIZE) {
+        if (scopeKey === "all" && total && uniqueReviewsMap.size < total && typeIndex + 1 < RATING_TYPES.length) {
+          typeIndex += 1;
+          ratingType = RATING_TYPES[typeIndex];
+          scope.rating_type = ratingType;
+          offset = 0;
+          scope.next_offset = 0;
+          continue;
+        }
+        scope.completed = true;
+        break;
+      }
+
+      offset = nextOffset;
+      await new Promise((s) => setTimeout(s, PACE_MS));
     }
-    offset = nextOffset;
-    await new Promise((s) => setTimeout(s, PACE_MS));
+
+    scope.completed = true;
   }
+
+  const allReviews = Array.from(uniqueReviewsMap.values());
   job._crawlSummary = {
+    version: 2,
     expected: total,
-    collected: durableRowsCount,
-    complete: !total || durableRowsCount >= total,
-    finalRatingType: ratingType,
+    collected: allReviews.length,
+    ui_reference: uiReference,
+    scopes: {
+      all: { ...scopes.all },
+      comment: { ...scopes.comment },
+      media: { ...scopes.media },
+    },
+    complete: !total || allReviews.length >= total,
   };
   try { await chrome.storage.local.remove([`checkpoint_${job.id}`]); } catch {}
-  return all;
+  return allReviews;
 }
 
 async function runJob(job) {
@@ -1659,8 +2013,6 @@ async function triggerVerificationRequired(details) {
 
 function resumeVerification(jobId) {
   stopVerificationWatcher();
-  if (verificationInfo && (verificationInfo.kind === "login" || verificationInfo.kind === "api_blocked")) {
-    console.warn("[bridge] Không thể resume verification cho job không phải thử thách CAPTCHA:", jobId);
   if (verificationInfo && verificationInfo.kind === "login") {
     console.warn("[bridge] Không thể resume verification cho job yêu cầu đăng nhập:", jobId);
     return;
@@ -2792,5 +3144,9 @@ if (typeof module !== "undefined" && module.exports) {
     detectCaptchaInTab,
     startVerificationWatcher,
     stopVerificationWatcher,
+    probeFilterCandidates,
+    normalizeCheckpointV2,
+    extractRatingSummary,
+    mergeReview,
   };
 }

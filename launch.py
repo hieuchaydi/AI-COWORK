@@ -298,29 +298,56 @@ def _save_ingest_checkpoint(job_id: str, params: dict) -> dict:
     with _INGEST_CHECKPOINTS_LOCK:
         chk = _INGEST_CHECKPOINTS.setdefault(job_id, {
             "job_id": job_id,
+            "version": 2,
+            "active_scope": "all",
+            "scopes": {},
             "rows": [],
             "seen_keys": set(),
+            "seen_map": {},
             "next_offset": 0,
             "rating_type": 0,
             "itemid": None,
             "shopid": None,
             "total": None,
+            "ui_reference": None,
         })
         new_rows = params.get("rows") or []
         if isinstance(new_rows, list):
             for r in new_rows:
                 if not isinstance(r, dict):
                     continue
-                key = (
-                    str(r.get("user") or "").strip(),
-                    str(r.get("thoi_gian") or r.get("time") or "").strip(),
-                    str(r.get("noi_dung") or r.get("comment") or "").strip(),
-                )
-                if key != ("", "", ""):
-                    if key in chk["seen_keys"]:
+                review_id = str(r.get("cmid") or r.get("id") or "").strip()
+                if review_id:
+                    key = ("id", review_id)
+                else:
+                    key = (
+                        "fp",
+                        str(r.get("user") or "").strip(),
+                        str(r.get("thoi_gian") or r.get("time") or "").strip(),
+                        str(r.get("noi_dung") or r.get("comment") or "").strip(),
+                        str(r.get("phan_loai") or "").strip(),
+                        str(r.get("sao") or "").strip(),
+                    )
+                if key != ("fp", "", "", "", "", ""):
+                    seen_map = chk.setdefault("seen_map", {})
+                    if key in seen_map:
+                        idx = seen_map[key]
+                        existing = chk["rows"][idx]
+                        for field in ("anh_urls", "video_urls", "media_urls"):
+                            if r.get(field) and not existing.get(field):
+                                existing[field] = r[field]
+                            elif r.get(field) and existing.get(field) and len(str(r[field])) > len(str(existing[field])):
+                                existing[field] = r[field]
+                        for field in ("noi_dung", "comment"):
+                            if r.get(field) and (not existing.get(field) or len(str(r[field])) > len(str(existing.get(field) or ""))):
+                                existing[field] = r[field]
+                        for field in ("phan_loai", "cmid", "orderid"):
+                            if r.get(field) and not existing.get(field):
+                                existing[field] = r[field]
                         continue
+                    seen_map[key] = len(chk["rows"])
                     chk["seen_keys"].add(key)
-                chk["rows"].append(r)
+                chk["rows"].append(dict(r))
 
         offset = params.get("next_offset")
         if offset is None:
@@ -335,6 +362,14 @@ def _save_ingest_checkpoint(job_id: str, params: dict) -> dict:
             chk["shopid"] = str(params["shopid"])
         if params.get("total") is not None:
             chk["total"] = _safe_int(params["total"])
+        if params.get("version") is not None:
+            chk["version"] = _safe_int(params["version"])
+        if params.get("active_scope") is not None:
+            chk["active_scope"] = str(params["active_scope"])
+        if params.get("scopes") is not None and isinstance(params["scopes"], dict):
+            chk["scopes"] = params["scopes"]
+        if params.get("ui_reference") is not None and isinstance(params["ui_reference"], dict):
+            chk["ui_reference"] = params["ui_reference"]
         chk["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
         current_rows_count = len(chk["rows"])
@@ -343,32 +378,49 @@ def _save_ingest_checkpoint(job_id: str, params: dict) -> dict:
         total = chk.get("total")
         itemid = chk.get("itemid")
         shopid = chk.get("shopid")
+        version = chk.get("version", 2)
+        active_scope = chk.get("active_scope", "all")
+        scopes = chk.get("scopes", {})
+        ui_reference = chk.get("ui_reference")
+
+    chk_snapshot = {
+        "version": version,
+        "active_scope": active_scope,
+        "scopes": scopes,
+        "next_offset": next_offset,
+        "rating_type": rating_type,
+        "rows_count": current_rows_count,
+        "itemid": itemid,
+        "shopid": shopid,
+        "total": total,
+        "ui_reference": ui_reference,
+    }
 
     _update_ingest_progress(
         job_id,
         {
             "status": "running",
             "stage": "fetch",
-            "message": f"Đã lấy {current_rows_count}" + (f"/{total}" if total else "") + " đánh giá (checkpoint)",
+            "active_scope": active_scope,
+            "scopes": scopes,
+            "ui_reference": ui_reference,
+            "message": f"Đã lấy {current_rows_count}" + (f"/{total}" if total else "") + f" đánh giá (checkpoint [{active_scope}])",
             "rows": current_rows_count,
             "offset": next_offset,
-            "checkpoint": {
-                "next_offset": next_offset,
-                "rating_type": rating_type,
-                "rows_count": current_rows_count,
-                "itemid": itemid,
-                "shopid": shopid,
-                "total": total,
-            },
+            "checkpoint": chk_snapshot,
         },
     )
     _persist_ingest_state()
     return {
         "ok": True,
         "job": job_id,
+        "version": version,
+        "active_scope": active_scope,
+        "scopes": scopes,
         "next_offset": next_offset,
         "rating_type": rating_type,
         "rows_count": current_rows_count,
+        "ui_reference": ui_reference,
     }
 
 
@@ -671,12 +723,16 @@ def _queue_ingest_job(url: str, kind: str) -> dict:
                 chk = _INGEST_CHECKPOINTS.get(job["id"])
                 if chk:
                     job_msg["checkpoint"] = {
+                        "version": chk.get("version", 2),
+                        "active_scope": chk.get("active_scope", "all"),
+                        "scopes": chk.get("scopes", {}),
                         "next_offset": chk.get("next_offset", 0),
                         "offset": chk.get("next_offset", 0),
                         "rating_type": chk.get("rating_type", 0),
                         "itemid": chk.get("itemid"),
                         "shopid": chk.get("shopid"),
                         "total": chk.get("total"),
+                        "ui_reference": chk.get("ui_reference"),
                         "rows_count": len(chk.get("rows", [])),
                     }
             _BROWSER_WS.send({"type": "ingest.job", "job": job_msg})
@@ -759,12 +815,16 @@ def _on_browser_ws_connect() -> None:
             chk = _INGEST_CHECKPOINTS.get(job.get("id"))
             if chk:
                 job_msg["checkpoint"] = {
+                    "version": chk.get("version", 2),
+                    "active_scope": chk.get("active_scope", "all"),
+                    "scopes": chk.get("scopes", {}),
                     "next_offset": chk.get("next_offset", 0),
                     "offset": chk.get("next_offset", 0),
                     "rating_type": chk.get("rating_type", 0),
                     "itemid": chk.get("itemid"),
                     "shopid": chk.get("shopid"),
                     "total": chk.get("total"),
+                    "ui_reference": chk.get("ui_reference"),
                     "rows_count": len(chk.get("rows", [])),
                 }
         payload = job_msg if "checkpoint" in job_msg else job
@@ -1038,20 +1098,40 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
             chk = _INGEST_CHECKPOINTS.get(job_id)
             if chk and chk.get("rows"):
                 combined_rows = []
-                seen = set()
+                seen = {}
                 for r in chk["rows"] + rows:
                     if not isinstance(r, dict):
                         continue
-                    key = (
-                        str(r.get("user") or "").strip(),
-                        str(r.get("thoi_gian") or r.get("time") or "").strip(),
-                        str(r.get("noi_dung") or r.get("comment") or "").strip(),
-                    )
-                    if key != ("", "", ""):
+                    review_id = str(r.get("cmid") or r.get("id") or "").strip()
+                    if review_id:
+                        key = ("id", review_id)
+                    else:
+                        key = (
+                            "fp",
+                            str(r.get("user") or "").strip(),
+                            str(r.get("thoi_gian") or r.get("time") or "").strip(),
+                            str(r.get("noi_dung") or r.get("comment") or "").strip(),
+                            str(r.get("phan_loai") or "").strip(),
+                            str(r.get("sao") or "").strip(),
+                        )
+                    if key != ("fp", "", "", "", "", ""):
                         if key in seen:
+                            idx = seen[key]
+                            existing = combined_rows[idx]
+                            for field in ("anh_urls", "video_urls", "media_urls"):
+                                if r.get(field) and not existing.get(field):
+                                    existing[field] = r[field]
+                                elif r.get(field) and existing.get(field) and len(str(r[field])) > len(str(existing[field])):
+                                    existing[field] = r[field]
+                            for field in ("noi_dung", "comment"):
+                                if r.get(field) and (not existing.get(field) or len(str(r[field])) > len(str(existing.get(field) or ""))):
+                                    existing[field] = r[field]
+                            for field in ("phan_loai", "cmid", "orderid"):
+                                if r.get(field) and not existing.get(field):
+                                    existing[field] = r[field]
                             continue
-                        seen.add(key)
-                    combined_rows.append(r)
+                        seen[key] = len(combined_rows)
+                    combined_rows.append(dict(r))
                 rows = combined_rows
 
     if len(rows) == 0:

@@ -267,10 +267,38 @@ function renderStatus(state, details) {
     jobProgressLabel.textContent = label;
     jobProgressPercent.textContent = `${percent}%`;
     jobProgressBar.style.width = `${percent}%`;
-    jobProgressBar.parentElement.setAttribute("aria-valuenow", String(percent));
-    jobProgressMeta.textContent = Number.isFinite(rows) && rows > 0
-      ? `Đã lấy ${rows.toLocaleString("vi-VN")}${Number.isFinite(total) && total > 0 ? `/${total.toLocaleString("vi-VN")} đánh giá` : " đánh giá"}`
+    let metaText = Number.isFinite(rows) && rows > 0
+      ? `Đã lấy ${rows.toLocaleString("vi-VN")}${Number.isFinite(total) && total > 0 ? `/${total.toLocaleString("vi-VN")} đánh giá unique` : " đánh giá unique"}`
       : "Đang kết nối và chuẩn bị dữ liệu";
+
+    const scopes = progress.scopes;
+    if (scopes && typeof scopes === "object") {
+      const scopeSummary = [];
+      if (scopes.all && (scopes.all.rows_count > 0 || progress.active_scope === "all")) {
+        scopeSummary.push(`Tất cả: ${Number(scopes.all.rows_count || 0).toLocaleString("vi-VN")}`);
+      }
+      if (scopes.comment && (scopes.comment.rows_count > 0 || progress.active_scope === "comment")) {
+        scopeSummary.push(`Bình luận: ${Number(scopes.comment.rows_count || 0).toLocaleString("vi-VN")}`);
+      }
+      if (scopes.media && (scopes.media.rows_count > 0 || progress.active_scope === "media")) {
+        scopeSummary.push(`Ảnh/Video: ${Number(scopes.media.rows_count || 0).toLocaleString("vi-VN")}`);
+      }
+      if (scopeSummary.length > 0) {
+        metaText += ` [${scopeSummary.join(" | ")}]`;
+      }
+    }
+
+    const uiRef = progress.ui_reference;
+    if (uiRef && typeof uiRef === "object") {
+      const refParts = [];
+      if (uiRef.rating_total) refParts.push(`Tổng: ${uiRef.rating_total.toLocaleString("vi-VN")}`);
+      if (uiRef.rcount_with_context) refParts.push(`Bình luận: ${uiRef.rcount_with_context.toLocaleString("vi-VN")}`);
+      if (uiRef.rcount_with_media) refParts.push(`Ảnh/Video: ${uiRef.rcount_with_media.toLocaleString("vi-VN")}`);
+      if (refParts.length > 0) {
+        metaText += ` • Tham chiếu Shopee UI: ${refParts.join(", ")}`;
+      }
+    }
+    jobProgressMeta.textContent = metaText;
   } else {
     currentJobId = null;
     jobStatusText.textContent = "No job currently running";
