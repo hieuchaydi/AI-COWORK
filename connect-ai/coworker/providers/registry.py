@@ -29,6 +29,8 @@ from .openai_provider import OpenAIProvider
 from .vertex_provider import VertexProvider
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
+CLOUDFLARE_API_ROOT = "https://api.cloudflare.com/client/v4/accounts"
+CLOUDFLARE_MAX_TOKENS = 8192
 
 
 @dataclass(frozen=True)
@@ -210,6 +212,44 @@ def _openai_compat(
         )
 
     return build
+
+
+def _cloudflare_base_url(account_id: str, override: Optional[str] = None) -> str:
+    """Return Cloudflare's account-scoped OpenAI-compatible Workers AI endpoint."""
+    custom = (override or "").strip().rstrip("/")
+    if custom:
+        return custom
+    account = (account_id or "").strip()
+    if not account:
+        raise RuntimeError(
+            "No Cloudflare Account ID configured — add it in Settings ▸ Models."
+        )
+    return f"{CLOUDFLARE_API_ROOT}/{account}/ai/v1"
+
+
+def _build_cloudflare(profile: dict[str, Any], secrets: Any) -> ProviderClient:
+    """Build Workers AI without ever falling back to the OpenAI credential/endpoint."""
+    p = profile or {}
+    # ``api_token`` was briefly written by the launcher before Cloudflare became a
+    # first-class descriptor. Keep it as a read-only migration alias.
+    api_key = (
+        (p.get("api_key") or p.get("api_token") or "").strip()
+        or os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
+    )
+    if not api_key:
+        raise RuntimeError(
+            "No Cloudflare API token configured — add it in Settings ▸ Models."
+        )
+    account_id = (
+        (p.get("account_id") or "").strip()
+        or os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    )
+    return OpenAIProvider(
+        api_key=api_key,
+        base_url=_cloudflare_base_url(account_id, p.get("base_url")),
+        default_max_tokens=CLOUDFLARE_MAX_TOKENS,
+        provider_name="cloudflare",
+    )
 
 
 
@@ -551,6 +591,35 @@ DESCRIPTORS: list[ProviderDescriptor] = [
         env_key="NVIDIA_API_KEY",
         endpoint_help="NVIDIA API Catalog OpenAI-compatible endpoint. Requires an NVIDIA Developer API key.",
     ),
+    ProviderDescriptor(
+        name="cloudflare",
+        title="Cloudflare Workers AI",
+        needs_key=True,
+        fields=[
+            ProviderField(
+                "api_key",
+                "Cloudflare API token",
+                secret=True,
+                help="Use an Account API token with Workers AI Read or Workers AI Write permission.",
+            ),
+            ProviderField(
+                "account_id",
+                "Cloudflare Account ID",
+                help="The account whose Workers AI allocation and models will be used.",
+            ),
+            ProviderField(
+                "base_url",
+                "Endpoint override (optional)",
+                required=False,
+                placeholder="https://gateway.ai.cloudflare.com/v1/…/compat",
+                help="Leave blank for the account-scoped Workers AI endpoint; set only for an AI Gateway compatibility endpoint.",
+            ),
+        ],
+        build=_build_cloudflare,
+        recommended_model="@cf/openai/gpt-oss-120b",
+        env_key="CLOUDFLARE_API_TOKEN",
+        blurb="Uses Cloudflare's account-scoped OpenAI-compatible Workers AI API.",
+    ),
     # Cohere — native v2 Chat API, including multi-step tool use.
     ProviderDescriptor(
         name="cohere",
@@ -878,6 +947,45 @@ def verify_provider_key(
         return _verify_bedrock(fields or {}, timeout)
     if name == "vertex":
         return _verify_vertex(fields or {}, timeout)
+    if name == "cloudflare":
+        cf_fields = fields or {}
+        account_id = (
+            (cf_fields.get("account_id") or "").strip()
+            or os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+        )
+        if not key:
+            key = (
+                (cf_fields.get("api_key") or cf_fields.get("api_token") or "").strip()
+                or os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
+            )
+        if not account_id:
+            return {"ok": False, "error": "Enter a Cloudflare Account ID to test."}
+        if not key:
+            return {"ok": False, "error": "Enter a Cloudflare API token to test."}
+        try:
+            resp = httpx.get(
+                f"{CLOUDFLARE_API_ROOT}/{account_id}/ai/models/search",
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=timeout,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"Couldn't reach Cloudflare Workers AI ({exc.__class__.__name__}).",
+            }
+        if resp.status_code < 300:
+            return {"ok": True}
+        if resp.status_code in (401, 403):
+            return {
+                "ok": False,
+                "error": "Cloudflare rejected the token. Use an Account API token with Workers AI Read or Workers AI Write permission.",
+            }
+        if resp.status_code == 404:
+            return {"ok": False, "error": "Cloudflare Account ID not found."}
+        return {
+            "ok": False,
+            "error": f"Cloudflare Workers AI returned HTTP {resp.status_code}.",
+        }
     try:
         if name == "anthropic":
             resp = httpx.get(

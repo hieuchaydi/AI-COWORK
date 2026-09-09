@@ -393,6 +393,47 @@ def test_output_budget_only_fills_a_gap_and_only_when_opted_in():
     assert "max_tokens" not in explicit.chat.completions.calls[1]
 
 
+def test_cloudflare_builder_composes_account_scoped_endpoint(monkeypatch):
+    from coworker.providers.registry import build_provider_client
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    provider = build_provider_client(
+        "cloudflare",
+        {"api_key": "cf-token", "account_id": "account-123"},
+        None,
+    )
+
+    assert provider._api_key == "cf-token"
+    assert provider._base_url == (
+        "https://api.cloudflare.com/client/v4/accounts/account-123/ai/v1"
+    )
+    assert provider._provider_name == "cloudflare"
+    assert provider._default_max_tokens == 8192
+
+
+def test_cloudflare_builder_never_falls_back_to_openai(monkeypatch):
+    import pytest
+
+    from coworker.providers.registry import build_provider_client
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-real")
+    monkeypatch.delenv("CLOUDFLARE_API_TOKEN", raising=False)
+    monkeypatch.delenv("CLOUDFLARE_ACCOUNT_ID", raising=False)
+
+    with pytest.raises(RuntimeError, match="Cloudflare API token"):
+        build_provider_client("cloudflare", {"account_id": "account-123"}, None)
+
+
+def test_cloudflare_models_are_registered_with_agent_capabilities():
+    from coworker.providers.capabilities import capabilities_for
+    from coworker.providers.matrix import models_for_provider
+
+    models = models_for_provider("cloudflare")
+    assert "@cf/openai/gpt-oss-120b" in models
+    assert "@cf/meta/llama-3.3-70b-instruct-fp8-fast" in models
+    assert capabilities_for("cloudflare:@cf/openai/gpt-oss-120b").tools
+
+
 # -- curated model matrix (labels + capabilities by full routed id) -----------------
 
 

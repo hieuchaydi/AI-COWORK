@@ -101,6 +101,29 @@ def test_verify_ollama_uses_v1_models_no_key(monkeypatch):
     assert "headers" not in cap  # keyless
 
 
+def test_verify_cloudflare_checks_the_workers_ai_catalog(monkeypatch):
+    cap: dict = {}
+    _patch_get(monkeypatch, status=200, capture=cap)
+
+    assert verify_provider_key(
+        "cloudflare",
+        api_key="cf-token",
+        fields={"account_id": "account-123"},
+    ) == {"ok": True}
+    assert cap["url"] == (
+        "https://api.cloudflare.com/client/v4/accounts/account-123/ai/models/search"
+    )
+    assert cap["headers"]["Authorization"] == "Bearer cf-token"
+
+
+def test_verify_cloudflare_requires_account_id(monkeypatch):
+    monkeypatch.delenv("CLOUDFLARE_ACCOUNT_ID", raising=False)
+    assert verify_provider_key("cloudflare", api_key="cf-token") == {
+        "ok": False,
+        "error": "Enter a Cloudflare Account ID to test.",
+    }
+
+
 def test_verify_network_error_is_clean(monkeypatch):
     _patch_get(monkeypatch, raise_exc=ConnectionError("boom"))
     res = verify_provider_key("openai", api_key="sk-x")

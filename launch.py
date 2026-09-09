@@ -3843,7 +3843,7 @@ def _seed_runtime_state() -> None:
         _ow_post(
             "/v1/providers",
             {"name": "cloudflare", "fields": {
-                "api_token": CLOUDFLARE_TOKEN,
+                "api_key": CLOUDFLARE_TOKEN,
                 "account_id": CLOUDFLARE_ACCOUNT_ID,
             }},
         )
