@@ -1363,6 +1363,8 @@ def test_ingest_verification_resolved_idempotent_by_cycle(server):
     assert prog1["stage"] == "resumed"
     assert prog1["status"] == "queued"
     assert prog1["checkpoint"]["next_offset"] == 50
+    with launch._INGEST_JOBS_LOCK:
+        assert job_id in [j.get("id") for j in launch._INGEST_JOBS]
 
     # Repeat verification.resolved cycle 1 -> should be ignored (idempotent)
     # If it were reprocessed, it would overwrite status or print duplicate

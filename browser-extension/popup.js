@@ -150,6 +150,9 @@ function renderStatus(state, details) {
     statusBadge.textContent = "Connected";
   } else if (state === "busy") {
     statusBadge.textContent = "Busy";
+  } else if (state === "resuming") {
+    statusBadge.textContent = "Resuming";
+    statusBadge.className = "badge warning";
   } else if (state === "awaiting_user_verification") {
     statusBadge.textContent = "Verification";
     statusBadge.className = "badge verification";

@@ -927,6 +927,17 @@ def _on_browser_ws_message(message: dict) -> None:
                     "checkpoint": chk_snapshot,
                 },
             )
+            job = _INGEST_ALL_JOBS.get(job_id)
+            if job:
+                if chk_snapshot:
+                    job["checkpoint"] = chk_snapshot
+                job["retry"] = True
+                with _INGEST_JOBS_LOCK:
+                    if job_id not in [j.get("id") for j in _INGEST_JOBS]:
+                        _INGEST_JOBS.append(job)
+                        _INGEST_JOB_EVENT.set()
+                if _BROWSER_WS.connected:
+                    _BROWSER_WS.send({"type": "ingest.job", "job": job, "retry": True})
             _persist_ingest_state()
     elif kind in ("api_blocked", "api.blocked"):
         params = message.get("params") or {}

@@ -1451,7 +1451,99 @@ test('verification watcher transitions to api_blocked when challenge absent but 
   vm.runInContext('stopVerificationWatcher()', context);
 });
 
+test('resumeVerification recovers job from chrome.storage.local when in-memory pendingVerificationJobs is empty', async () => {
+  const { context, frames, sockets } = await worker();
+  sockets[0].onopen();
 
+  let enqueuedJob = null;
+  vm.runInContext(`
+    enqueueLegacyJob = (j) => { enqueuedJob = j; };
+  `, context);
 
+  // Simulate MV3 Service Worker wake-up: pendingVerificationJobs is empty!
+  const targetJobId = "job-sw-restart-auto";
+  const storedJob = { id: targetJobId, url: "https://shopee.vn/product/123/456", checkpoint: { version: 2, next_offset: 20 } };
 
+  await context.chrome.storage.local.set({
+    [`pending_job_${targetJobId}`]: storedJob,
+  });
 
+  await vm.runInContext(`
+    resumeVerification("${targetJobId}", { verification_cycle: 2, checkpoint: { next_offset: 20 } });
+  `, context);
+
+  const enqueued = vm.runInContext('enqueuedJob', context);
+  assert.ok(enqueued, 'Job must be recovered from storage and enqueued');
+  assert.equal(enqueued.id, targetJobId);
+  assert.equal(enqueued.retry, true);
+
+  // Frame verification.resolved sent
+  const resolvedFrame = frames.find((f) => f.type === 'verification.resolved' && f.params?.job_id === targetJobId);
+  assert.ok(resolvedFrame, 'verification.resolved frame must be sent');
+  assert.equal(resolvedFrame.params.verification_cycle, 2);
+});
+
+test('startApiBlockedWatcher auto-resumes job on tab reload when preflight ratings returns 200', async () => {
+  const { context, frames, sockets } = await worker();
+  sockets[0].onopen();
+
+  let tabListener = null;
+  context.chrome.tabs = {
+    onUpdated: {
+      addListener: (fn) => { tabListener = fn; },
+      removeListener: () => { tabListener = null; },
+    },
+    get: async () => ({ id: 99 }),
+    update: async () => ({ id: 99 }),
+  };
+
+  let preflightCount = 0;
+  let enqueuedJob = null;
+  vm.runInContext(`
+    var preflightCount = 0;
+    var enqueuedJob = null;
+    preflightRatingsInTab = async () => {
+      preflightCount++;
+      return {
+        ok: true,
+        status: 200,
+        json: { data: { ratings: [{ itemid: 456, cmid: 111 }] } },
+      };
+    };
+    enqueueLegacyJob = (j) => { enqueuedJob = j; };
+    pendingVerificationJobs.set("job-api-blocked-reload", {
+      id: "job-api-blocked-reload",
+      url: "https://shopee.vn/product/123/456",
+    });
+    verificationInfo = { job_id: "job-api-blocked-reload", kind: "api_blocked" };
+  `, context);
+
+  const details = {
+    job_id: "job-api-blocked-reload",
+    tab_id: 99,
+    url: "https://shopee.vn/product/123/456",
+    checkpoint: { version: 2, next_offset: 10 },
+  };
+
+  vm.runInContext(`
+    startApiBlockedWatcher(${JSON.stringify(details)});
+  `, context);
+
+  const listener = tabListener || vm.runInContext('activeApiBlockedTabListener', context);
+  assert.ok(listener, 'activeApiBlockedTabListener must be set');
+
+  // Simulate user reloading the Shopee tab
+  await listener(99, { status: 'complete' }, { url: "https://shopee.vn/product/123/456" });
+
+  assert.equal(vm.runInContext('preflightCount', context), 1);
+  const enqueued = vm.runInContext('enqueuedJob', context);
+  assert.ok(enqueued, 'Job must be auto-resumed and enqueued');
+  assert.equal(enqueued.id, "job-api-blocked-reload");
+
+  // verification.resolved frame sent with recheck: true
+  const resolvedFrame = frames.find((f) => f.type === 'verification.resolved' && f.params?.job_id === "job-api-blocked-reload");
+  assert.ok(resolvedFrame, 'verification.resolved frame must be sent on auto-resume');
+  assert.equal(resolvedFrame.params.recheck, true);
+
+  vm.runInContext('stopApiBlockedWatcher()', context);
+});

@@ -1605,14 +1605,28 @@ async function runJob(job) {
       // 2. traffic_verification / CAPTCHA: Hỗ trợ pause/resume verification
       lastVerificationJob = job;
       pendingVerificationJobs.set(job.id, job);
+      let checkpoint = null;
+      try {
+        const stored = await chrome.storage.local.get([`checkpoint_${job.id}`]);
+        checkpoint = stored[`checkpoint_${job.id}`] || null;
+      } catch {}
+      try {
+        await chrome.storage.local.set({ [`pending_job_${job.id}`]: job });
+      } catch {}
+      const parsed = idsFrom(job.url || "");
+      const itemid = job.itemid || parsed.itemid || checkpoint?.itemid;
+      const shopid = job._targetShopId || job.shopid || parsed.shopid || checkpoint?.shopid;
       const evidence = await captureTabEvidence(job._targetTabId || null);
       await triggerVerificationRequired({
         job_id: job.id,
         url: job.url,
+        itemid,
+        shopid,
         tab_id: job._targetTabId || null,
         reason: message,
         kind: "verification",
         evidence_screenshot: evidence,
+        checkpoint,
       });
       await progress({
         status: "awaiting_user_verification",
@@ -1650,6 +1664,9 @@ async function runJob(job) {
       // Lưu job vào pending verification để sẵn sàng resume
       lastVerificationJob = job;
       pendingVerificationJobs.set(job.id, job);
+      try {
+        await chrome.storage.local.set({ [`pending_job_${job.id}`]: job });
+      } catch {}
 
       if (captchaCheck?.detected) {
         // --- 1. VERIFICATION_REQUIRED: Tab hiển thị CAPTCHA challenge rõ ràng ---
@@ -1723,7 +1740,7 @@ async function runJob(job) {
           });
         }
 
-        // Cập nhật state nội bộ và dừng job, tuyệt đối KHÔNG bật watcher polling theo timer
+        // Cập nhật state nội bộ và dừng job, bật Smart Auto-Resume Watcher (lắng nghe reload/active tab và backoff an toàn)
         updateState("api_blocked", {
           job_id: job.id,
           url: job.url,
@@ -1733,6 +1750,17 @@ async function runJob(job) {
           checkpoint,
           evidence_screenshot: evidence,
         });
+
+        if (targetTabId) {
+          startApiBlockedWatcher({
+            job_id: job.id,
+            url: job.url,
+            tab_id: targetTabId,
+            itemid: job.itemid,
+            shopid: job._targetShopId || job.shopid,
+            checkpoint,
+          });
+        }
 
         await progress({
           status: "error",
@@ -1798,6 +1826,102 @@ const verificationCycles = new Map();
 const resumeInFlightMap = new Map();
 let verificationWatcherInterval = null;
 let activeTabUpdateListener = null;
+let apiBlockedWatcherInterval = null;
+let activeApiBlockedTabListener = null;
+let lastApiBlockedCheckTime = 0;
+
+function stopApiBlockedWatcher() {
+  if (apiBlockedWatcherInterval) {
+    clearTimeout(apiBlockedWatcherInterval);
+    apiBlockedWatcherInterval = null;
+  }
+  if (activeApiBlockedTabListener && chrome.tabs?.onUpdated) {
+    try {
+      chrome.tabs.onUpdated.removeListener(activeApiBlockedTabListener);
+    } catch {}
+    activeApiBlockedTabListener = null;
+  }
+}
+
+function startApiBlockedWatcher(details) {
+  stopApiBlockedWatcher();
+  const jid = details?.job_id;
+  const targetTabId = details?.tab_id;
+  if (!jid || !targetTabId || !chrome.tabs) return;
+
+  const parsed = idsFrom(details?.url || "");
+  const itemid = details?.itemid || details?.checkpoint?.itemid || parsed.itemid;
+  const shopid = details?.shopid || details?.checkpoint?.shopid || parsed.shopid;
+  const referer = details?.url || "";
+
+  const checkAndAutoResume = async (source) => {
+    if (!verificationInfo || verificationInfo.job_id !== jid || verificationInfo.kind !== "api_blocked") {
+      stopApiBlockedWatcher();
+      return;
+    }
+    const now = Date.now();
+    // Throttle: don't preflight more often than once every 8 seconds
+    if (now - lastApiBlockedCheckTime < 8000) {
+      return;
+    }
+    lastApiBlockedCheckTime = now;
+
+    if (resumeInFlightMap.get(jid)) return;
+
+    console.log(`[bridge] Smart auto-recheck for api_blocked (trigger: ${source}) on tab ${targetTabId}...`);
+    let preflightRes = null;
+    try {
+      preflightRes = await preflightRatingsInTab(targetTabId, itemid, shopid, referer);
+    } catch (err) {
+      console.warn("[bridge] Smart preflight error:", err?.message || err);
+      return;
+    }
+
+    const evalRes = evaluatePreflightResult(preflightRes);
+    const hasValidRatings = preflightRes?.ok && (
+      (preflightRes.json?.data && (Array.isArray(preflightRes.json.data.ratings) || Array.isArray(preflightRes.json.data.items))) ||
+      Array.isArray(preflightRes.json?.ratings) ||
+      Array.isArray(preflightRes.json?.items) ||
+      (preflightRes.status === 200 && !preflightRes.json?.error)
+    );
+
+    if (hasValidRatings) {
+      console.log(`[bridge] ✔ Smart auto-recheck succeeded (HTTP 200)! Auto-resuming job: ${jid}`);
+      stopApiBlockedWatcher();
+      updateState("resuming", { job_id: jid, message: "Shopee đã hết chặn API! Đang tự động tiếp tục cào..." });
+      resumeVerification(jid, {
+        recheck: true,
+        checkpoint: details?.checkpoint,
+        message: "Shopee đã hết chặn API (HTTP 200). Hệ thống tự động tiếp tục cào từ checkpoint.",
+      });
+    } else {
+      console.log(`[bridge] Smart preflight still blocked (status: ${preflightRes?.status}):`, evalRes.error);
+    }
+  };
+
+  // 1. Listen for tab reload / navigation
+  const tabListener = async (tabId, changeInfo, tab) => {
+    if (tabId !== targetTabId) return;
+    if (changeInfo.status === "complete") {
+      await checkAndAutoResume("tab_reload");
+    }
+  };
+  chrome.tabs.onUpdated?.addListener(tabListener);
+  activeApiBlockedTabListener = tabListener;
+
+  // 2. Safe Backoff Timer: try at 15s, 45s, 90s (max 3 auto checks to avoid infinite looping)
+  let backoffIndex = 0;
+  const backoffDelays = [15000, 30000, 45000];
+  const scheduleNextBackoff = () => {
+    if (backoffIndex >= backoffDelays.length) return;
+    const delay = backoffDelays[backoffIndex++];
+    apiBlockedWatcherInterval = setTimeout(async () => {
+      await checkAndAutoResume("backoff_timer");
+      scheduleNextBackoff();
+    }, delay);
+  };
+  scheduleNextBackoff();
+}
 
 async function captureTabEvidence(tabId) {
   try {
@@ -1842,8 +1966,12 @@ async function detectCaptchaInTab(tabId) {
           "iframe[src*='captcha']",
           ".challenge-container",
           ".verify-container",
-          "div[class*='captcha']",
-          "div[class*='verify']",
+          ".verify-slider",
+          "div[class*='captcha-modal']",
+          "div[class*='captcha_wrapper']",
+          "div[class*='shopee-captcha']",
+          "div[class*='traffic-verify']",
+          "div[class*='puzzle-verify']",
         ];
         for (const sel of selectors) {
           const el = document.querySelector(sel);
@@ -1904,8 +2032,9 @@ function startVerificationWatcher(details) {
   const targetTabId = details?.tab_id;
   if (!jid || !targetTabId || !chrome.tabs) return;
 
-  const itemid = details?.itemid || (details?.checkpoint?.itemid);
-  const shopid = details?.shopid || (details?.checkpoint?.shopid);
+  const parsed = idsFrom(details?.url || "");
+  const itemid = details?.itemid || (details?.checkpoint?.itemid) || parsed.itemid;
+  const shopid = details?.shopid || (details?.checkpoint?.shopid) || parsed.shopid;
   const referer = details?.referer || details?.url;
 
   let consecutiveAbsentCount = 0;
@@ -2047,8 +2176,9 @@ async function triggerVerificationRequired(details) {
   }
 }
 
-function resumeVerification(jobId, options = {}) {
+async function resumeVerification(jobId, options = {}) {
   stopVerificationWatcher();
+  stopApiBlockedWatcher();
   if (verificationInfo && verificationInfo.kind === "login") {
     console.warn("[bridge] Không thể resume verification cho job yêu cầu đăng nhập:", jobId);
     return;
@@ -2058,9 +2188,17 @@ function resumeVerification(jobId, options = {}) {
     return;
   }
 
-  const jobToResume = (jobId && pendingVerificationJobs.get(jobId)) || lastVerificationJob;
-  const targetJobId = jobId || jobToResume?.id;
+  let jobToResume = (jobId && pendingVerificationJobs.get(jobId)) || lastVerificationJob;
+  const targetJobId = jobId || jobToResume?.id || (verificationInfo && verificationInfo.job_id);
   console.log("[bridge] Resuming verification, jobId:", targetJobId);
+
+  // If not found in memory (e.g. after Service Worker idle/restart), recover from storage
+  if (!jobToResume && targetJobId) {
+    try {
+      const stored = await chrome.storage.local.get([`pending_job_${targetJobId}`]);
+      jobToResume = stored[`pending_job_${targetJobId}`] || null;
+    } catch {}
+  }
 
   if (targetJobId) {
     notifiedVerificationJobIds.delete(targetJobId);
@@ -2095,6 +2233,9 @@ function resumeVerification(jobId, options = {}) {
     }
     if (targetJobId) {
       resumeInFlightMap.set(targetJobId, false);
+      try {
+        await chrome.storage.local.remove([`pending_job_${targetJobId}`]);
+      } catch {}
     }
     knownJobs.delete(jobToResume.id);
     jobToResume.retry = true;
@@ -2104,11 +2245,38 @@ function resumeVerification(jobId, options = {}) {
     enqueueLegacyJob(jobToResume);
   } else if (targetJobId) {
     resumeInFlightMap.set(targetJobId, false);
+    // Fallback: construct minimal job from checkpoint/verificationInfo if missing
+    const fallbackUrl = verificationInfo?.url;
+    if (fallbackUrl) {
+      const fallbackJob = {
+        id: targetJobId,
+        url: fallbackUrl,
+        retry: true,
+        checkpoint,
+      };
+      console.log("[bridge] Retrying with fallback job after verification:", fallbackJob.id);
+      knownJobs.delete(targetJobId);
+      enqueueLegacyJob(fallbackJob);
+    }
   }
 }
 
 async function handleRecheckApi(jobId) {
-  const job = (jobId && pendingVerificationJobs.get(jobId)) || lastVerificationJob;
+  let job = (jobId && pendingVerificationJobs.get(jobId)) || lastVerificationJob;
+  if (!job && jobId) {
+    try {
+      const stored = await chrome.storage.local.get([`pending_job_${jobId}`]);
+      job = stored[`pending_job_${jobId}`] || null;
+    } catch {}
+  }
+  if (!job && verificationInfo?.url) {
+    job = {
+      id: jobId || verificationInfo.job_id,
+      url: verificationInfo.url,
+      checkpoint: verificationInfo.checkpoint,
+      _targetTabId: verificationInfo.tab_id,
+    };
+  }
   if (!job) {
     return { ok: false, error: "Không tìm thấy thông tin job để kiểm tra lại." };
   }
@@ -3281,6 +3449,8 @@ if (typeof module !== "undefined" && module.exports) {
     detectCaptchaInTab,
     startVerificationWatcher,
     stopVerificationWatcher,
+    startApiBlockedWatcher,
+    stopApiBlockedWatcher,
     probeFilterCandidates,
     normalizeCheckpointV2,
     extractRatingSummary,
