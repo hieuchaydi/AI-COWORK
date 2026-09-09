@@ -3109,7 +3109,8 @@ async function dispatchEnvelope(envelope) {
 
   // Handle verification resume/resolved
   if (envelope.type === "verification.resolved" || envelope.type === "verification.resume") {
-    resumeVerification(envelope.params && (envelope.params.jobId || envelope.params.id));
+    const params = envelope.params || {};
+    resumeVerification(params.jobId || params.job_id || params.id, params);
     return;
   }
 

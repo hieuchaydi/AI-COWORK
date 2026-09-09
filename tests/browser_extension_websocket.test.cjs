@@ -1407,6 +1407,38 @@ test('handleRecheckApi rejects HTTP 200 when ratings payload is unusable', async
   assert.equal(resolvedFrame, undefined);
 });
 
+test('gateway verification.resolved with recheck resumes api_blocked job', async () => {
+  const { context, frames, sockets } = await worker();
+  sockets[0].onopen();
+
+  let enqueuedJob = null;
+  await vm.runInContext(`
+    enqueueLegacyJob = (j) => { enqueuedJob = j; };
+    pendingVerificationJobs.set("job-gateway-recheck", {
+      id: "job-gateway-recheck",
+      url: "https://shopee.vn/product/111/222",
+    });
+    updateState("api_blocked", { job_id: "job-gateway-recheck", kind: "api_blocked" });
+    dispatchEnvelope({
+      type: "verification.resolved",
+      params: {
+        jobId: "job-gateway-recheck",
+        recheck: true,
+        checkpoint: { version: 2, next_offset: 12 },
+      },
+    });
+  `, context);
+
+  const enqueued = vm.runInContext('enqueuedJob', context);
+  assert.ok(enqueued, 'api_blocked job should resume when gateway sends recheck=true');
+  assert.equal(enqueued.id, 'job-gateway-recheck');
+  assert.equal(enqueued.retry, true);
+  assert.equal(enqueued.checkpoint.next_offset, 12);
+
+  const refusedFrame = frames.find((f) => f.type === 'verification.resolved' && f.params?.job_id === 'job-gateway-recheck' && f.params?.recheck === false);
+  assert.equal(refusedFrame, undefined);
+});
+
 test('verification watcher requires 2 consecutive absent checks before preflight and resolution', async () => {
   const { context, frames, sockets } = await worker();
   sockets[0].onopen();

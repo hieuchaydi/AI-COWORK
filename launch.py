@@ -2694,6 +2694,7 @@ class _HelperHandler(BaseHTTPRequestHandler):
                 return
 
             job_id = (qs.get("id", [""])[0] or qs.get("jobId", [""])[0] or "").strip()
+            is_recheck = False
             if not job_id:
                 with _INGEST_PROGRESS_LOCK:
                     for jid, p in reversed(list(_INGEST_PROGRESS.items())):
@@ -2727,7 +2728,7 @@ class _HelperHandler(BaseHTTPRequestHandler):
             msg = {
                 "v": 1,
                 "type": "verification.resolved",
-                "params": {"jobId": job_id, "retry": True} if job_id else {"retry": True},
+                "params": {"jobId": job_id, "job_id": job_id, "retry": True, "recheck": is_recheck} if job_id else {"retry": True, "recheck": is_recheck},
             }
             sent = _BROWSER_WS.send(msg)
             _BROWSER_WS.transport.resume_verification()
@@ -3453,6 +3454,7 @@ class _HelperHandler(BaseHTTPRequestHandler):
                 return
 
             job_id = (body.get("id") or body.get("jobId") or qs.get("id", [""])[0] or qs.get("jobId", [""])[0] or "").strip()
+            is_recheck = False
             if not job_id:
                 with _INGEST_PROGRESS_LOCK:
                     for jid, p in reversed(list(_INGEST_PROGRESS.items())):
@@ -3487,7 +3489,7 @@ class _HelperHandler(BaseHTTPRequestHandler):
             msg = {
                 "v": 1,
                 "type": "verification.resolved",
-                "params": {"jobId": job_id, "retry": True} if job_id else {"retry": True},
+                "params": {"jobId": job_id, "job_id": job_id, "retry": True, "recheck": is_recheck} if job_id else {"retry": True, "recheck": is_recheck},
             }
             sent = _BROWSER_WS.send(msg)
             _BROWSER_WS.transport.resume_verification()
