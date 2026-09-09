@@ -12,6 +12,8 @@ const jobProgressLabel = document.getElementById("jobProgressLabel");
 const jobProgressPercent = document.getElementById("jobProgressPercent");
 const jobProgressBar = document.getElementById("jobProgressBar");
 const jobProgressMeta = document.getElementById("jobProgressMeta");
+const btnExportSnapshot = document.getElementById("btnExportSnapshot");
+const jobExportMessage = document.getElementById("jobExportMessage");
 const verificationBox = document.getElementById("verificationBox");
 const verificationReason = document.getElementById("verificationReason");
 const verificationMsg = document.getElementById("verificationMsg");
@@ -28,6 +30,7 @@ const openReport = document.getElementById("openReport");
 const zipParts = document.getElementById("zipParts");
 
 let currentVerification = null;
+let currentJobId = null;
 
 function storageGet(keys) {
   return new Promise((resolve) => chrome.storage.local.get(keys, resolve));
@@ -224,6 +227,7 @@ function renderStatus(state, details) {
 
   if (details && details.currentJob) {
     const job = details.currentJob;
+    currentJobId = job.id;
     const progress = job._progress || {};
     jobStatusText.textContent = `Job: ${job.id} (${progress.stage || job.stage || "running"})`;
     const percent = Math.max(0, Math.min(100, Number(progress.percent) || 0));
@@ -239,8 +243,28 @@ function renderStatus(state, details) {
       ? `Đã lấy ${rows.toLocaleString("vi-VN")}${Number.isFinite(total) && total > 0 ? `/${total.toLocaleString("vi-VN")} đánh giá` : " đánh giá"}`
       : "Đang kết nối và chuẩn bị dữ liệu";
   } else {
+    currentJobId = null;
     jobStatusText.textContent = "No job currently running";
     jobProgress.style.display = "none";
+  }
+}
+
+async function exportSnapshot() {
+  if (!currentJobId) return;
+  btnExportSnapshot.disabled = true;
+  jobExportMessage.textContent = "Đang tạo ZIP từ checkpoint hiện tại...";
+  try {
+    const endpoint = new URL("/ingest/export", gatewayStatusUrl(gatewayUrlInput.value));
+    endpoint.searchParams.set("id", currentJobId);
+    const response = await fetch(endpoint.toString());
+    const result = await response.json();
+    if (!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    jobExportMessage.textContent = `Đã tạo ZIP với ${Number(result.count || 0).toLocaleString("vi-VN")} đánh giá.`;
+    renderCompletedResult(result, gatewayUrlInput.value);
+  } catch (error) {
+    jobExportMessage.textContent = `Không thể xuất ZIP: ${error.message}`;
+  } finally {
+    btnExportSnapshot.disabled = false;
   }
 }
 
@@ -338,6 +362,7 @@ async function changeConnection(action) {
 btnAutoPair.addEventListener("click", () => changeConnection("connect"));
 btnConnect.addEventListener("click", () => changeConnection("connect"));
 btnDisconnect.addEventListener("click", () => changeConnection("disconnect"));
+btnExportSnapshot.addEventListener("click", exportSnapshot);
 
 if (btnOpenVerificationTab) {
   btnOpenVerificationTab.addEventListener("click", async () => {

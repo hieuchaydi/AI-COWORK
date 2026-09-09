@@ -250,6 +250,8 @@ button {
   color: #5f6368;
 }
 
+.job-export { width: 100%; margin-top: 7px; }
+
 .alert-box {
   background: #fef7e0;
   border: 1px solid #f9ab00;

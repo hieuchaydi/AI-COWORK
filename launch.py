@@ -2735,6 +2735,34 @@ class _HelperHandler(BaseHTTPRequestHandler):
             })
             return
 
+        # /ingest/export?id=… — create a downloadable snapshot from durable
+        # checkpoint rows without stopping or modifying the active crawl.
+        if self.path.split("?", 1)[0] == "/ingest/export":
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            job_id = (qs.get("id", [""])[0] or "").strip()
+            with _INGEST_CHECKPOINTS_LOCK:
+                checkpoint = dict(_INGEST_CHECKPOINTS.get(job_id) or {})
+                rows = list(checkpoint.get("rows") or [])
+            job = _INGEST_ALL_JOBS.get(job_id) or {}
+            if not rows:
+                self._json(404, {"ok": False, "error": "Chưa có checkpoint để xuất ZIP"})
+                return
+            itemid = str(checkpoint.get("itemid") or job.get("itemid") or "").strip()
+            name = f"shopee_{itemid}_reviews_snapshot" if itemid else f"ingest_{job_id}_snapshot"
+            code, result = _store_ingest_payload({
+                "name": name,
+                "source": job.get("url") or "",
+                "rows": rows,
+                "partial": True,
+                "crawl_summary": {
+                    "expected": checkpoint.get("total"),
+                    "collected": len(rows),
+                    "complete": False,
+                },
+            })
+            self._json(code, result)
+            return
+
         # /ingest/traces?id=… — retrieve structured trace log for a job or recent jobs
         if self.path.split("?", 1)[0] == "/ingest/traces":
             qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
