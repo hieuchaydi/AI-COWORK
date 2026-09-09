@@ -433,6 +433,18 @@ def test_cloudflare_model_is_registered_with_agent_capabilities():
     assert capabilities_for("cloudflare:google/gemini-3.8-flash").tools
 
 
+def test_cerebras_models_are_registered_with_agent_capabilities():
+    from coworker.providers.capabilities import capabilities_for
+    from coworker.providers.matrix import models_for_provider
+
+    assert models_for_provider("cerebras") == [
+        "qwen-3.8-27b",
+        "gemma-4-31b",
+        "gpt-oss-120b",
+    ]
+    assert capabilities_for("cerebras:qwen-3.8-27b").tools
+
+
 # -- curated model matrix (labels + capabilities by full routed id) -----------------
 
 

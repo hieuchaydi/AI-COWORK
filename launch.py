@@ -3836,9 +3836,14 @@ def _seed_runtime_state() -> None:
             ]
         )
     # Cerebras — very fast OpenAI-compatible inference. Only seed when the key is present
-    # (compat providers fail on first use without a key). gpt-oss-120b = best tool use.
+    # (compat providers fail on first use without a key). Qwen has the largest account quota;
+    # GPT-OSS and Gemma remain available for reasoning and vision-oriented work.
     if CEREBRAS_KEY:
-        picker.append("cerebras:gpt-oss-120b")
+        picker.extend([
+            "cerebras:qwen-3.8-27b",
+            "cerebras:gemma-4-31b",
+            "cerebras:gpt-oss-120b",
+        ])
     if CLOUDFLARE_TOKEN and CLOUDFLARE_ACCOUNT_ID:
         _ow_post(
             "/v1/providers",
@@ -3897,7 +3902,7 @@ def _seed_runtime_state() -> None:
     elif GROQ_KEY:
         default_model = "groq:openai/gpt-oss-120b"
     elif CEREBRAS_KEY:
-        default_model = "cerebras:gpt-oss-120b"
+        default_model = "cerebras:qwen-3.8-27b"
     elif CLOUDFLARE_TOKEN and CLOUDFLARE_ACCOUNT_ID:
         default_model = "cloudflare:google/gemini-3.8-flash"
     elif COHERE_KEY:

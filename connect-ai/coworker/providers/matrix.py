@@ -147,6 +147,15 @@ MATRIX: dict[str, ModelEntry] = {
     "deepseek:deepseek-v4-pro": ModelEntry(
         "DeepSeek V4 Pro · DeepSeek", _AGENTIC, 128_000
     ),
+    "cerebras:qwen-3.8-27b": ModelEntry(
+        "Qwen 3.8 27B · Cerebras", _AGENTIC, 131_072
+    ),
+    "cerebras:gemma-4-31b": ModelEntry(
+        "Gemma 4 31B · Cerebras", _AGENTIC, 131_072
+    ),
+    "cerebras:gpt-oss-120b": ModelEntry(
+        "GPT-OSS 120B · Cerebras", _AGENTIC, 131_000
+    ),
     "kimi:kimi-k2.6": ModelEntry("Kimi K2.6 · Moonshot", _AGENTIC, 256_000),
     "minimax:MiniMax-M2.5": ModelEntry("MiniMax M2.5 · MiniMax"),
     "qwen:qwen3-max": ModelEntry("Qwen3 Max · Alibaba", _AGENTIC, 256_000),
