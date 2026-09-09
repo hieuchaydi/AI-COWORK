@@ -1635,81 +1635,14 @@ async function runJob(job) {
         stage: "verification_required",
       });
     } else if (failureKind === "api_blocked") {
-      // 3. api_blocked: Shopee chặn API (HTTP 403) nhưng KHÔNG PHẢI CAPTCHA và KHÔNG PHẢI login
-      // 3. api_blocked: Shopee chặn API (HTTP 403) — Quét CAPTCHA, focus tab, chụp bằng chứng, lưu checkpoint
+      // 3. api_blocked: Shopee chặn API (HTTP 403)
       let checkpoint = null;
       try {
         const stored = await chrome.storage.local.get([`checkpoint_${job.id}`]);
         checkpoint = stored[`checkpoint_${job.id}`] || null;
       } catch {}
 
-      // 3a. Gửi WebSocket event api_blocked lên server để lưu checkpoint và log
-      if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
-        bridgeSend({
-          v: 1,
-          type: "api_blocked",
-          id: "blocked-" + Date.now(),
-          params: {
-            job_id: job.id,
-            url: job.url,
-            tab_id: job._targetTabId || null,
-            reason: message,
-            status: 403,
-            checkpoint,
-          },
-        });
-      }
-
-      // 3b. Focus tab Shopee hiện tại hoặc mở trang trạng thái nội bộ (Human In The Loop)
       const targetTabId = job._targetTabId;
-      let tabFocused = false;
-      if (targetTabId && chrome.tabs) {
-        try {
-          const tab = await chrome.tabs.update(targetTabId, { active: true });
-          if (tab && tab.windowId && chrome.windows) {
-            await chrome.windows.update(tab.windowId, { focused: true });
-          }
-          tabFocused = true;
-        } catch (tabErr) {
-          console.warn("[bridge] Could not focus tab for api_blocked:", tabErr?.message);
-        }
-      }
-      if (!tabFocused && chrome.tabs?.create) {
-        try {
-          const statusUrl = `http://127.0.0.1:8766/ingest?job=${encodeURIComponent(job.id)}`;
-          await chrome.tabs.create({ url: statusUrl });
-        } catch {}
-      }
-
-      // 3c. Cập nhật state nội bộ và dừng job, không retry tự động
-      updateState("api_blocked", {
-        job_id: job.id,
-        url: job.url,
-        tab_id: job._targetTabId || null,
-        reason: message,
-        kind: "api_blocked",
-        checkpoint,
-      });
-      await progress({
-        status: "error",
-        stage: "api_blocked",
-        message: "Shopee chặn API đánh giá (HTTP 403 / API Blocked). Job đã dừng an toàn, không retry tự động.",
-        error: message,
-        api_blocked: true,
-        verification_required: false,
-        login_required: false,
-        checkpoint,
-        percent: 100,
-      });
-      await uploadIngestResult({
-        job: job.id,
-        error: message,
-        api_blocked: true,
-        verification_required: false,
-        login_required: false,
-        checkpoint,
-        stage: "api_blocked",
-      });
       // Quét xem tab Shopee có slider CAPTCHA hoặc trang xác minh không
       const captchaCheck = targetTabId ? await detectCaptchaInTab(targetTabId) : { detected: false };
       const evidence = targetTabId ? await captureTabEvidence(targetTabId) : null;
@@ -1719,7 +1652,7 @@ async function runJob(job) {
       pendingVerificationJobs.set(job.id, job);
 
       if (captchaCheck?.detected) {
-        // Tab hiển thị CAPTCHA challenge rõ ràng -> Chuyển sang verification challenge
+        // --- 1. VERIFICATION_REQUIRED: Tab hiển thị CAPTCHA challenge rõ ràng ---
         await triggerVerificationRequired({
           job_id: job.id,
           url: job.url,
@@ -1736,7 +1669,7 @@ async function runJob(job) {
           error: message,
           verification_required: true,
           login_required: false,
-          api_blocked: true,
+          api_blocked: false,
           evidence_screenshot: evidence,
           checkpoint,
           percent: 100,
@@ -1746,13 +1679,33 @@ async function runJob(job) {
           error: message,
           verification_required: true,
           login_required: false,
-          api_blocked: true,
+          api_blocked: false,
           evidence_screenshot: evidence,
           checkpoint,
           stage: "verification_required",
         });
       } else {
-        // Chưa thấy CAPTCHA trên DOM hoặc bị giới hạn API
+        // --- 2. API_BLOCKED: Bị chặn API (403) nhưng tab không có CAPTCHA challenge ---
+        let tabFocused = false;
+        if (targetTabId && chrome.tabs) {
+          try {
+            const tab = await chrome.tabs.update(targetTabId, { active: true });
+            if (tab && tab.windowId && chrome.windows) {
+              await chrome.windows.update(tab.windowId, { focused: true });
+            }
+            tabFocused = true;
+          } catch (tabErr) {
+            console.warn("[bridge] Could not focus tab for api_blocked:", tabErr?.message);
+          }
+        }
+        if (!tabFocused && chrome.tabs?.create) {
+          try {
+            const statusUrl = `http://127.0.0.1:8766/ingest?job=${encodeURIComponent(job.id)}`;
+            await chrome.tabs.create({ url: statusUrl });
+          } catch {}
+        }
+
+        // Gửi WebSocket event api_blocked lên server để lưu checkpoint và log
         if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
           bridgeSend({
             v: 1,
@@ -1770,6 +1723,7 @@ async function runJob(job) {
           });
         }
 
+        // Cập nhật state nội bộ và dừng job, tuyệt đối KHÔNG bật watcher polling theo timer
         updateState("api_blocked", {
           job_id: job.id,
           url: job.url,
@@ -1780,14 +1734,10 @@ async function runJob(job) {
           evidence_screenshot: evidence,
         });
 
-        if (targetTabId) {
-          startVerificationWatcher({ job_id: job.id, tab_id: targetTabId });
-        }
-
         await progress({
           status: "error",
           stage: "api_blocked",
-          message: "Shopee chặn API đánh giá (HTTP 403). Tab đã được mở để xác minh; job tạm dừng an toàn.",
+          message: "Shopee chặn API đánh giá (HTTP 403 / API Blocked). Job đã dừng an toàn; vui lòng kiểm tra lại.",
           error: message,
           api_blocked: true,
           verification_required: false,
@@ -1844,6 +1794,8 @@ async function runJob(job) {
 
 // ── Verification Challenge Detection, Evidence & Handover ────────────────────
 const notifiedVerificationJobIds = new Set();
+const verificationCycles = new Map();
+const resumeInFlightMap = new Map();
 let verificationWatcherInterval = null;
 let activeTabUpdateListener = null;
 
@@ -1896,7 +1848,10 @@ async function detectCaptchaInTab(tabId) {
         for (const sel of selectors) {
           const el = document.querySelector(sel);
           if (el && (el.offsetWidth > 0 || el.offsetHeight > 0)) {
-            return { detected: true, type: "dom_selector", selector: sel };
+            try {
+              el.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+            } catch {}
+            return { detected: true, type: "dom_selector", selector: sel, elementFound: true };
           }
         }
         const text = document.body ? document.body.innerText.toLowerCase() : "";
@@ -1910,7 +1865,15 @@ async function detectCaptchaInTab(tabId) {
         ];
         for (const p of phrases) {
           if (text.includes(p)) {
-            return { detected: true, type: "dom_text", phrase: p };
+            try {
+              const matchingEl = Array.from(document.querySelectorAll("div, p, span, h1, h2, h3, label, a, button, section, form")).find(
+                (e) => e.innerText && e.innerText.toLowerCase().includes(p) && e.children.length === 0
+              );
+              if (matchingEl) {
+                matchingEl.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+              }
+            } catch {}
+            return { detected: true, type: "dom_text", phrase: p, elementFound: true };
           }
         }
         return { detected: false };
@@ -1941,32 +1904,105 @@ function startVerificationWatcher(details) {
   const targetTabId = details?.tab_id;
   if (!jid || !targetTabId || !chrome.tabs) return;
 
+  const itemid = details?.itemid || (details?.checkpoint?.itemid);
+  const shopid = details?.shopid || (details?.checkpoint?.shopid);
+  const referer = details?.referer || details?.url;
+
+  let consecutiveAbsentCount = 0;
+
+  const performCheckAndPreflight = async () => {
+    if (!verificationInfo || verificationInfo.job_id !== jid || verificationInfo.kind !== "verification") {
+      stopVerificationWatcher();
+      return;
+    }
+    const check = await detectCaptchaInTab(targetTabId);
+    if (!check || !check.detected) {
+      consecutiveAbsentCount++;
+      console.log(`[bridge] CAPTCHA absent count: ${consecutiveAbsentCount}/2 for job ${jid}`);
+      if (consecutiveAbsentCount >= 2) {
+        if (resumeInFlightMap.get(jid)) {
+          console.log("[bridge] Resume already in-flight for job:", jid);
+          return;
+        }
+        resumeInFlightMap.set(jid, true);
+
+        console.log("[bridge] Challenge absent 2 times consecutively! Running preflight API in tab...");
+        let preflightRes = null;
+        try {
+          preflightRes = await preflightRatingsInTab(targetTabId, itemid, shopid, referer);
+        } catch (err) {
+          console.warn("[bridge] Preflight error:", err?.message || err);
+        }
+
+        const evalRes = evaluatePreflightResult(preflightRes);
+        const hasValidRatings = preflightRes?.ok && (
+          (preflightRes.json?.data && (Array.isArray(preflightRes.json.data.ratings) || Array.isArray(preflightRes.json.data.items))) ||
+          Array.isArray(preflightRes.json?.ratings) ||
+          Array.isArray(preflightRes.json?.items) ||
+          (preflightRes.status === 200 && !preflightRes.json?.error)
+        );
+
+        if (hasValidRatings) {
+          console.log("[bridge] ✔ Preflight succeeded (HTTP 200 & valid ratings)! Resuming job:", jid);
+          stopVerificationWatcher();
+          const currentCycle = (verificationCycles.get(jid) || 0) + 1;
+          verificationCycles.set(jid, currentCycle);
+          resumeVerification(jid, {
+            verification_cycle: currentCycle,
+            checkpoint: details?.checkpoint,
+            message: "Thử thách CAPTCHA đã được giải và preflight API thành công (HTTP 200)",
+          });
+        } else {
+          console.warn("[bridge] ✘ Preflight failed after challenge disappeared:", evalRes.error || preflightRes?.status);
+          resumeInFlightMap.set(jid, false);
+          consecutiveAbsentCount = 0;
+
+          // Nếu API trả 403 mà tab không có challenge -> Chuyển sang api_blocked và DỪNG watcher để tránh loop!
+          if (preflightRes?.status === 403 || evalRes.error?.includes("403")) {
+            console.warn("[bridge] Tab has no challenge but API is 403 -> transitioning to api_blocked");
+            stopVerificationWatcher();
+            const reason = evalRes.error || "Shopee chặn API đánh giá (HTTP 403 / API Blocked)";
+            updateState("api_blocked", {
+              job_id: jid,
+              tab_id: targetTabId,
+              reason,
+              kind: "api_blocked",
+              checkpoint: details?.checkpoint,
+            });
+            if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+              bridgeSend({
+                v: 1,
+                type: "api_blocked",
+                id: "blocked-" + Date.now(),
+                params: {
+                  job_id: jid,
+                  status: 403,
+                  reason,
+                  checkpoint: details?.checkpoint,
+                },
+              });
+            }
+          }
+        }
+      }
+    } else {
+      // Challenge vẫn tồn tại trên tab
+      consecutiveAbsentCount = 0;
+    }
+  };
+
   const tabUpdateListener = async (tabId, changeInfo, tab) => {
     if (tabId !== targetTabId) return;
     if (changeInfo.status === "complete" || (tab.url && !tab.url.includes("/verify/traffic"))) {
-      const check = await detectCaptchaInTab(targetTabId);
-      if (!check.detected) {
-        console.log("[bridge] Auto-detected CAPTCHA resolution on tab:", targetTabId);
-        stopVerificationWatcher();
-        resumeVerification(jid);
-      }
+      await performCheckAndPreflight();
     }
   };
   chrome.tabs.onUpdated?.addListener(tabUpdateListener);
   activeTabUpdateListener = tabUpdateListener;
 
   verificationWatcherInterval = setInterval(async () => {
-    if (!verificationInfo || verificationInfo.job_id !== jid) {
-      stopVerificationWatcher();
-      return;
-    }
-    const check = await detectCaptchaInTab(targetTabId);
-    if (!check.detected) {
-      console.log("[bridge] Auto-detected CAPTCHA resolved in-place for job:", jid);
-      stopVerificationWatcher();
-      resumeVerification(jid);
-    }
-  }, 3000);
+    await performCheckAndPreflight();
+  }, 2500);
 }
 
 async function triggerVerificationRequired(details) {
@@ -2011,32 +2047,122 @@ async function triggerVerificationRequired(details) {
   }
 }
 
-function resumeVerification(jobId) {
+function resumeVerification(jobId, options = {}) {
   stopVerificationWatcher();
   if (verificationInfo && verificationInfo.kind === "login") {
     console.warn("[bridge] Không thể resume verification cho job yêu cầu đăng nhập:", jobId);
     return;
   }
-  console.log("[bridge] Resuming verification, jobId:", jobId);
-  if (jobId) notifiedVerificationJobIds.delete(jobId);
+  if (verificationInfo && verificationInfo.kind === "api_blocked" && !options.recheck) {
+    console.warn("[bridge] Job đang ở trạng thái api_blocked, cần preflight recheckApi trước khi resume:", jobId);
+    return;
+  }
+
+  const jobToResume = (jobId && pendingVerificationJobs.get(jobId)) || lastVerificationJob;
+  const targetJobId = jobId || jobToResume?.id;
+  console.log("[bridge] Resuming verification, jobId:", targetJobId);
+
+  if (targetJobId) {
+    notifiedVerificationJobIds.delete(targetJobId);
+  }
   updateState("connected");
+
+  const cycle = options.verification_cycle || (targetJobId ? verificationCycles.get(targetJobId) || 1 : 1);
+  const checkpoint = options.checkpoint || (targetJobId && verificationInfo?.checkpoint) || null;
+
   if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
     bridgeSend({
       v: 1,
       type: "verification.resolved",
       id: "resumed-" + Date.now(),
-      params: { status: "resumed", message: "User confirmed verification in tab", jobId },
+      params: {
+        status: "resumed",
+        message: options.message || "User confirmed verification in tab",
+        jobId: targetJobId,
+        job_id: targetJobId,
+        verification_cycle: cycle,
+        recheck: Boolean(options.recheck),
+        checkpoint,
+      },
     });
   }
-  const jobToResume = (jobId && pendingVerificationJobs.get(jobId)) || lastVerificationJob;
+
   if (jobToResume) {
     console.log("[bridge] Retrying job after verification:", jobToResume.id);
     pendingVerificationJobs.delete(jobToResume.id);
     if (lastVerificationJob && lastVerificationJob.id === jobToResume.id) {
       lastVerificationJob = null;
     }
+    if (targetJobId) {
+      resumeInFlightMap.set(targetJobId, false);
+    }
     knownJobs.delete(jobToResume.id);
+    jobToResume.retry = true;
+    if (checkpoint) {
+      jobToResume.checkpoint = checkpoint;
+    }
     enqueueLegacyJob(jobToResume);
+  } else if (targetJobId) {
+    resumeInFlightMap.set(targetJobId, false);
+  }
+}
+
+async function handleRecheckApi(jobId) {
+  const job = (jobId && pendingVerificationJobs.get(jobId)) || lastVerificationJob;
+  if (!job) {
+    return { ok: false, error: "Không tìm thấy thông tin job để kiểm tra lại." };
+  }
+
+  let checkpoint = null;
+  try {
+    const stored = await chrome.storage.local.get([`checkpoint_${job.id}`]);
+    checkpoint = stored[`checkpoint_${job.id}`] || job.checkpoint || null;
+  } catch {}
+
+  const parsed = idsFrom(job.url || "");
+  const itemid = job.itemid || parsed.itemid || checkpoint?.itemid;
+  const shopid = job._targetShopId || job.shopid || parsed.shopid || checkpoint?.shopid;
+
+  let targetTabId = job._targetTabId;
+  if (!targetTabId) {
+    const tab = await findOrOpenShopeeTab(job.url, itemid);
+    targetTabId = tab?.id;
+    job._targetTabId = targetTabId;
+  }
+
+  if (!targetTabId) {
+    return { ok: false, error: "Không tìm thấy hoặc không mở được tab Shopee." };
+  }
+
+  let preflightRes;
+  try {
+    preflightRes = await preflightRatingsInTab(targetTabId, itemid, shopid, job._targetTabUrl || job.url);
+  } catch (err) {
+    return { ok: false, error: `Lỗi kết nối preflight: ${err.message}` };
+  }
+
+  const evalRes = evaluatePreflightResult(preflightRes);
+  const hasValidRatings = preflightRes?.ok && (
+    (preflightRes.json?.data && (Array.isArray(preflightRes.json.data.ratings) || Array.isArray(preflightRes.json.data.items))) ||
+    Array.isArray(preflightRes.json?.ratings) ||
+    Array.isArray(preflightRes.json?.items) ||
+    (preflightRes.status === 200 && !preflightRes.json?.error)
+  );
+
+  if (hasValidRatings) {
+    console.log("[bridge] Recheck API thành công (HTTP 200), resuming job:", job.id);
+    updateState("resuming", { job_id: job.id, message: "Kiểm tra API thành công! Đang tiếp tục cào..." });
+    resumeVerification(job.id, { recheck: true, checkpoint });
+    return { ok: true, message: "Kiểm tra thành công (HTTP 200)! Đang tiếp tục cào từ checkpoint." };
+  } else {
+    const status = preflightRes?.status || "unknown";
+    const reason = evalRes.error || formatShopeeFailure(preflightRes);
+    console.warn(`[bridge] Recheck API thất bại (HTTP ${status}):`, reason);
+    return {
+      ok: false,
+      status: preflightRes?.status,
+      error: `API vẫn bị chặn (HTTP ${status}): ${reason}`,
+    };
   }
 }
 
@@ -3101,6 +3227,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === "resumeVerification") {
     resumeVerification(msg.jobId);
     sendResponse({ ok: true });
+    return true;
+  }
+  if (msg.action === "recheckApi") {
+    handleRecheckApi(msg.jobId).then(
+      (res) => sendResponse(res),
+      (err) => sendResponse({ ok: false, error: err?.message || String(err) })
+    );
+    return true;
   }
   return false;
 });
@@ -3129,6 +3263,9 @@ if (typeof module !== "undefined" && module.exports) {
     formatShopeeFailure,
     runJob,
     resumeVerification,
+    handleRecheckApi,
+    verificationCycles,
+    resumeInFlightMap,
     triggerVerificationRequired,
     enqueueLegacyJob,
     jobQueue,

@@ -20,6 +20,8 @@ const verificationMsg = document.getElementById("verificationMsg");
 const verificationTargetUrl = document.getElementById("verificationTargetUrl");
 const btnOpenVerificationTab = document.getElementById("btnOpenVerificationTab");
 const btnResumeVerification = document.getElementById("btnResumeVerification");
+const btnRecheckApi = document.getElementById("btnRecheckApi");
+const recheckStatusMsg = document.getElementById("recheckStatusMsg");
 const tabList = document.getElementById("tabList");
 const resultSection = document.getElementById("resultSection");
 const resultSummary = document.getElementById("resultSummary");
@@ -190,24 +192,30 @@ function renderStatus(state, details) {
       if (btnResumeVerification) {
         btnResumeVerification.style.display = "none";
       }
+      if (btnRecheckApi) btnRecheckApi.style.display = "none";
+      if (recheckStatusMsg) recheckStatusMsg.style.display = "none";
     } else if (kind === "api_blocked") {
       verificationBox.className = "alert-box blocked-box";
-      if (verifTitle) verifTitle.textContent = "🚫 Shopee chặn API (HTTP 403 / WAF)";
-      verificationMsg.textContent = "Shopee đã chặn IP hoặc phiên truy cập của API đánh giá (HTTP 403). Đây không phải là CAPTCHA hoặc lỗi đăng nhập.";
-      if (verifTitle) verifTitle.textContent = "🚫 Shopee chặn API (HTTP 403) — Cần giải CAPTCHA / Xác minh phiên";
-      verificationMsg.textContent = "Shopee đã tạm chặn API đánh giá (HTTP 403). Hãy mở tab Shopee để kiểm tra/giải CAPTCHA hoặc xác minh phiên, sau đó bấm Tiếp tục cào từ Checkpoint.";
+      if (verifTitle) verifTitle.textContent = "🚫 Shopee chặn API (HTTP 403 / API Blocked)";
+      verificationMsg.textContent = "Shopee đã tạm chặn API đánh giá (HTTP 403). Job đã dừng an toàn (không tự động loop retry). Hãy mở tab Shopee kiểm tra hoặc bấm 'Kiểm tra lại' để thử kết nối API.";
       if (verificationReason) {
         verificationReason.textContent = details.verification.reason || "Lý do: HTTP 403 Forbidden / Access Denied";
       }
       if (btnOpenVerificationTab) {
-        btnOpenVerificationTab.style.display = "none";
         btnOpenVerificationTab.style.display = (targetUrl || details.verification.tab_id) ? "block" : "none";
-        btnOpenVerificationTab.textContent = "Mở tab Shopee cần xử lý / giải CAPTCHA";
+        btnOpenVerificationTab.textContent = "Mở tab Shopee";
       }
       if (btnResumeVerification) {
         btnResumeVerification.style.display = "none";
-        btnResumeVerification.style.display = "block";
-        btnResumeVerification.textContent = "Tiếp tục cào từ Checkpoint";
+      }
+      if (btnRecheckApi) {
+        btnRecheckApi.style.display = "block";
+        btnRecheckApi.disabled = false;
+        btnRecheckApi.textContent = "Kiểm tra lại";
+      }
+      if (recheckStatusMsg) {
+        recheckStatusMsg.style.display = "none";
+        recheckStatusMsg.textContent = "";
       }
     } else {
       // verification (CAPTCHA / challenge)
@@ -225,6 +233,8 @@ function renderStatus(state, details) {
         btnResumeVerification.style.display = "block";
         btnResumeVerification.textContent = "Tiếp tục sau khi đã giải CAPTCHA";
       }
+      if (btnRecheckApi) btnRecheckApi.style.display = "none";
+      if (recheckStatusMsg) recheckStatusMsg.style.display = "none";
     }
 
     if (verificationTargetUrl) {
@@ -252,6 +262,8 @@ function renderStatus(state, details) {
     if (btnResumeVerification) {
       btnResumeVerification.style.display = "block";
     }
+    if (btnRecheckApi) btnRecheckApi.style.display = "none";
+    if (recheckStatusMsg) recheckStatusMsg.style.display = "none";
   }
 
   if (details && details.currentJob) {
@@ -460,6 +472,48 @@ btnResumeVerification.addEventListener("click", () => {
     jobStatusText.textContent = "Đã xác nhận xác minh, đang tiếp tục cào...";
   }
 });
+
+if (btnRecheckApi) {
+  btnRecheckApi.addEventListener("click", async () => {
+    if (!currentVerification) return;
+    const jobId = currentVerification.job_id;
+    btnRecheckApi.disabled = true;
+    btnRecheckApi.textContent = "Đang kiểm tra...";
+    if (recheckStatusMsg) {
+      recheckStatusMsg.style.display = "block";
+      recheckStatusMsg.style.color = "#0066cc";
+      recheckStatusMsg.textContent = "Đang gửi preflight request tới Shopee API...";
+    }
+    try {
+      const resp = await chrome.runtime.sendMessage({ action: "recheckApi", jobId });
+      if (resp && resp.ok) {
+        btnRecheckApi.textContent = "Thành công!";
+        if (recheckStatusMsg) {
+          recheckStatusMsg.style.color = "#008800";
+          recheckStatusMsg.textContent = "✔ " + (resp.message || "Kiểm tra thành công (HTTP 200)! Đang tiếp tục cào...");
+        }
+        setTimeout(() => {
+          verificationBox.style.display = "none";
+          loadConfig();
+        }, 1200);
+      } else {
+        btnRecheckApi.disabled = false;
+        btnRecheckApi.textContent = "Kiểm tra lại";
+        if (recheckStatusMsg) {
+          recheckStatusMsg.style.color = "#cc0000";
+          recheckStatusMsg.textContent = "✘ " + (resp?.error || "Shopee vẫn đang chặn API (HTTP 403)");
+        }
+      }
+    } catch (err) {
+      btnRecheckApi.disabled = false;
+      btnRecheckApi.textContent = "Kiểm tra lại";
+      if (recheckStatusMsg) {
+        recheckStatusMsg.style.color = "#cc0000";
+        recheckStatusMsg.textContent = "✘ Lỗi: " + err.message;
+      }
+    }
+  });
+}
 
 // Periodic refresh
 loadConfig();

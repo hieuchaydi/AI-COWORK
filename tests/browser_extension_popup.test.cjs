@@ -35,6 +35,7 @@ async function popup(result) {
     'btnResumeVerification', 'tabList', 'connectionError', 'verificationTitle',
     'resultSection', 'resultSummary', 'downloadCsv', 'downloadZip',
     'openManifest', 'openReport', 'zipParts',
+    'openManifest', 'openReport', 'zipParts', 'btnRecheckApi', 'recheckStatusMsg',
   ];
   const elements = Object.fromEntries(ids.map(id => [id, element(id)]));
   const stored = {
@@ -100,4 +101,40 @@ test('popup automatically exposes CSV, ZIP, manifest and report after a complete
 test('popup never turns a non-local result URL into a download link', async () => {
   const { context } = await popup(null);
   assert.equal(vm.runInContext('outputUrl("https://example.com/result.zip", "ws://127.0.0.1:8766/browser/v1/ws")', context), '');
+});
+
+test('popup displays btnRecheckApi for api_blocked and btnResumeVerification for verification', async () => {
+  const { context, elements } = await popup(null);
+
+  // 1. When verification is api_blocked:
+  vm.runInContext(`
+    renderStatus("api_blocked", {
+      verification: {
+        kind: "api_blocked",
+        job_id: "job-blocked-1",
+        reason: "HTTP 403 Forbidden",
+        url: "https://shopee.vn/product/1/2",
+      }
+    });
+  `, context);
+
+  assert.equal(elements.btnRecheckApi.style.display, 'block');
+  assert.equal(elements.btnResumeVerification.style.display, 'none');
+  assert.match(elements.verificationTitle.textContent, /Shopee chặn API/);
+
+  // 2. When verification is verification (CAPTCHA):
+  vm.runInContext(`
+    renderStatus("awaiting_user_verification", {
+      verification: {
+        kind: "verification",
+        job_id: "job-captcha-1",
+        reason: "Slider CAPTCHA",
+        url: "https://shopee.vn/product/1/2",
+      }
+    });
+  `, context);
+
+  assert.equal(elements.btnResumeVerification.style.display, 'block');
+  assert.equal(elements.btnRecheckApi.style.display, 'none');
+  assert.match(elements.verificationTitle.textContent, /Yêu cầu giải CAPTCHA/);
 });

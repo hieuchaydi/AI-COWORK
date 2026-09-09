@@ -1229,6 +1229,229 @@ test('extractShopeeReviews traverses multi-scopes independently with deduplicati
   assert.ok(lastChk.scopes);
 });
 
+test('handleRecheckApi runs preflight and resumes job from checkpoint on HTTP 200', async () => {
+  const { context, frames, sockets } = await worker();
+  sockets[0].onopen();
+
+  let resumedEnqueuedJob = null;
+  context.chrome.tabs = {
+    get: async (id) => ({ id, windowId: 1, url: 'https://shopee.vn/product/111/222' }),
+    update: async () => ({ id: 1 }),
+    create: async () => {},
+  };
+  context.chrome.storage.local = {
+    get: async () => ({
+      'checkpoint_job-recheck-200': {
+        version: 2,
+        active_scope: 'comment',
+        next_offset: 20,
+        itemid: '222',
+        shopid: '111',
+      },
+    }),
+    set: async () => {},
+  };
+
+  vm.runInContext(`
+    findOrOpenShopeeTab = async () => ({ id: 55, url: "https://shopee.vn/product/111/222" });
+    preflightRatingsInTab = async () => ({
+      ok: true,
+      status: 200,
+      json: { data: { ratings: [{ id: "r1", comment: "good" }] } },
+    });
+    enqueueLegacyJob = (j) => { resumedEnqueuedJob = j; };
+  `, context);
+
+  const testJob = {
+    id: 'job-recheck-200',
+    url: 'https://shopee.vn/product/111/222',
+    _targetTabId: 55,
+  };
+
+  vm.runInContext(`
+    pendingVerificationJobs.set("job-recheck-200", ${JSON.stringify(testJob)});
+    updateState("api_blocked", { job_id: "job-recheck-200", kind: "api_blocked" });
+  `, context);
+
+  const result = await vm.runInContext('handleRecheckApi("job-recheck-200")', context);
+  assert.equal(result.ok, true);
+
+  // Verification resolved frame sent with recheck: true
+  const resolvedFrame = frames.find((f) => f.type === 'verification.resolved' && f.params?.job_id === 'job-recheck-200');
+  assert.ok(resolvedFrame, 'verification.resolved frame should be sent');
+  assert.equal(resolvedFrame.params.recheck, true);
+  assert.equal(resolvedFrame.params.checkpoint.active_scope, 'comment');
+
+  // Job was enqueued to resume
+  const enqueued = vm.runInContext('resumedEnqueuedJob', context);
+  assert.ok(enqueued, 'Job must be re-enqueued on successful recheck');
+  assert.equal(enqueued.id, 'job-recheck-200');
+  assert.equal(enqueued.retry, true);
+});
+
+test('handleRecheckApi rejects and does not resume when preflight returns 403', async () => {
+  const { context, frames, sockets } = await worker();
+  sockets[0].onopen();
+
+  vm.runInContext(`
+    findOrOpenShopeeTab = async () => ({ id: 66, url: "https://shopee.vn/product/111/222" });
+    preflightRatingsInTab = async () => ({
+      ok: false,
+      status: 403,
+      error: "Shopee reviews API access denied (HTTP 403)",
+      textSample: "403 Forbidden",
+    });
+    enqueueLegacyJob = (j) => { throw new Error("Should not enqueue!"); };
+  `, context);
+
+  const testJob = {
+    id: 'job-recheck-403',
+    url: 'https://shopee.vn/product/111/222',
+    _targetTabId: 66,
+  };
+
+  vm.runInContext(`
+    pendingVerificationJobs.set("job-recheck-403", ${JSON.stringify(testJob)});
+    updateState("api_blocked", { job_id: "job-recheck-403", kind: "api_blocked" });
+  `, context);
+
+  const result = await vm.runInContext('handleRecheckApi("job-recheck-403")', context);
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 403);
+  assert.ok(result.error.includes("403"));
+
+  // No resolved frame sent
+  const resolvedFrame = frames.find((f) => f.type === 'verification.resolved' && f.params?.job_id === 'job-recheck-403');
+  assert.equal(resolvedFrame, undefined);
+});
+
+test('verification watcher requires 2 consecutive absent checks before preflight and resolution', async () => {
+  const { context, frames, sockets } = await worker();
+  sockets[0].onopen();
+
+  let tabUpdateListener = null;
+
+  context.chrome.tabs = {
+    onUpdated: {
+      addListener: (fn) => { tabUpdateListener = fn; },
+      removeListener: () => { tabUpdateListener = null; },
+    },
+    get: async () => ({ id: 77 }),
+    update: async () => ({ id: 77 }),
+  };
+
+  context.detectCallCount = 0;
+  context.preflightCalled = false;
+  context.enqueued = false;
+
+  vm.runInContext(`
+    detectCaptchaInTab = async () => {
+      detectCallCount++;
+      return { detected: false };
+    };
+    preflightRatingsInTab = async () => {
+      preflightCalled = true;
+      return {
+        ok: true,
+        status: 200,
+        json: { data: { ratings: [{ id: "r1" }] } },
+      };
+    };
+    enqueueLegacyJob = () => { enqueued = true; };
+  `, context);
+
+  const details = {
+    job_id: 'job-watcher-consecutive',
+    tab_id: 77,
+    kind: 'verification',
+    checkpoint: { version: 2, next_offset: 10 },
+  };
+
+  vm.runInContext(`
+    pendingVerificationJobs.set("job-watcher-consecutive", { id: "job-watcher-consecutive", url: "https://shopee.vn/product/111/222" });
+    verificationInfo = { job_id: "job-watcher-consecutive", kind: "verification" };
+    startVerificationWatcher(${JSON.stringify(details)});
+  `, context);
+
+  // Trigger tabUpdateListener 1st time
+  const listener = tabUpdateListener || vm.runInContext('activeTabUpdateListener', context);
+  assert.ok(listener, 'tab update listener must be registered');
+
+  await listener(77, { status: 'complete' }, { url: 'https://shopee.vn/product/111/222' });
+  // 1st check: consecutiveAbsentCount = 1, preflight should NOT be called yet
+  assert.equal(vm.runInContext('preflightCalled', context), false);
+  assert.equal(vm.runInContext('enqueued', context), false);
+
+  // Trigger tabUpdateListener 2nd time
+  await listener(77, { status: 'complete' }, { url: 'https://shopee.vn/product/111/222' });
+  // 2nd check: consecutiveAbsentCount = 2, preflight should be called and resume job
+  assert.equal(vm.runInContext('preflightCalled', context), true);
+  assert.equal(vm.runInContext('enqueued', context), true);
+
+  vm.runInContext('stopVerificationWatcher()', context);
+});
+
+test('verification watcher transitions to api_blocked when challenge absent but preflight is 403', async () => {
+  const { context, frames, sockets } = await worker();
+  sockets[0].onopen();
+
+  let tabUpdateListener = null;
+  context.chrome.tabs = {
+    onUpdated: {
+      addListener: (fn) => { tabUpdateListener = fn; },
+      removeListener: () => { tabUpdateListener = null; },
+    },
+    get: async () => ({ id: 88 }),
+    update: async () => ({ id: 88 }),
+  };
+
+  vm.runInContext(`
+    detectCaptchaInTab = async () => ({ detected: false });
+    preflightRatingsInTab = async () => ({
+      ok: false,
+      status: 403,
+      error: "Shopee reviews API access denied (HTTP 403)",
+      textSample: "403 Forbidden",
+    });
+    enqueueLegacyJob = () => { throw new Error("Should not enqueue!"); };
+  `, context);
+
+  const details = {
+    job_id: 'job-watcher-to-blocked',
+    tab_id: 88,
+    kind: 'verification',
+    checkpoint: { version: 2, next_offset: 15 },
+  };
+
+  vm.runInContext(`
+    verificationInfo = { job_id: "job-watcher-to-blocked", kind: "verification" };
+    startVerificationWatcher(${JSON.stringify(details)});
+  `, context);
+
+  const listener = tabUpdateListener || vm.runInContext('activeTabUpdateListener', context);
+  assert.ok(listener, 'tab update listener must be registered');
+
+  // Trigger 2 consecutive checks
+  await listener(88, { status: 'complete' }, { url: 'https://shopee.vn/product/111/222' });
+  await listener(88, { status: 'complete' }, { url: 'https://shopee.vn/product/111/222' });
+
+  // Extension state should transition to api_blocked
+  const state = vm.runInContext('extensionState', context);
+  assert.equal(state, 'api_blocked');
+
+  // api_blocked frame sent
+  const blockedFrame = frames.find((f) => f.type === 'api_blocked' && f.params?.job_id === 'job-watcher-to-blocked');
+  assert.ok(blockedFrame, 'api_blocked frame must be sent');
+  assert.equal(blockedFrame.params.status, 403);
+
+  // Watcher must be stopped (no interval or listener)
+  const watcherInterval = vm.runInContext('verificationWatcherInterval', context);
+  assert.equal(watcherInterval, null);
+
+  vm.runInContext('stopVerificationWatcher()', context);
+});
+
+
 
 
 

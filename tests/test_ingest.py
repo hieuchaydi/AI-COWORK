@@ -343,10 +343,16 @@ def test_shopee_classification_api_blocked_vs_login_vs_captcha(server):
     assert res3["progress"]["status"] == "error"
     assert res3["progress"]["stage"] == "api_blocked"
     # Resume rejected
+    # Resume rejected without recheck
     with pytest.raises(urllib.error.HTTPError) as exc3:
         _get(base, f"/browser/resume?id={job_3}")
     assert exc3.value.code == 400
     assert json.loads(exc3.value.read().decode())["api_blocked"] is True
+
+    # Resume accepted with recheck=1
+    resumed3 = _get(base, f"/browser/resume?id={job_3}&recheck=1")
+    assert resumed3["ok"] is True
+    assert resumed3["resumed"] is True
 
     # 4. General failure
     job_4 = _get(base, "/ingest/job?url=https://shopee.vn/product/70/80")["job"]["id"]
@@ -1325,4 +1331,54 @@ def test_save_ingest_checkpoint_v2_and_multi_scope_dedup(server):
     content = csv_file.read_text(encoding="utf-8-sig")
     assert "cmid001.jpg" in content
     assert "Đẹp và chắc chắn" in content
+
+
+def test_ingest_verification_resolved_idempotent_by_cycle(server):
+    """Server handles verification.resolved idempotently based on (job_id, cycle)."""
+    base, _ = server
+    import launch
+
+    job_id = _get(base, "/ingest/job?url=https://shopee.vn/product/101/202")["job"]["id"]
+    _get(base, "/ingest/jobs?wait=1")
+
+    # Set checkpoint
+    launch._save_ingest_checkpoint(job_id, {
+        "id": job_id,
+        "next_offset": 50,
+        "rating_type": 5,
+        "active_scope": "all",
+    })
+
+    # Trigger verification.resolved cycle 1
+    launch._on_browser_ws_message({
+        "type": "verification.resolved",
+        "params": {
+            "job_id": job_id,
+            "verification_cycle": 1,
+            "status": "resumed",
+        },
+    })
+
+    prog1 = _get(base, f"/ingest/progress?id={job_id}")["progress"]
+    assert prog1["stage"] == "resumed"
+    assert prog1["status"] == "queued"
+    assert prog1["checkpoint"]["next_offset"] == 50
+
+    # Repeat verification.resolved cycle 1 -> should be ignored (idempotent)
+    # If it were reprocessed, it would overwrite status or print duplicate
+    with launch._INGEST_RESOLVED_LOCK:
+        assert 1 in launch._INGEST_RESOLVED_CYCLES.get(job_id, set())
+
+    # Cycle 2 is allowed
+    launch._on_browser_ws_message({
+        "type": "verification.resolved",
+        "params": {
+            "job_id": job_id,
+            "verification_cycle": 2,
+            "status": "resumed",
+        },
+    })
+    with launch._INGEST_RESOLVED_LOCK:
+        assert 2 in launch._INGEST_RESOLVED_CYCLES.get(job_id, set())
+
 

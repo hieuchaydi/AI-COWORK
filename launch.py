@@ -151,6 +151,8 @@ _INGEST_TRACES: dict[str, list[dict]] = {}
 _INGEST_TRACES_LOCK = threading.Lock()
 _INGEST_CHECKPOINTS: dict[str, dict] = {}
 _INGEST_CHECKPOINTS_LOCK = threading.Lock()
+_INGEST_RESOLVED_CYCLES: dict[str, set[int]] = {}
+_INGEST_RESOLVED_LOCK = threading.Lock()
 
 
 def _sanitize_trace_url(url: object) -> str | None:
@@ -881,7 +883,51 @@ def _on_browser_ws_message(message: dict) -> None:
             _update_ingest_progress(job_id, progress_patch)
             _persist_ingest_state()
     elif kind == "verification.resolved":
+        params = message.get("params") or {}
+        job_id = str(params.get("jobId") or params.get("job_id") or "")
+        cycle = params.get("verification_cycle") or 1
+        is_recheck = bool(params.get("recheck"))
+        if job_id and not is_recheck:
+            with _INGEST_RESOLVED_LOCK:
+                cycles = _INGEST_RESOLVED_CYCLES.setdefault(job_id, set())
+                if cycle in cycles:
+                    print(f"[launch] Duplicate verification.resolved for job {job_id} cycle {cycle}, ignoring", file=sys.stderr)
+                    return
+                cycles.add(cycle)
+
         _BROWSER_WS.transport.resume_verification()
+
+        if job_id:
+            with _INGEST_JOBS_LOCK:
+                _INGEST_RESULTS.pop(job_id, None)
+            with _INGEST_CHECKPOINTS_LOCK:
+                raw_chk = _INGEST_CHECKPOINTS.get(job_id) or {}
+                chk_snapshot = {
+                    "version": raw_chk.get("version", 2),
+                    "active_scope": raw_chk.get("active_scope", "all"),
+                    "scopes": raw_chk.get("scopes", {}),
+                    "next_offset": raw_chk.get("next_offset", 0),
+                    "rating_type": raw_chk.get("rating_type", 0),
+                    "rows_count": len(raw_chk.get("rows", [])),
+                    "itemid": raw_chk.get("itemid"),
+                    "shopid": raw_chk.get("shopid"),
+                    "total": raw_chk.get("total"),
+                    "ui_reference": raw_chk.get("ui_reference"),
+                } if raw_chk else None
+            _update_ingest_progress(
+                job_id,
+                {
+                    "status": "queued",
+                    "stage": "resumed",
+                    "verification_required": False,
+                    "api_blocked": False,
+                    "message": "Đã xác minh và preflight thành công, đang tiếp tục cào từ checkpoint...",
+                    "percent": 5,
+                    "error": None,
+                    "checkpoint": chk_snapshot,
+                },
+            )
+            _persist_ingest_state()
     elif kind in ("api_blocked", "api.blocked"):
         params = message.get("params") or {}
         job_id = str(params.get("job_id") or params.get("jobId") or "")
@@ -2655,12 +2701,17 @@ class _HelperHandler(BaseHTTPRequestHandler):
                     })
                     return
                 if target_p.get("stage") == "api_blocked" or target_p.get("api_blocked"):
-                    self._json(400, {
-                        "ok": False,
-                        "error": "Không thể resume verification: Shopee đã chặn truy cập API (HTTP 403 / API Blocked).",
-                        "api_blocked": True,
-                    })
-                    return
+                    is_recheck = (
+                        self.path.find("recheck=1") != -1
+                        or self.path.find("force=1") != -1
+                    )
+                    if not is_recheck:
+                        self._json(400, {
+                            "ok": False,
+                            "error": "Không thể tự động resume verification: Shopee đã chặn truy cập API (HTTP 403 / API Blocked). Vui lòng bấm 'Kiểm tra lại' trên popup để kiểm tra kết nối.",
+                            "api_blocked": True,
+                        })
+                        return
 
             msg = {
                 "v": 1,
@@ -3409,12 +3460,18 @@ class _HelperHandler(BaseHTTPRequestHandler):
                     })
                     return
                 if target_p.get("stage") == "api_blocked" or target_p.get("api_blocked"):
-                    _reply(400, {
-                        "ok": False,
-                        "error": "Không thể resume verification: Shopee đã chặn truy cập API (HTTP 403 / API Blocked).",
-                        "api_blocked": True,
-                    })
-                    return
+                    is_recheck = (
+                        self.path.find("recheck=1") != -1
+                        or self.path.find("force=1") != -1
+                        or (isinstance(body, dict) and (body.get("recheck") or body.get("force")))
+                    )
+                    if not is_recheck:
+                        _reply(400, {
+                            "ok": False,
+                            "error": "Không thể tự động resume verification: Shopee đã chặn truy cập API (HTTP 403 / API Blocked). Vui lòng bấm 'Kiểm tra lại' trên popup để kiểm tra kết nối.",
+                            "api_blocked": True,
+                        })
+                        return
 
             msg = {
                 "v": 1,
