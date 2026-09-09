@@ -32,6 +32,7 @@ const btnDismissResult = document.getElementById("btnDismissResult");
 
 let currentVerification = null;
 let currentJobId = null;
+let dismissedResultId = "";
 
 function storageGet(keys) {
   return new Promise((resolve) => chrome.storage.local.get(keys, resolve));
@@ -81,8 +82,13 @@ function setResultLink(element, path, wsUrl) {
   return Boolean(url);
 }
 
+function completedResultId(result) {
+  if (!result) return "";
+  return String(result.job || result.job_id || result.csv || result.completedAt || "");
+}
+
 function renderCompletedResult(result, wsUrl) {
-  if (!result || !result.count) {
+  if (!result || !result.count || completedResultId(result) === dismissedResultId) {
     resultSection.style.display = "none";
     return;
   }
@@ -280,6 +286,7 @@ async function loadConfig() {
     "currentJob",
     "lastConnectionError",
     "lastCompletedResult",
+    "dismissedResultId",
   ]);
   const runtime = await runtimeStatus();
   const gateway = await readGatewayStatus(res.gatewayUrl);
@@ -293,6 +300,7 @@ async function loadConfig() {
   const verification = runtime?.verificationInfo ?? res.verificationInfo;
   const currentJob = runtime?.currentJob ?? res.currentJob;
   const completedResult = runtime?.lastCompletedResult ?? res.lastCompletedResult;
+  dismissedResultId = res.dismissedResultId || dismissedResultId;
   const connectionError = document.getElementById("connectionError");
   if (state === "client_conflict") {
     const ownerId = runtime?.connectionConflict?.owner?.clientId;
@@ -366,7 +374,11 @@ btnDisconnect.addEventListener("click", () => changeConnection("disconnect"));
 btnExportSnapshot.addEventListener("click", exportSnapshot);
 btnDismissResult.addEventListener("click", async () => {
   // Only dismisses the notification card. The generated CSV/ZIP files remain intact.
+  const result = (await runtimeStatus())?.lastCompletedResult
+    || (await storageGet(["lastCompletedResult"])).lastCompletedResult;
+  dismissedResultId = completedResultId(result);
   resultSection.style.display = "none";
+  await chrome.storage.local.set({ dismissedResultId });
   await chrome.runtime.sendMessage({ action: "clearCompletedResult" });
 });
 
