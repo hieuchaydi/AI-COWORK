@@ -790,6 +790,80 @@ test('detectCaptchaInTab flags verification URLs and captures evidence', async (
   assert.equal(evidence, 'data:image/png;base64,mocked_traffic_captcha');
 });
 
+test('runJob handles api_blocked: sends websocket event, focuses tab, saves state and does not retry', async () => {
+  const { context, frames, sockets, getMessageListener } = await worker();
+  sockets[0].onopen();
+
+  const updatedTabs = [];
+  const updatedWindows = [];
+
+  context.chrome.storage.local = {
+    get: async (keys) => {
+      if (Array.isArray(keys) && keys.includes('checkpoint_job-403-blocked')) {
+        return {
+          'checkpoint_job-403-blocked': {
+            next_offset: 40,
+            rating_type: 5,
+            rows_count: 40,
+          },
+        };
+      }
+      return {};
+    },
+    set: async () => {},
+  };
+  context.chrome.tabs = {
+    update: async (tabId, updateProps) => {
+      updatedTabs.push({ tabId, updateProps });
+      return { id: tabId, windowId: 99 };
+    },
+    create: async () => {},
+  };
+  context.chrome.windows = {
+    update: async (windowId, updateProps) => {
+      updatedWindows.push({ windowId, updateProps });
+      return { id: windowId };
+    },
+  };
+  vm.runInContext(`
+    extractShopeeReviews = async () => {
+      const err = new Error('Shopee reviews API access denied: HTTP 403 / API Blocked');
+      err.failureKind = 'api_blocked';
+      throw err;
+    };
+    sendIngestRequest = async () => ({ ok: true });
+  `, context);
+
+  const job = {
+    id: 'job-403-blocked',
+    url: 'https://shopee.vn/product/111/222',
+    _targetTabId: 77,
+  };
+
+  await vm.runInContext(`runJob(${JSON.stringify(job)})`, context);
+
+  // Check state updated to api_blocked
+  const state = vm.runInContext('extensionState', context);
+  assert.equal(state, 'api_blocked');
+  const verifInfo = vm.runInContext('verificationInfo', context);
+  assert.equal(verifInfo?.kind, 'api_blocked');
+
+  // Check WebSocket frame sent
+  const blockedFrame = frames.find((f) => f.type === 'api_blocked');
+  assert.ok(blockedFrame, 'api_blocked WebSocket frame should be sent');
+  assert.equal(blockedFrame.params.job_id, 'job-403-blocked');
+  assert.equal(blockedFrame.params.status, 403);
+  assert.equal(blockedFrame.params.checkpoint.next_offset, 40);
+
+  // Check tab focused
+  assert.equal(updatedTabs.length, 1);
+  assert.equal(updatedTabs[0].tabId, 77);
+  assert.equal(updatedTabs[0].updateProps.active, true);
+  assert.equal(updatedWindows.length, 1);
+  assert.equal(updatedWindows[0].windowId, 99);
+  assert.equal(updatedWindows[0].updateProps.focused, true);
+});
+
 
 
 

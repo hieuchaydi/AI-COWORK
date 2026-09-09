@@ -935,7 +935,7 @@ async function extractShopeeReviews(job, progress) {
 
     if (!fetchRes.ok) {
       const failureKind = classifyShopeeFailure(fetchRes);
-      if (failureKind === "verification") {
+      if (failureKind === "verification" || failureKind === "api_blocked") {
         try {
           await chrome.storage.local.set({
             [`checkpoint_${job.id}`]: {
@@ -959,6 +959,21 @@ async function extractShopeeReviews(job, progress) {
     const json = fetchRes.json;
     if (json && (json.error || json.is_login === false || (json.data && json.data.is_login === false))) {
       const failureKind = classifyShopeeFailure(fetchRes);
+      if (failureKind === "verification" || failureKind === "api_blocked") {
+        try {
+          await chrome.storage.local.set({
+            [`checkpoint_${job.id}`]: {
+              next_offset: offset,
+              rating_type: ratingType,
+              rows_count: durableRowsCount,
+              itemid,
+              shopid,
+              total,
+              updated_at: Date.now(),
+            },
+          });
+        } catch {}
+      }
       const err = new Error(formatShopeeFailure(fetchRes));
       err.failureKind = failureKind;
       err.fetchRes = fetchRes;
@@ -1249,21 +1264,68 @@ async function runJob(job) {
       });
     } else if (failureKind === "api_blocked") {
       // 3. api_blocked: Shopee chặn API (HTTP 403) nhưng KHÔNG PHẢI CAPTCHA và KHÔNG PHẢI login
+      let checkpoint = null;
+      try {
+        const stored = await chrome.storage.local.get([`checkpoint_${job.id}`]);
+        checkpoint = stored[`checkpoint_${job.id}`] || null;
+      } catch {}
+
+      // 3a. Gửi WebSocket event api_blocked lên server để lưu checkpoint và log
+      if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+        bridgeSend({
+          v: 1,
+          type: "api_blocked",
+          id: "blocked-" + Date.now(),
+          params: {
+            job_id: job.id,
+            url: job.url,
+            tab_id: job._targetTabId || null,
+            reason: message,
+            status: 403,
+            checkpoint,
+          },
+        });
+      }
+
+      // 3b. Focus tab Shopee hiện tại hoặc mở trang trạng thái nội bộ (Human In The Loop)
+      const targetTabId = job._targetTabId;
+      let tabFocused = false;
+      if (targetTabId && chrome.tabs) {
+        try {
+          const tab = await chrome.tabs.update(targetTabId, { active: true });
+          if (tab && tab.windowId && chrome.windows) {
+            await chrome.windows.update(tab.windowId, { focused: true });
+          }
+          tabFocused = true;
+        } catch (tabErr) {
+          console.warn("[bridge] Could not focus tab for api_blocked:", tabErr?.message);
+        }
+      }
+      if (!tabFocused && chrome.tabs?.create) {
+        try {
+          const statusUrl = `http://127.0.0.1:8766/ingest?job=${encodeURIComponent(job.id)}`;
+          await chrome.tabs.create({ url: statusUrl });
+        } catch {}
+      }
+
+      // 3c. Cập nhật state nội bộ và dừng job, không retry tự động
       updateState("api_blocked", {
         job_id: job.id,
         url: job.url,
         tab_id: job._targetTabId || null,
         reason: message,
         kind: "api_blocked",
+        checkpoint,
       });
       await progress({
         status: "error",
         stage: "api_blocked",
-        message: "Shopee chặn API đánh giá (HTTP 403 / API Blocked). Không có CAPTCHA hoặc yêu cầu đăng nhập.",
+        message: "Shopee chặn API đánh giá (HTTP 403 / API Blocked). Job đã dừng an toàn, không retry tự động.",
         error: message,
         api_blocked: true,
         verification_required: false,
         login_required: false,
+        checkpoint,
         percent: 100,
       });
       await uploadIngestResult({
@@ -1272,6 +1334,7 @@ async function runJob(job) {
         api_blocked: true,
         verification_required: false,
         login_required: false,
+        checkpoint,
         stage: "api_blocked",
       });
     } else {

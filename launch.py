@@ -822,6 +822,49 @@ def _on_browser_ws_message(message: dict) -> None:
             _persist_ingest_state()
     elif kind == "verification.resolved":
         _BROWSER_WS.transport.resume_verification()
+    elif kind in ("api_blocked", "api.blocked"):
+        params = message.get("params") or {}
+        job_id = str(params.get("job_id") or params.get("jobId") or "")
+        reason = str(params.get("reason") or "Shopee reviews API access denied (HTTP 403 / API Blocked)")
+        checkpoint = params.get("checkpoint")
+        print(f"[launch] ⚠️ Shopee API Blocked (HTTP 403) for job {job_id}: {reason}", file=sys.stderr)
+        if hasattr(_BROWSER_WS.transport, "block_api"):
+            _BROWSER_WS.transport.block_api(reason, params)
+        if checkpoint and isinstance(checkpoint, dict) and job_id:
+            try:
+                _save_ingest_checkpoint(job_id, checkpoint)
+            except Exception as exc:
+                print(f"[launch] Failed to save checkpoint for api_blocked job {job_id}: {exc}", file=sys.stderr)
+        if job_id:
+            result = {
+                "ok": False,
+                "error": reason,
+                "status": "error",
+                "stage": "api_blocked",
+                "api_blocked": True,
+                "verification_required": False,
+                "login_required": False,
+                "retryable": False,
+            }
+            if checkpoint:
+                result["checkpoint"] = checkpoint
+            _INGEST_RESULTS[job_id] = result
+            with _INGEST_JOBS_LOCK:
+                _INGEST_INFLIGHT.pop(job_id, None)
+            progress_patch = {
+                "status": "error",
+                "stage": "api_blocked",
+                "api_blocked": True,
+                "verification_required": False,
+                "login_required": False,
+                "message": reason,
+                "error": reason,
+                "percent": 100,
+            }
+            if checkpoint:
+                progress_patch["checkpoint"] = checkpoint
+            _update_ingest_progress(job_id, progress_patch)
+            _persist_ingest_state()
 
 
 _INGEST_RPC = IngestRPC(
@@ -3167,9 +3210,21 @@ class _HelperHandler(BaseHTTPRequestHandler):
                 token = authorization[7:].strip()
             origin = self.headers.get("Origin", "")
             if origin and not validate_extension_origin(origin, _BROWSER_WS.allowlisted_extension_ids)[0]:
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if 0 < length <= MAX_MESSAGE_BYTES:
+                        self.rfile.read(length)
+                except Exception:
+                    pass
                 _reply(403, {"ok": False, "error": "Origin forbidden"})
                 return
             if not token or not (verify_pairing_token(token, _BROWSER_WS.token) or verify_pairing_token(token, API_TOKEN)):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if 0 < length <= MAX_MESSAGE_BYTES:
+                        self.rfile.read(length)
+                except Exception:
+                    pass
                 _reply(401, {"ok": False, "error": "Valid bridge or API token required"})
                 return
             try:

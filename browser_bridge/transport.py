@@ -27,6 +27,7 @@ class ExtensionState:
     BUSY = "busy"
     AWAITING_USER_VERIFICATION = "awaiting_user_verification"
     PERMISSION_REQUIRED = "permission_required"
+    API_BLOCKED = "api_blocked"
 
 
 class BrowserTransport(ABC):
@@ -172,6 +173,10 @@ class WebSocketTransport(BrowserTransport):
         with self._lock:
             self.set_state(ExtensionState.AWAITING_USER_VERIFICATION, {"url": url, "reason": reason})
 
+    def block_api(self, reason: str = "", details: Optional[Dict[str, Any]] = None) -> None:
+        with self._lock:
+            self.set_state(ExtensionState.API_BLOCKED, {"reason": reason, **(details or {})})
+
     def is_paused(self) -> bool:
         with self._lock:
             return self._state == ExtensionState.AWAITING_USER_VERIFICATION
@@ -226,6 +231,21 @@ class WebSocketTransport(BrowserTransport):
 
         if env.type == MessageType.VERIFICATION_RESOLVED:
             self.resume_verification()
+            return
+
+        if env.type == MessageType.API_BLOCKED:
+            details = env.params or env.progress or {}
+            reason = str(details.get("reason") or "Shopee reviews API access denied (HTTP 403 / API Blocked)")
+            self.block_api(reason, details)
+            err = BridgeError.create(
+                ErrorCode.API_BLOCKED,
+                f"Shopee reviews API access denied: {reason}",
+                retryable=False,
+                details=details,
+            )
+            if pending:
+                pending.error = err
+                pending.event.set()
             return
 
         if env.type == MessageType.TAB_STATE:

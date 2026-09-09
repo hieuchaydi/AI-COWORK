@@ -28,6 +28,7 @@ class MessageType(str, Enum):
     TAB_STATE = "tab.state"
     VERIFICATION_REQUIRED = "verification.required"
     VERIFICATION_RESOLVED = "verification.resolved"
+    API_BLOCKED = "api_blocked"
 
 
 class ErrorCode(str, Enum):
@@ -43,6 +44,7 @@ class ErrorCode(str, Enum):
     SAME_ORIGIN_VIOLATION = "SAME_ORIGIN_VIOLATION"
     VERIFICATION_REQUIRED = "VERIFICATION_REQUIRED"
     CLIENT_ALREADY_CONNECTED = "CLIENT_ALREADY_CONNECTED"
+    API_BLOCKED = "API_BLOCKED"
     INTERNAL_ERROR = "INTERNAL_ERROR"
 
 

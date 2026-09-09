@@ -262,7 +262,6 @@ def test_shopee_full_workflow_from_queue_to_results(setup_shopee_environment):
                 "uploadId": upload_id,
             },
         })
-        comp_reply = recv_reply_matching(client, req_id_complete, timeout=5.0)
         comp_reply = recv_reply_matching(client, req_id_complete, timeout=15.0)
         assert comp_reply["type"] == "ingest.reply"
         assert comp_reply["id"] == req_id_complete
@@ -406,7 +405,12 @@ def test_shopee_workflow_verification_required_and_resume(setup_shopee_environme
                 "reason": "Shopee traffic verification required",
             },
         })
-        time.sleep(0.1)
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            progress = launch._INGEST_PROGRESS.get(job_id, {})
+            if progress.get("status") == "awaiting_user_verification":
+                break
+            time.sleep(0.02)
 
         # Server pauses for human verification
         progress = launch._INGEST_PROGRESS.get(job_id, {})

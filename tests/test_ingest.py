@@ -1182,3 +1182,56 @@ def test_ingest_resume_and_evidence_capture(server):
     assert updated["progress"]["status"] == "queued"
     assert updated["progress"]["stage"] == "resumed"
 
+
+def test_on_browser_ws_message_api_blocked_saves_checkpoint_and_log(server, monkeypatch):
+    base, outputs = server
+    import launch
+
+    # 1. Enqueue job
+    job_res = _get(base, "/ingest/job?url=https://shopee.vn/product/777/888")
+    job_id = job_res["job"]["id"]
+    _get(base, "/ingest/jobs?wait=1")
+
+    # 2. Simulate incoming WebSocket message of type api_blocked
+    checkpoint_data = {
+        "next_offset": 60,
+        "rating_type": 5,
+        "rows_count": 60,
+        "itemid": "888",
+        "shopid": "777",
+    }
+    msg = {
+        "v": 1,
+        "type": "api_blocked",
+        "id": "blocked-777",
+        "params": {
+            "job_id": job_id,
+            "reason": "Shopee reviews API access denied (HTTP 403 / API Blocked)",
+            "status": 403,
+            "checkpoint": checkpoint_data,
+        },
+    }
+    launch._on_browser_ws_message(msg)
+
+    # 3. Verify server state: result and progress
+    result_resp = _get(base, f"/ingest/result?id={job_id}")
+    assert result_resp["ok"] is True
+    res_data = result_resp["result"]
+    assert res_data["ok"] is False
+    assert res_data["api_blocked"] is True
+    assert res_data["retryable"] is False
+    assert res_data["stage"] == "api_blocked"
+
+    prog = result_resp["progress"]
+    assert prog["status"] == "error"
+    assert prog["stage"] == "api_blocked"
+    assert prog["api_blocked"] is True
+    assert prog["checkpoint"]["next_offset"] == 60
+
+    # 4. Verify in-memory checkpoint has been preserved
+    with launch._INGEST_CHECKPOINTS_LOCK:
+        chk = launch._INGEST_CHECKPOINTS.get(job_id)
+        assert chk is not None
+        assert chk["next_offset"] == 60
+        assert chk["rating_type"] == 5
+

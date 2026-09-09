@@ -722,3 +722,23 @@ def test_captcha_detector_match_template_grayscale(tmp_path):
     assert sim_diff < 0.6
 
 
+def test_transport_api_blocked_state_and_envelope():
+    transport = WebSocketTransport(send_fn=lambda env: True, is_connected_fn=lambda: True)
+    transport.set_state(ExtensionState.CONNECTED)
+    assert transport.get_state() == ExtensionState.CONNECTED
+
+    transport.block_api(reason="Shopee 403 Forbidden", details={"status": 403})
+    assert transport.get_state() == ExtensionState.API_BLOCKED
+
+    # Test inbound envelope MessageType.API_BLOCKED
+    envelope = {
+        "v": 1,
+        "type": "api_blocked",
+        "id": "blocked-123",
+        "params": {"reason": "Rate limited 403", "status": 403},
+    }
+    transport.handle_inbound_envelope(envelope)
+    assert transport.get_state() == ExtensionState.API_BLOCKED
+
+
+
