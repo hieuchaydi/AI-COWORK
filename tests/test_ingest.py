@@ -1140,3 +1140,45 @@ def test_e2e_ingest_job_to_csv_media_and_zip_complete(server, monkeypatch):
     assert report_file.is_file()
 
 
+def test_ingest_resume_and_evidence_capture(server):
+    base, outputs = server
+    # 1. Enqueue job
+    job = _get(base, "/ingest/job?url=https://shopee.vn/product/300/400")["job"]["id"]
+    _get(base, "/ingest/jobs?wait=1")
+
+    # 2. Report verification required with evidence_screenshot
+    sample_b64 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    status, post_res = _post(
+        base,
+        "/ingest",
+        {
+            "job": job,
+            "error": "Shopee challenge at https://shopee.vn/verify/traffic",
+            "evidence_screenshot": sample_b64,
+        },
+    )
+    assert status == 200
+    assert post_res["ok"] is False
+    assert post_res["verification_required"] is True
+
+    # 3. Check result via /ingest/result includes evidence metadata
+    res = _get(base, f"/ingest/result?id={job}")
+    assert res["ok"] is True
+    assert res["progress"]["status"] == "awaiting_user_verification"
+    assert res["progress"]["stage"] == "verification_required"
+    assert "evidence_file" in res["progress"]
+    assert "evidence_url" in res["progress"]
+    evidence_filename = Path(res["progress"]["evidence_file"]).name
+    evidence_path = outputs / "evidence" / evidence_filename
+    assert evidence_path.is_file()
+
+    # 4. Resume job using the alias /ingest/resume?id=...
+    resume_res = _get(base, f"/ingest/resume?id={job}")
+    assert resume_res["ok"] is True
+    assert resume_res["resumed"] is True
+
+    # 5. Check status is now resumed and available to workers
+    updated = _get(base, f"/ingest/result?id={job}")
+    assert updated["progress"]["status"] == "queued"
+    assert updated["progress"]["stage"] == "resumed"
+

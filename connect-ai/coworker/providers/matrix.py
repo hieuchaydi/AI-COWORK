@@ -427,6 +427,7 @@ AION_ALIASES: dict[str, str] = {
 
 
 def resolve_model_alias(model: str) -> str:
+    """Map human/short aliases to canonical model IDs (e.g. Cohere versioned IDs)."""
     """Map human/short aliases to canonical model IDs (e.g. Cohere versioned IDs, AionLabs aliases)."""
     if model in AION_ALIASES:
         return AION_ALIASES[model]

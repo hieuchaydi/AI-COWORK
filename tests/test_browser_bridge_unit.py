@@ -27,8 +27,14 @@ from browser_bridge.actions import (
     FetchSameOriginParams,
     PageNavigateParams,
     PageScrollParams,
+    PageScreenshotParams,
     TabOpenParams,
     validate_action_params,
+)
+from browser_bridge.captcha_detector import (
+    is_captcha_detected,
+    save_evidence_screenshot,
+    match_template_grayscale,
 )
 from browser_bridge.protocol import (
     BridgeError,
@@ -641,3 +647,78 @@ def test_http_polling_accepts_helper_nested_job_response():
     ok, result, error = transport.execute_command("shopee-reviews", {"url": "https://shopee.vn/product/1/2"})
     assert ok and error is None
     assert result["id"] == "nested-job"
+
+
+# ── Page Screenshot & Captcha Detector Tests ─────────────────────────────
+
+def test_action_page_screenshot_params():
+    params = validate_action_params(ActionName.PAGE_SCREENSHOT.value, {})
+    assert isinstance(params, PageScreenshotParams)
+    assert params.format == "png"
+    assert params.quality is None
+
+    params_custom = validate_action_params(
+        ActionName.PAGE_SCREENSHOT.value,
+        {"format": "jpeg", "quality": 80, "tab_id": 42},
+    )
+    assert params_custom.format == "jpeg"
+    assert params_custom.quality == 80
+    assert params_custom.tabId == 42
+
+    with pytest.raises(Exception):
+        validate_action_params(ActionName.PAGE_SCREENSHOT.value, {"format": "bmp"})
+
+
+def test_captcha_detector_is_captcha_detected():
+    assert is_captcha_detected("https://shopee.vn/verify/traffic")["detected"] is True
+    assert is_captcha_detected("https://shopee.vn/verify/slider")["detected"] is True
+    assert is_captcha_detected("https://banhang.shopee.vn/account/verify")["detected"] is True
+    assert is_captcha_detected("https://shopee.vn/product/123/456")["detected"] is False
+
+    assert is_captcha_detected("https://shopee.vn/product/123/456", text_sample="Vui lòng xác minh để tiếp tục")["detected"] is True
+    assert is_captcha_detected("https://shopee.vn/product/123/456", text_sample="Đánh giá sản phẩm tuyệt vời")["detected"] is False
+
+    assert is_captcha_detected("https://shopee.vn/product/123/456", html_sample="""<div class="geetest_holder"></div>""")["detected"] is True
+    assert is_captcha_detected("https://shopee.vn/product/123/456", html_sample="""<div>Review content</div>""")["detected"] is False
+
+
+def test_captcha_detector_save_evidence_screenshot(tmp_path):
+    # 1x1 transparent PNG base64
+    sample_b64 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    res = save_evidence_screenshot(
+        job_id="test-job-999",
+        screenshot_data=sample_b64,
+        output_dir=tmp_path,
+        server_port=8766,
+    )
+    assert res["evidence_file"] is not None
+    assert Path(res["evidence_file"]).exists()
+    assert res["size_bytes"] > 0
+    assert res["evidence_url"].startswith("http://127.0.0.1:8766/outputs/evidence/test-job-999_captcha_")
+    assert res["evidence_url"].endswith(".png")
+
+
+def test_captcha_detector_match_template_grayscale(tmp_path):
+    from PIL import Image
+
+    img1 = Image.new("L", (100, 100), color=128)
+    p1 = tmp_path / "img1.png"
+    img1.save(p1)
+
+    img2 = Image.new("L", (100, 100), color=128)
+    p2 = tmp_path / "img2.png"
+    img2.save(p2)
+
+    img3 = Image.new("L", (100, 100), color=0)
+    p3 = tmp_path / "img3.png"
+    img3.save(p3)
+
+    is_match, sim_identical = match_template_grayscale(p1, p2)
+    assert is_match is True
+    assert sim_identical > 0.99
+
+    is_match_diff, sim_diff = match_template_grayscale(p1, p3)
+    assert is_match_diff is False
+    assert sim_diff < 0.6
+
+

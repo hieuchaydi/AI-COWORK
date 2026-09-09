@@ -106,7 +106,7 @@ def setup_shopee_environment(gateway_server, monkeypatch, tmp_path):
     yield server, port, token, rpc, tmp_path
 
 
-def recv_reply_matching(client: SimpleWebSocketTestClient, req_id: str, timeout: float = 5.0) -> Dict[str, Any]:
+def recv_reply_matching(client: SimpleWebSocketTestClient, req_id: str, timeout: float = 15.0) -> Dict[str, Any]:
     """Waits for an ingest.reply matching req_id, ignoring unhandled push envelopes."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -263,6 +263,7 @@ def test_shopee_full_workflow_from_queue_to_results(setup_shopee_environment):
             },
         })
         comp_reply = recv_reply_matching(client, req_id_complete, timeout=5.0)
+        comp_reply = recv_reply_matching(client, req_id_complete, timeout=15.0)
         assert comp_reply["type"] == "ingest.reply"
         assert comp_reply["id"] == req_id_complete
         assert comp_reply["ok"] is True

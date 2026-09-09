@@ -754,4 +754,42 @@ test('reviewFingerprint deduplicates the same review across rating segments', as
   assert.ok(keys[0].length > 0);
 });
 
+test('handleAction page.screenshot returns captured image data', async () => {
+  const { context } = await worker();
+  context.setTimeout = (fn) => { queueMicrotask(fn); return 1; };
+  context.chrome.tabs = {
+    get: async (id) => ({ id, windowId: 1, active: true, url: 'https://shopee.vn/test' }),
+    query: async () => [{ id: 10, windowId: 1, active: true, url: 'https://shopee.vn/test' }],
+    captureVisibleTab: async (winId, opts) => 'data:image/png;base64,evidence123',
+    update: async () => {},
+  };
+  context.chrome.windows = { update: async () => {} };
+  const res = await vm.runInContext('handleAction("page.screenshot", { format: "png", tabId: 10 })', context);
+  assert.equal(res.status, 'ok');
+  assert.equal(res.dataUrl, 'data:image/png;base64,evidence123');
+  assert.equal(res.tabId, 10);
+});
+
+test('detectCaptchaInTab flags verification URLs and captures evidence', async () => {
+  const { context } = await worker();
+  context.setTimeout = (fn) => { queueMicrotask(fn); return 1; };
+  context.chrome.tabs = {
+    get: async (id) => ({ id, windowId: 1, url: 'https://shopee.vn/verify/traffic' }),
+    captureVisibleTab: async () => 'data:image/png;base64,mocked_traffic_captcha',
+    update: async () => {},
+  };
+  context.chrome.windows = { update: async () => {} };
+  context.chrome.scripting = {
+    executeScript: async () => [{ result: { detected: true, type: 'url', details: 'https://shopee.vn/verify/traffic' } }],
+  };
+  const detection = await vm.runInContext('detectCaptchaInTab(101)', context);
+  assert.equal(detection.detected, true);
+  assert.equal(detection.type, 'url');
+
+  const evidence = await vm.runInContext('captureTabEvidence(101)', context);
+  assert.equal(evidence, 'data:image/png;base64,mocked_traffic_captcha');
+});
+
+
+
 

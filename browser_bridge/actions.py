@@ -29,6 +29,7 @@ class ActionName(str, Enum):
     INPUT_TYPE = "input.type"
     INPUT_SELECT = "input.select"
     PAGE_SNAPSHOT = "page.snapshot"
+    PAGE_SCREENSHOT = "page.screenshot"
     FETCH_SAME_ORIGIN = "fetch.sameOrigin"
     JOB_CANCEL = "job.cancel"
     PAGE_SCROLL = "page.scroll"
@@ -56,6 +57,7 @@ DISALLOWED_FETCH_HEADERS: Set[str] = {
 
 class BaseActionParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
 
 class TabOpenParams(BaseActionParams):
@@ -150,6 +152,20 @@ class PageSnapshotParams(BaseActionParams):
         return v
 
 
+class PageScreenshotParams(BaseActionParams):
+    tabId: Optional[int] = Field(default=None, description="Target tab ID; active tab if omitted")
+    tabId: Optional[int] = Field(default=None, alias="tab_id", description="Target tab ID; active tab if omitted")
+    format: str = Field(default="png", description="png | jpeg")
+    quality: Optional[int] = Field(default=None, ge=0, le=100, description="Quality 0-100 (for jpeg)")
+
+    @field_validator("format")
+    @classmethod
+    def validate_format(cls, v: str) -> str:
+        if v not in {"png", "jpeg"}:
+            raise ValueError(f"Invalid screenshot format '{v}'. Only 'png' and 'jpeg' are supported")
+        return v
+
+
 class FetchSameOriginParams(BaseActionParams):
     pathOrUrl: str = Field(..., description="Relative path or absolute same-origin URL")
     tabId: Optional[int] = Field(default=None, description="Target tab ID providing origin and cookies")
@@ -223,6 +239,8 @@ def validate_action_params(action: str, params: Dict[str, Any]) -> BaseModel:
         return InputSelectParams(**params)
     elif action == ActionName.PAGE_SNAPSHOT:
         return PageSnapshotParams(**params)
+    elif action == ActionName.PAGE_SCREENSHOT:
+        return PageScreenshotParams(**params)
     elif action == ActionName.FETCH_SAME_ORIGIN:
         return FetchSameOriginParams(**params)
     elif action == ActionName.JOB_CANCEL:

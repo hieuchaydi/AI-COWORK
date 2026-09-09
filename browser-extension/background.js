@@ -934,8 +934,24 @@ async function extractShopeeReviews(job, progress) {
     });
 
     if (!fetchRes.ok) {
+      const failureKind = classifyShopeeFailure(fetchRes);
+      if (failureKind === "verification") {
+        try {
+          await chrome.storage.local.set({
+            [`checkpoint_${job.id}`]: {
+              next_offset: offset,
+              rating_type: ratingType,
+              rows_count: durableRowsCount,
+              itemid,
+              shopid,
+              total,
+              updated_at: Date.now(),
+            },
+          });
+        } catch {}
+      }
       const err = new Error(fetchRes.error ? `Shopee API request failed: ${fetchRes.error}` : formatShopeeFailure(fetchRes));
-      err.failureKind = classifyShopeeFailure(fetchRes);
+      err.failureKind = failureKind;
       err.fetchRes = fetchRes;
       throw err;
     }
@@ -1202,12 +1218,14 @@ async function runJob(job) {
       // 2. traffic_verification / CAPTCHA: Hỗ trợ pause/resume verification
       lastVerificationJob = job;
       pendingVerificationJobs.set(job.id, job);
-      triggerVerificationRequired({
+      const evidence = await captureTabEvidence(job._targetTabId || null);
+      await triggerVerificationRequired({
         job_id: job.id,
         url: job.url,
         tab_id: job._targetTabId || null,
         reason: message,
         kind: "verification",
+        evidence_screenshot: evidence,
       });
       await progress({
         status: "awaiting_user_verification",
@@ -1217,6 +1235,7 @@ async function runJob(job) {
         verification_required: true,
         login_required: false,
         api_blocked: false,
+        evidence_screenshot: evidence,
         percent: 100,
       });
       await uploadIngestResult({
@@ -1225,6 +1244,7 @@ async function runJob(job) {
         verification_required: true,
         login_required: false,
         api_blocked: false,
+        evidence_screenshot: evidence,
         stage: "verification_required",
       });
     } else if (failureKind === "api_blocked") {
@@ -1289,12 +1309,155 @@ async function runJob(job) {
   }
 }
 
-// ── Verification Challenge Trigger ──────────────────────────────────────────
+// ── Verification Challenge Detection, Evidence & Handover ────────────────────
 const notifiedVerificationJobIds = new Set();
+let verificationWatcherInterval = null;
+let activeTabUpdateListener = null;
 
-function triggerVerificationRequired(details) {
+async function captureTabEvidence(tabId) {
+  try {
+    if (!chrome.tabs?.captureVisibleTab) return null;
+    let targetId = tabId;
+    if (!targetId) {
+      const active = await getActiveTab();
+      targetId = active?.id;
+    }
+    if (!targetId) return null;
+    const tab = await chrome.tabs.get(targetId);
+    if (!tab || !tab.windowId) return null;
+    try {
+      await chrome.tabs.update(targetId, { active: true });
+      if (tab.windowId && chrome.windows) await chrome.windows.update(tab.windowId, { focused: true });
+      await new Promise((r) => setTimeout(r, 200));
+    } catch {}
+    return await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+  } catch (err) {
+    console.warn("[bridge] captureTabEvidence failed:", err?.message || err);
+    return null;
+  }
+}
+
+async function detectCaptchaInTab(tabId) {
+  try {
+    if (!tabId || !chrome.scripting?.executeScript) return { detected: false };
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => {
+        const url = location.href.toLowerCase();
+        if (url.includes("/verify/traffic") || url.includes("/verify/slider") || url.includes("captcha")) {
+          return { detected: true, type: "url", details: location.href };
+        }
+        const selectors = [
+          ".shopee-captcha-slider",
+          ".captcha_container",
+          ".geetest_radar_btn",
+          ".geetest_canvas_bg",
+          "iframe[src*='verify']",
+          "iframe[src*='captcha']",
+          ".challenge-container",
+          ".verify-container",
+          "div[class*='captcha']",
+          "div[class*='verify']",
+        ];
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          if (el && (el.offsetWidth > 0 || el.offsetHeight > 0)) {
+            return { detected: true, type: "dom_selector", selector: sel };
+          }
+        }
+        const text = document.body ? document.body.innerText.toLowerCase() : "";
+        const phrases = [
+          "trượt để hoàn thành",
+          "kéo thanh trượt",
+          "xác minh bạn không phải là người máy",
+          "please slide to complete the puzzle",
+          "slide to verify",
+          "drag the slider",
+        ];
+        for (const p of phrases) {
+          if (text.includes(p)) {
+            return { detected: true, type: "dom_text", phrase: p };
+          }
+        }
+        return { detected: false };
+      },
+    });
+    return res?.result || { detected: false };
+  } catch (err) {
+    return { detected: false, error: err?.message };
+  }
+}
+
+function stopVerificationWatcher() {
+  if (verificationWatcherInterval) {
+    clearInterval(verificationWatcherInterval);
+    verificationWatcherInterval = null;
+  }
+  if (activeTabUpdateListener && chrome.tabs?.onUpdated) {
+    try {
+      chrome.tabs.onUpdated.removeListener(activeTabUpdateListener);
+    } catch {}
+    activeTabUpdateListener = null;
+  }
+}
+
+function startVerificationWatcher(details) {
+  stopVerificationWatcher();
+  const jid = details?.job_id;
+  const targetTabId = details?.tab_id;
+  if (!jid || !targetTabId || !chrome.tabs) return;
+
+  const tabUpdateListener = async (tabId, changeInfo, tab) => {
+    if (tabId !== targetTabId) return;
+    if (changeInfo.status === "complete" || (tab.url && !tab.url.includes("/verify/traffic"))) {
+      const check = await detectCaptchaInTab(targetTabId);
+      if (!check.detected) {
+        console.log("[bridge] Auto-detected CAPTCHA resolution on tab:", targetTabId);
+        stopVerificationWatcher();
+        resumeVerification(jid);
+      }
+    }
+  };
+  chrome.tabs.onUpdated?.addListener(tabUpdateListener);
+  activeTabUpdateListener = tabUpdateListener;
+
+  verificationWatcherInterval = setInterval(async () => {
+    if (!verificationInfo || verificationInfo.job_id !== jid) {
+      stopVerificationWatcher();
+      return;
+    }
+    const check = await detectCaptchaInTab(targetTabId);
+    if (!check.detected) {
+      console.log("[bridge] Auto-detected CAPTCHA resolved in-place for job:", jid);
+      stopVerificationWatcher();
+      resumeVerification(jid);
+    }
+  }, 3000);
+}
+
+async function triggerVerificationRequired(details) {
   console.warn("[bridge] ⚠️ Verification required:", details);
   updateState(stateForVerification(details), details);
+
+  // Human Handover: Focus target tab so user sees the verification UI immediately
+  const targetTabId = details?.tab_id;
+  if (targetTabId && chrome.tabs) {
+    try {
+      const tab = await chrome.tabs.update(targetTabId, { active: true });
+      if (tab && tab.windowId && chrome.windows) {
+        await chrome.windows.update(tab.windowId, { focused: true });
+      }
+    } catch (e) {
+      console.warn("[bridge] Could not focus tab for verification:", e?.message);
+    }
+  }
+
+  // Evidence Capture: Capture screenshot of the challenge page if not already attached
+  if (targetTabId && !details.evidence_screenshot) {
+    details.evidence_screenshot = await captureTabEvidence(targetTabId);
+  }
+
   const jid = details?.job_id;
   if (jid && notifiedVerificationJobIds.has(jid)) {
     return; // Đảm bảo gửi một thông báo duy nhất cho người dùng
@@ -1309,9 +1472,14 @@ function triggerVerificationRequired(details) {
       params: details,
     });
   }
+
+  if (details.kind === "verification") {
+    startVerificationWatcher(details);
+  }
 }
 
 function resumeVerification(jobId) {
+  stopVerificationWatcher();
   if (verificationInfo && (verificationInfo.kind === "login" || verificationInfo.kind === "api_blocked")) {
     console.warn("[bridge] Không thể resume verification cho job không phải thử thách CAPTCHA:", jobId);
     return;
@@ -1648,6 +1816,30 @@ async function handleAction(action, params) {
         args: [format, maxChars],
       });
       return { format, snapshot: res[0]?.result || "" };
+    }
+
+    case "page.screenshot": {
+      const targetTabId = params.tabId || (await getActiveTabId());
+      if (!targetTabId) throw new Error("No target tab available for screenshot");
+      const tab = await chrome.tabs.get(targetTabId);
+      if (!tab || !tab.windowId) throw new Error("Cannot locate tab window");
+      if (params.active !== false && chrome.tabs && chrome.windows) {
+        try {
+          await chrome.tabs.update(targetTabId, { active: true });
+          if (tab.windowId) await chrome.windows.update(tab.windowId, { focused: true });
+          await new Promise((r) => setTimeout(r, 150));
+        } catch {}
+      }
+      const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
+        format: params.format === "jpeg" ? "jpeg" : "png",
+        quality: params.quality,
+      });
+      return {
+        status: "ok",
+        tabId: targetTabId,
+        url: tab.url,
+        dataUrl,
+      };
     }
 
     case "fetch.sameOrigin": {
@@ -2415,5 +2607,9 @@ if (typeof module !== "undefined" && module.exports) {
     knownJobs,
     pendingVerificationJobs,
     notifiedVerificationJobIds,
+    captureTabEvidence,
+    detectCaptchaInTab,
+    startVerificationWatcher,
+    stopVerificationWatcher,
   };
 }

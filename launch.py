@@ -795,19 +795,30 @@ def _on_browser_ws_message(message: dict) -> None:
         job_id = str(params.get("job_id") or params.get("jobId") or "")
         reason = str(params.get("reason") or "Yêu cầu xác minh danh tính / CAPTCHA Shopee")
         _BROWSER_WS.transport.require_verification(params.get("url") or "")
+        evidence_data = params.get("evidence_screenshot") or params.get("screenshot")
+        evidence = None
+        if evidence_data and job_id:
+            try:
+                from browser_bridge.captcha_detector import save_evidence_screenshot
+                evidence = save_evidence_screenshot(job_id, evidence_data, _outputs_root(), HELPER_PORT)
+            except Exception as exc:
+                print(f"[launch] Failed to save evidence screenshot: {exc}", file=sys.stderr)
         if job_id:
-            _update_ingest_progress(
-                job_id,
-                {
-                    "status": "awaiting_user_verification",
-                    "stage": "verification_required",
-                    "verification_required": True,
-                    "message": reason,
-                    "error": reason,
-                    "url": params.get("url"),
-                    "percent": 100,
-                },
-            )
+            progress_patch = {
+                "status": "awaiting_user_verification",
+                "stage": "verification_required",
+                "verification_required": True,
+                "message": reason,
+                "error": reason,
+                "url": params.get("url"),
+                "percent": 100,
+            }
+            if evidence:
+                progress_patch["evidence_file"] = evidence["rel_path"]
+                progress_patch["evidence_url"] = evidence["url"]
+                progress_patch["evidence"] = evidence
+                print(f"[launch] ⚠️ Verification required for job {job_id}. Evidence saved: {evidence['rel_path']}", file=sys.stderr)
+            _update_ingest_progress(job_id, progress_patch)
             _persist_ingest_state()
     elif kind == "verification.resolved":
         _BROWSER_WS.transport.resume_verification()
@@ -904,6 +915,15 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
             status = "error"
             stage = "failed"
 
+        evidence_data = body.get("evidence_screenshot") or body.get("screenshot") if isinstance(body, dict) else None
+        evidence = None
+        if is_verification and evidence_data and job_id:
+            try:
+                from browser_bridge.captcha_detector import save_evidence_screenshot
+                evidence = save_evidence_screenshot(job_id, evidence_data, _outputs_root(), HELPER_PORT)
+            except Exception as exc:
+                print(f"[launch] Failed to save evidence screenshot in payload: {exc}", file=sys.stderr)
+
         if job_id:
             result = {
                 "ok": False,
@@ -914,22 +934,28 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
                 "login_required": is_login,
                 "api_blocked": is_api_blocked,
             }
+            if evidence:
+                result["evidence_file"] = evidence["rel_path"]
+                result["evidence_url"] = evidence["url"]
+                result["evidence"] = evidence
             _INGEST_RESULTS[job_id] = result
             with _INGEST_JOBS_LOCK:
                 _INGEST_INFLIGHT.pop(job_id, None)
-            _update_ingest_progress(
-                job_id,
-                {
-                    "status": status,
-                    "stage": stage,
-                    "verification_required": is_verification,
-                    "login_required": is_login,
-                    "api_blocked": is_api_blocked,
-                    "message": err_msg,
-                    "error": err_msg,
-                    "percent": 100,
-                },
-            )
+            prog_patch = {
+                "status": status,
+                "stage": stage,
+                "verification_required": is_verification,
+                "login_required": is_login,
+                "api_blocked": is_api_blocked,
+                "message": err_msg,
+                "error": err_msg,
+                "percent": 100,
+            }
+            if evidence:
+                prog_patch["evidence_file"] = evidence["rel_path"]
+                prog_patch["evidence_url"] = evidence["url"]
+                prog_patch["evidence"] = evidence
+            _update_ingest_progress(job_id, prog_patch)
             _persist_ingest_state()
             return 200, result
         return 200, {
@@ -2449,7 +2475,7 @@ class _HelperHandler(BaseHTTPRequestHandler):
             })
             return
 
-        if self.path.split("?", 1)[0] == "/browser/resume":
+        if self.path.split("?", 1)[0] in ("/browser/resume", "/ingest/resume"):
             qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
             auth_header = self.headers.get("Authorization", "")
             req_token = qs.get("token", [""])[0] or self.headers.get("X-Bridge-Token", "")

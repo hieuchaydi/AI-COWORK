@@ -17,6 +17,11 @@ from .security import (
     verify_pairing_token,
 )
 from .server import BrowserGatewayServer, GatewayClientConnection
+from .captcha_detector import (
+    is_captcha_detected,
+    match_template_grayscale,
+    save_evidence_screenshot,
+)
 from .transport import (
     BrowserTransport,
     ExtensionState,
@@ -47,5 +52,8 @@ __all__ = [
     "HttpPollingTransport",
     "TransportManager",
     "WebSocketTransport",
+    "is_captcha_detected",
+    "match_template_grayscale",
+    "save_evidence_screenshot",
 ]
 

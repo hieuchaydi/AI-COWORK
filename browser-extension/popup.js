@@ -224,7 +224,23 @@ function renderStatus(state, details) {
     if (verificationTargetUrl) {
       verificationTargetUrl.textContent = targetUrl ? `URL cần mở: ${targetUrl}` : "";
     }
+
+    const verificationEvidence = document.getElementById("verificationEvidence");
+    const evidenceImage = document.getElementById("evidenceImage");
+    const evidenceLink = document.getElementById("evidenceLink");
+    const screenshot = details.verification.evidence_screenshot || details.verification.evidence_url;
+    if (verificationEvidence && evidenceImage && screenshot) {
+      verificationEvidence.style.display = "block";
+      evidenceImage.src = screenshot;
+      if (evidenceLink) {
+        evidenceLink.href = screenshot;
+      }
+    } else if (verificationEvidence) {
+      verificationEvidence.style.display = "none";
+    }
   } else {
+    const verificationEvidence = document.getElementById("verificationEvidence");
+    if (verificationEvidence) verificationEvidence.style.display = "none";
     currentVerification = null;
     verificationBox.style.display = "none";
     if (btnResumeVerification) {
