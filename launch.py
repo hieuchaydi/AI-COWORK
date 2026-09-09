@@ -2752,6 +2752,39 @@ class _HelperHandler(BaseHTTPRequestHandler):
             })
             return
 
+        if self.path.split("?", 1)[0] == "/browser/open_verification":
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            verif_info = _BROWSER_WS.transport.get_verification_info() or {}
+            custom_url = (qs.get("url", [""])[0] or "").strip()
+            target_url = (
+                custom_url
+                or verif_info.get("verification_url")
+                or verif_info.get("target_url")
+                or verif_info.get("url")
+                or ""
+            )
+            if not target_url or "/verify/traffic" not in target_url:
+                with _INGEST_PROGRESS_LOCK:
+                    for jid, p in reversed(list(_INGEST_PROGRESS.items())):
+                        msg = str(p.get("error") or p.get("message") or "")
+                        m = re.search(r"https?://[^\s\"'<>]+verify/traffic[^\s\"'<>]*", msg)
+                        if m:
+                            target_url = m.group(0)
+                            break
+            if not target_url:
+                target_url = "https://shopee.vn"
+
+            tab_id = verif_info.get("tab_id")
+            ok, res, err = _BROWSER_WS.transport.execute_command("tab.open", {"url": target_url})
+            self._json(200 if ok else 500, {
+                "ok": ok,
+                "opened_url": target_url,
+                "tab_id": tab_id,
+                "result": res,
+                "error": err.to_dict() if err else None,
+            })
+            return
+
         if self.path.split("?", 1)[0] in ("/browser/resume", "/ingest/resume"):
             qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
             auth_header = self.headers.get("Authorization", "")

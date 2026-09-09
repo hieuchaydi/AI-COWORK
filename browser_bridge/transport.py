@@ -289,7 +289,14 @@ class WebSocketTransport(BrowserTransport):
 
         # 3. Check verification pause state
         if self.get_state() == ExtensionState.AWAITING_USER_VERIFICATION:
-            if action not in ("browser.health", "tab.list", "tab.getActive"):
+            allowed_during_verification = (
+                "browser.health",
+                "tab.list",
+                "tab.getActive",
+                "tab.open",
+                "tab.focus",
+            )
+            if action not in allowed_during_verification:
                 return False, None, BridgeError.create(
                     ErrorCode.VERIFICATION_REQUIRED,
                     "Human verification required on page. Workflow paused.",

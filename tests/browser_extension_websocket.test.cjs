@@ -643,6 +643,55 @@ test('extractShopeeReviews reports api_blocked when Shopee confirms login on a 4
   });
 });
 
+test('extractShopeeReviews detects verification required on HTTP 200 with verify/traffic redirect', async () => {
+  const { context } = await worker();
+  const verifyUrl = "https://shopee.vn/verify/traffic?anti_bot_tracking_id=gqRjZGVrxHSFomtptTE0MjUx";
+  vm.runInContext(`
+    chrome.tabs = {
+      query: async () => [{ id: 12, url: "https://shopee.vn/product/111/222" }],
+      create: async () => ({ id: 12, url: "https://shopee.vn/product/111/222" }),
+      get: async () => ({ id: 12, url: "https://shopee.vn/product/111/222" }),
+      update: async (id, updateInfo) => ({ id, url: updateInfo.url || "https://shopee.vn/product/111/222", windowId: 1 }),
+      onUpdated: { addListener() {}, removeListener() {} },
+    };
+    chrome.windows = {
+      update: async () => ({}),
+    };
+    chrome.scripting = {
+      executeScript: async () => [{
+        result: {
+          ok: true,
+          status: 200,
+          url: "${verifyUrl}",
+          pageUrl: "${verifyUrl}",
+          json: null,
+          textSample: "<!DOCTYPE html><html><body>Shopee verify traffic</body></html>",
+        }
+      }],
+    };
+  `, context);
+
+  await assert.rejects(async () => {
+    await vm.runInContext(`
+      extractShopeeReviews({
+        id: "job-preflight-verify-200",
+        url: "https://shopee.vn/product/111/222",
+        itemid: "222",
+      }, () => {})
+    `, context);
+  }, (err) => {
+    assert.equal(err.failureKind, 'verification');
+    assert.match(err.message, /verification required/i);
+    assert.match(err.message, /verify\/traffic/i);
+    return true;
+  });
+
+  const extracted = vm.runInContext(`
+    extractVerificationUrl("Shopee verification required (HTTP 200) — tab=${verifyUrl}; response=${verifyUrl}")
+  `, context);
+  assert.equal(extracted, verifyUrl);
+});
+
 test('Job cu bi treo/loi khong khoa job moi trong queue executor', async () => {
   const { context } = await worker();
   vm.runInContext(`

@@ -6,6 +6,7 @@ const vm = require('node:vm');
 
 function element(id = '') {
   const classes = new Set();
+  const listeners = {};
   return {
     id,
     style: {},
@@ -22,6 +23,17 @@ function element(id = '') {
       contains(name) { return classes.has(name); },
     },
     addEventListener() {},
+    addEventListener(event, handler) {
+      listeners[event] = listeners[event] || [];
+      listeners[event].push(handler);
+    },
+    async click() {
+      if (listeners['click']) {
+        for (const h of listeners['click']) {
+          await h();
+        }
+      }
+    },
     appendChild(child) { this.children.push(child); return child; },
     removeAttribute(name) { delete this[name]; },
   };
@@ -138,3 +150,48 @@ test('popup displays btnRecheckApi for api_blocked and btnResumeVerification for
   assert.equal(elements.btnRecheckApi.style.display, 'none');
   assert.match(elements.verificationTitle.textContent, /Yêu cầu giải CAPTCHA/);
 });
+
+test('popup displays correct verify/traffic URL and btnOpenVerificationTab navigates to it', async () => {
+  const { context, elements } = await popup(null);
+  const verifyUrl = "https://shopee.vn/verify/traffic?anti_bot_tracking_id=challenge123";
+
+  vm.runInContext(`
+    let updatedTab = null;
+    let updatedWindow = null;
+    chrome.tabs.update = async (tabId, opts) => {
+      updatedTab = { tabId, ...opts };
+      return { id: tabId, windowId: 42 };
+    };
+    chrome.windows.update = async (winId, opts) => {
+      updatedWindow = { winId, ...opts };
+      return {};
+    };
+
+    renderStatus("awaiting_user_verification", {
+      verification: {
+        kind: "verification",
+        job_id: "job-traffic-1",
+        reason: "Shopee verification required (HTTP 200) — tab=${verifyUrl}; response=unknown",
+        tab_id: 10,
+        url: "https://shopee.vn/product/1/2",
+      }
+    });
+  `, context);
+
+  assert.equal(elements.verificationTargetUrl.textContent, `URL cần mở: ${verifyUrl}`);
+  assert.equal(elements.btnOpenVerificationTab.style.display, 'block');
+
+  // Trigger click on btnOpenVerificationTab
+  await vm.runInContext(`
+    document.getElementById("btnOpenVerificationTab").click();
+  `, context);
+
+  const updatedTab = vm.runInContext('updatedTab', context);
+  const updatedWindow = vm.runInContext('updatedWindow', context);
+  assert.equal(updatedTab.tabId, 10);
+  assert.equal(updatedTab.url, verifyUrl);
+  assert.equal(updatedTab.active, true);
+  assert.equal(updatedWindow.winId, 42);
+  assert.equal(updatedWindow.focused, true);
+});
+

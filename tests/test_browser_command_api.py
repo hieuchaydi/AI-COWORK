@@ -108,3 +108,48 @@ def test_registered_extension_does_not_repeat_setup(monkeypatch, tmp_path):
         "example": {"path": str(tmp_path / "browser-extension")}
     }}}), encoding="utf-8")
     assert launch._profile_has_browser_extension(profile)
+
+
+def test_transport_allows_tab_open_during_verification():
+    from browser_bridge.transport import WebSocketTransport, ExtensionState
+
+    transport = WebSocketTransport(send_fn=lambda data: True, is_connected_fn=lambda: True)
+    transport.set_state(ExtensionState.AWAITING_USER_VERIFICATION, {"url": "https://shopee.vn/verify/traffic?id=123"})
+
+    # Action outside allowlist should be rejected immediately with VERIFICATION_REQUIRED
+    ok, res, err = transport.execute_command("page.evaluate", {"script": "1+1"})
+    assert not ok
+    assert err is not None and err.code.lower() == "verification_required"
+
+    # Action in allowlist should pass the verification state check
+    ok, res, err = transport.execute_command("tab.open", {"url": "https://shopee.vn/verify/traffic?id=123"}, deadline_ms=10)
+    assert err is None or err.code.lower() != "verification_required"
+
+
+def test_open_verification_endpoint(monkeypatch):
+    transport = Mock()
+    transport.get_verification_info.return_value = {
+        "url": "https://shopee.vn/product/123",
+        "verification_url": "https://shopee.vn/verify/traffic?anti_bot_tracking_id=test123",
+        "tab_id": 99,
+    }
+    transport.execute_command.return_value = (True, {"id": 99}, None)
+    bridge = Mock(token="test-bridge-token", allowlisted_extension_ids=None, transport=transport)
+    monkeypatch.setattr(launch, "_BROWSER_WS", bridge)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), launch._HelperHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/browser/open_verification"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.load(resp)
+            assert resp.status == 200
+            assert data["ok"] is True
+            assert data["opened_url"] == "https://shopee.vn/verify/traffic?anti_bot_tracking_id=test123"
+            transport.execute_command.assert_called_once_with("tab.open", {"url": "https://shopee.vn/verify/traffic?anti_bot_tracking_id=test123"})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+

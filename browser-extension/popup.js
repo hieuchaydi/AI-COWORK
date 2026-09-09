@@ -40,6 +40,23 @@ function storageGet(keys) {
   return new Promise((resolve) => chrome.storage.local.get(keys, resolve));
 }
 
+function extractVerificationUrl(input) {
+  if (!input) return "";
+  if (typeof input === "object") {
+    if (typeof input.verification_url === "string" && input.verification_url.includes("/verify/traffic")) return input.verification_url.replace(/[;,.)]+$/, "");
+    if (typeof input.target_url === "string" && input.target_url.includes("/verify/traffic")) return input.target_url.replace(/[;,.)]+$/, "");
+    if (typeof input.pageUrl === "string" && input.pageUrl.includes("/verify/traffic")) return input.pageUrl.replace(/[;,.)]+$/, "");
+    if (typeof input.url === "string" && input.url.includes("/verify/traffic")) return input.url.replace(/[;,.)]+$/, "");
+    const str = `${input.reason || ""} ${input.error || ""} ${input.message || ""}`;
+    const match = str.match(/https?:\/\/[^\s"'`<>]+verify\/traffic[^\s"'`<>;,)]*/);
+    if (match) return match[0].replace(/[;,.)]+$/, "");
+  } else if (typeof input === "string") {
+    const match = input.match(/https?:\/\/[^\s"'`<>]+verify\/traffic[^\s"'`<>;,)]*/);
+    if (match) return match[0].replace(/[;,.)]+$/, "");
+  }
+  return "";
+}
+
 function runtimeStatus() {
   return new Promise((resolve) => {
     chrome.runtime.sendMessage({ action: "getStatus" }, (response) => {
@@ -173,13 +190,12 @@ function renderStatus(state, details) {
   if (details && details.verification) {
     currentVerification = details.verification;
     verificationBox.style.display = "block";
-    verificationMsg.textContent = `Yêu cầu xác minh tại: ${details.verification.url || details.verification.hostname || "tab hiện tại"}`;
+    const kind = details.verification.kind || "verification";
+    const targetUrl = details.verification.verification_url || details.verification.target_url || extractVerificationUrl(details.verification) || details.verification.url || details.verification.hostname || "";
+    verificationMsg.textContent = `Yêu cầu xác minh tại: ${targetUrl || "tab hiện tại"}`;
     if (verificationReason) {
       verificationReason.textContent = details.verification.reason || "Lý do: Shopee yêu cầu giải CAPTCHA hoặc xác minh danh tính tài khoản";
     }
-
-    const kind = details.verification.kind || "verification";
-    const targetUrl = details.verification.url || details.verification.hostname || "";
 
     if (kind === "login") {
       verificationBox.className = "alert-box login-box";
@@ -451,15 +467,25 @@ if (btnOpenVerificationTab) {
   btnOpenVerificationTab.addEventListener("click", async () => {
     if (!currentVerification) return;
     const tabId = currentVerification.tab_id;
-    const url = currentVerification.url;
+    const targetUrl = currentVerification.verification_url || currentVerification.target_url || extractVerificationUrl(currentVerification) || currentVerification.url;
     if (tabId) {
       try {
-        await chrome.tabs.update(tabId, { active: true });
+        let tab = null;
+        if (targetUrl && targetUrl.includes("/verify/traffic")) {
+          tab = await chrome.tabs.update(tabId, { url: targetUrl, active: true });
+        } else {
+          tab = await chrome.tabs.update(tabId, { active: true });
+        }
+        if (tab?.windowId) {
+          await chrome.windows.update(tab.windowId, { focused: true });
+        }
         return;
       } catch {}
     }
-    if (url) {
-      chrome.tabs.create({ url, active: true });
+    if (targetUrl) {
+      chrome.tabs.create({ url: targetUrl, active: true }, (tab) => {
+        if (tab?.windowId) chrome.windows.update(tab.windowId, { focused: true });
+      });
     }
   });
 }

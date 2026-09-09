@@ -778,6 +778,24 @@ function formatShopeeFailure(fetchRes) {
   return `Shopee reviews API access denied (HTTP ${status}) — không thấy CAPTCHA trên tab; endpoint=${endpoint}; tab=${page}; response=${sample || "empty"}`;
 }
 
+function extractVerificationUrl(input) {
+  if (!input) return "";
+  if (typeof input === "object") {
+    if (typeof input.verification_url === "string" && input.verification_url.includes("/verify/traffic")) return input.verification_url.replace(/[;,.)]+$/, "");
+    if (typeof input.target_url === "string" && input.target_url.includes("/verify/traffic")) return input.target_url.replace(/[;,.)]+$/, "");
+    if (typeof input.pageUrl === "string" && input.pageUrl.includes("/verify/traffic")) return input.pageUrl.replace(/[;,.)]+$/, "");
+    if (typeof input.url === "string" && input.url.includes("/verify/traffic")) return input.url.replace(/[;,.)]+$/, "");
+    if (typeof input.responseUrl === "string" && input.responseUrl.includes("/verify/traffic")) return input.responseUrl.replace(/[;,.)]+$/, "");
+    const str = `${input.reason || ""} ${input.error || ""} ${input.message || ""} ${input.textSample || ""}`;
+    const match = str.match(/https?:\/\/[^\s"'`<>]+verify\/traffic[^\s"'`<>;,)]*/);
+    if (match) return match[0].replace(/[;,.)]+$/, "");
+  } else if (typeof input === "string") {
+    const match = input.match(/https?:\/\/[^\s"'`<>]+verify\/traffic[^\s"'`<>;,)]*/);
+    if (match) return match[0].replace(/[;,.)]+$/, "");
+  }
+  return "";
+}
+
 async function preflightRatingsInTab(tabId, itemid, shopid, referer) {
   return executeScriptResultWithRetry({
     target: { tabId },
@@ -820,10 +838,14 @@ function evaluatePreflightResult(fetchRes) {
   const json = fetchRes?.json || {};
   const explicitLoginState = shopeeLoginState(fetchRes);
   const isLoginRequired = explicitLoginState === false;
-  const isLogin = explicitLoginState === true || Boolean(fetchRes?.ok && !isLoginRequired);
+  const failureKind = classifyShopeeFailure(fetchRes);
+  const isVerificationRequired = failureKind === "verification";
+  const isLogin = explicitLoginState === true || Boolean(fetchRes?.ok && !isLoginRequired && !isVerificationRequired);
   let error = null;
   if (isLoginRequired) {
     error = `Shopee login required (HTTP ${status ?? "unknown"}, error=${json?.error ?? "unknown"}, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome`;
+  } else if (isVerificationRequired) {
+    error = formatShopeeFailure(fetchRes);
   } else if (!fetchRes?.ok) {
     error = fetchRes?.error ? `Shopee API request failed: ${fetchRes.error}` : formatShopeeFailure(fetchRes);
   }
@@ -1117,8 +1139,9 @@ async function extractShopeeReviews(job, progress) {
 
   // Classify the API response before deriving auth state. Shopee can return
   // 403/error=90309999 together with is_login=true; that is API blocking, not logout.
-  if (!preflightRes.ok) {
-    const failureKind = classifyShopeeFailure(preflightRes);
+  const preflightFailureKind = classifyShopeeFailure(preflightRes);
+  if (!preflightRes.ok || preflightFailureKind === "verification") {
+    const failureKind = preflightFailureKind;
     const err = new Error(evalResult.error || formatShopeeFailure(preflightRes));
     err.failureKind = failureKind;
     err.fetchRes = preflightRes;
@@ -1335,8 +1358,9 @@ async function extractShopeeReviews(job, progress) {
       }
 
       const json = fetchRes.json;
-      if (json && (json.error || json.is_login === false || (json.data && json.data.is_login === false))) {
-        let failureKind = classifyShopeeFailure(fetchRes);
+      const failureKindFromRes = classifyShopeeFailure(fetchRes);
+      if (failureKindFromRes === "verification" || (json && (json.error || json.is_login === false || (json.data && json.data.is_login === false)))) {
+        let failureKind = failureKindFromRes;
         if (failureKind === "api_blocked" && tab?.id) {
           try {
             const captchaCheck = await detectCaptchaInTab(tab.id);
@@ -1663,9 +1687,12 @@ async function runJob(job) {
       const itemid = job.itemid || parsed.itemid || checkpoint?.itemid;
       const shopid = job._targetShopId || job.shopid || parsed.shopid || checkpoint?.shopid;
       const evidence = await captureTabEvidence(job._targetTabId || null);
+      const verificationUrl = extractVerificationUrl(e?.fetchRes) || extractVerificationUrl(message) || job.url;
       await triggerVerificationRequired({
         job_id: job.id,
         url: job.url,
+        verification_url: verificationUrl,
+        target_url: verificationUrl,
         itemid,
         shopid,
         tab_id: job._targetTabId || null,
@@ -2247,18 +2274,26 @@ function startVerificationWatcher(details) {
 
 async function triggerVerificationRequired(details) {
   console.warn("[bridge] ⚠️ Verification required:", details);
+  const verificationUrl = details.verification_url || details.target_url || extractVerificationUrl(details) || details.url;
+  details.verification_url = verificationUrl;
+  details.target_url = verificationUrl;
   updateState(stateForVerification(details), details);
 
-  // Human Handover: Focus target tab so user sees the verification UI immediately
+  // Human Handover: Focus & navigate target tab so user sees the verification UI immediately
   const targetTabId = details?.tab_id;
   if (targetTabId && chrome.tabs) {
     try {
-      const tab = await chrome.tabs.update(targetTabId, { active: true });
+      let tab = null;
+      if (verificationUrl && verificationUrl.includes("/verify/traffic")) {
+        tab = await chrome.tabs.update(targetTabId, { url: verificationUrl, active: true });
+      } else {
+        tab = await chrome.tabs.update(targetTabId, { active: true });
+      }
       if (tab && tab.windowId && chrome.windows) {
         await chrome.windows.update(tab.windowId, { focused: true });
       }
     } catch (e) {
-      console.warn("[bridge] Could not focus tab for verification:", e?.message);
+      console.warn("[bridge] Could not focus/navigate tab for verification:", e?.message);
     }
   }
 
@@ -3548,6 +3583,7 @@ if (typeof module !== "undefined" && module.exports) {
     crawlPercent,
     classifyShopeeFailure,
     formatShopeeFailure,
+    extractVerificationUrl,
     runJob,
     resumeVerification,
     handleRecheckApi,
