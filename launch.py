@@ -3871,13 +3871,21 @@ def _seed_runtime_state() -> None:
         _ow_post("/v1/settings/models/remove", {"model": model})
     _ow_delete("/v1/providers/cloudflare")
 
-    # 1c. Pin default model: Claude Haiku > Groq gpt-oss-120b > Cohere > Gemini 3.5 Flash-Lite.
+    # 1c. Select the strongest available model automatically. The picker keeps
+    # faster/cheaper alternatives, but adding a provider key should immediately
+    # make that provider usable without a second configuration step.
     if ANTHROPIC_KEY:
-        default_model = "anthropic:claude-haiku-4-5"
+        default_model = "anthropic:claude-opus-4-8"
+    elif OPENAI_KEY:
+        default_model = "openai:gpt-5.5"
+    elif GEMINI_KEY:
+        default_model = "gemini:gemini-3.1-pro-preview"
     elif GROQ_KEY:
         default_model = "groq:openai/gpt-oss-120b"
+    elif CEREBRAS_KEY:
+        default_model = "cerebras:gpt-oss-120b"
     elif COHERE_KEY:
-        default_model = "cohere:command-a-03-2025"
+        default_model = "cohere:command-a-reasoning-08-2025"
     else:
         default_model = "gemini:gemini-3.5-flash-lite"
     _ow_post("/v1/settings/default-model", {"model": default_model})
