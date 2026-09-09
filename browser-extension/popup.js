@@ -194,14 +194,20 @@ function renderStatus(state, details) {
       verificationBox.className = "alert-box blocked-box";
       if (verifTitle) verifTitle.textContent = "🚫 Shopee chặn API (HTTP 403 / WAF)";
       verificationMsg.textContent = "Shopee đã chặn IP hoặc phiên truy cập của API đánh giá (HTTP 403). Đây không phải là CAPTCHA hoặc lỗi đăng nhập.";
+      if (verifTitle) verifTitle.textContent = "🚫 Shopee chặn API (HTTP 403) — Cần giải CAPTCHA / Xác minh phiên";
+      verificationMsg.textContent = "Shopee đã tạm chặn API đánh giá (HTTP 403). Hãy mở tab Shopee để kiểm tra/giải CAPTCHA hoặc xác minh phiên, sau đó bấm Tiếp tục cào từ Checkpoint.";
       if (verificationReason) {
         verificationReason.textContent = details.verification.reason || "Lý do: HTTP 403 Forbidden / Access Denied";
       }
       if (btnOpenVerificationTab) {
         btnOpenVerificationTab.style.display = "none";
+        btnOpenVerificationTab.style.display = (targetUrl || details.verification.tab_id) ? "block" : "none";
+        btnOpenVerificationTab.textContent = "Mở tab Shopee cần xử lý / giải CAPTCHA";
       }
       if (btnResumeVerification) {
         btnResumeVerification.style.display = "none";
+        btnResumeVerification.style.display = "block";
+        btnResumeVerification.textContent = "Tiếp tục cào từ Checkpoint";
       }
     } else {
       // verification (CAPTCHA / challenge)

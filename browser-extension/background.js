@@ -935,6 +935,15 @@ async function extractShopeeReviews(job, progress) {
 
     if (!fetchRes.ok) {
       const failureKind = classifyShopeeFailure(fetchRes);
+      let failureKind = classifyShopeeFailure(fetchRes);
+      if (failureKind === "api_blocked" && tab?.id) {
+        try {
+          const captchaCheck = await detectCaptchaInTab(tab.id);
+          if (captchaCheck?.detected) {
+            failureKind = "verification";
+          }
+        } catch {}
+      }
       if (failureKind === "verification" || failureKind === "api_blocked") {
         try {
           await chrome.storage.local.set({
@@ -959,6 +968,15 @@ async function extractShopeeReviews(job, progress) {
     const json = fetchRes.json;
     if (json && (json.error || json.is_login === false || (json.data && json.data.is_login === false))) {
       const failureKind = classifyShopeeFailure(fetchRes);
+      let failureKind = classifyShopeeFailure(fetchRes);
+      if (failureKind === "api_blocked" && tab?.id) {
+        try {
+          const captchaCheck = await detectCaptchaInTab(tab.id);
+          if (captchaCheck?.detected) {
+            failureKind = "verification";
+          }
+        } catch {}
+      }
       if (failureKind === "verification" || failureKind === "api_blocked") {
         try {
           await chrome.storage.local.set({
@@ -1264,6 +1282,7 @@ async function runJob(job) {
       });
     } else if (failureKind === "api_blocked") {
       // 3. api_blocked: Shopee chặn API (HTTP 403) nhưng KHÔNG PHẢI CAPTCHA và KHÔNG PHẢI login
+      // 3. api_blocked: Shopee chặn API (HTTP 403) — Quét CAPTCHA, focus tab, chụp bằng chứng, lưu checkpoint
       let checkpoint = null;
       try {
         const stored = await chrome.storage.local.get([`checkpoint_${job.id}`]);
@@ -1337,6 +1356,103 @@ async function runJob(job) {
         checkpoint,
         stage: "api_blocked",
       });
+      // Quét xem tab Shopee có slider CAPTCHA hoặc trang xác minh không
+      const captchaCheck = targetTabId ? await detectCaptchaInTab(targetTabId) : { detected: false };
+      const evidence = targetTabId ? await captureTabEvidence(targetTabId) : null;
+
+      // Lưu job vào pending verification để sẵn sàng resume
+      lastVerificationJob = job;
+      pendingVerificationJobs.set(job.id, job);
+
+      if (captchaCheck?.detected) {
+        // Tab hiển thị CAPTCHA challenge rõ ràng -> Chuyển sang verification challenge
+        await triggerVerificationRequired({
+          job_id: job.id,
+          url: job.url,
+          tab_id: targetTabId || null,
+          reason: `Phát hiện thử thách CAPTCHA khi gọi API Shopee (${captchaCheck.type || "slider"})`,
+          kind: "verification",
+          evidence_screenshot: evidence,
+          checkpoint,
+        });
+        await progress({
+          status: "awaiting_user_verification",
+          stage: "verification_required",
+          message: "Shopee yêu cầu xác minh danh tính / giải CAPTCHA. Vui lòng thao tác trên tab Chrome.",
+          error: message,
+          verification_required: true,
+          login_required: false,
+          api_blocked: true,
+          evidence_screenshot: evidence,
+          checkpoint,
+          percent: 100,
+        });
+        await uploadIngestResult({
+          job: job.id,
+          error: message,
+          verification_required: true,
+          login_required: false,
+          api_blocked: true,
+          evidence_screenshot: evidence,
+          checkpoint,
+          stage: "verification_required",
+        });
+      } else {
+        // Chưa thấy CAPTCHA trên DOM hoặc bị giới hạn API
+        if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+          bridgeSend({
+            v: 1,
+            type: "api_blocked",
+            id: "blocked-" + Date.now(),
+            params: {
+              job_id: job.id,
+              url: job.url,
+              tab_id: targetTabId || null,
+              reason: message,
+              status: 403,
+              checkpoint,
+              evidence_screenshot: evidence,
+            },
+          });
+        }
+
+        updateState("api_blocked", {
+          job_id: job.id,
+          url: job.url,
+          tab_id: targetTabId || null,
+          reason: message,
+          kind: "api_blocked",
+          checkpoint,
+          evidence_screenshot: evidence,
+        });
+
+        if (targetTabId) {
+          startVerificationWatcher({ job_id: job.id, tab_id: targetTabId });
+        }
+
+        await progress({
+          status: "error",
+          stage: "api_blocked",
+          message: "Shopee chặn API đánh giá (HTTP 403). Tab đã được mở để xác minh; job tạm dừng an toàn.",
+          error: message,
+          api_blocked: true,
+          verification_required: false,
+          login_required: false,
+          checkpoint,
+          evidence_screenshot: evidence,
+          percent: 100,
+        });
+        await uploadIngestResult({
+          job: job.id,
+          error: message,
+          api_blocked: true,
+          verification_required: false,
+          login_required: false,
+          checkpoint,
+          evidence_screenshot: evidence,
+          stage: "api_blocked",
+        });
+      }
     } else {
       // 4. Lỗi WebSocket / extension / network khác
       updateState("error", {
@@ -1545,6 +1661,8 @@ function resumeVerification(jobId) {
   stopVerificationWatcher();
   if (verificationInfo && (verificationInfo.kind === "login" || verificationInfo.kind === "api_blocked")) {
     console.warn("[bridge] Không thể resume verification cho job không phải thử thách CAPTCHA:", jobId);
+  if (verificationInfo && verificationInfo.kind === "login") {
+    console.warn("[bridge] Không thể resume verification cho job yêu cầu đăng nhập:", jobId);
     return;
   }
   console.log("[bridge] Resuming verification, jobId:", jobId);

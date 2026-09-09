@@ -827,6 +827,7 @@ def _on_browser_ws_message(message: dict) -> None:
         job_id = str(params.get("job_id") or params.get("jobId") or "")
         reason = str(params.get("reason") or "Shopee reviews API access denied (HTTP 403 / API Blocked)")
         checkpoint = params.get("checkpoint")
+        evidence_data = params.get("evidence_screenshot") or params.get("screenshot")
         print(f"[launch] ⚠️ Shopee API Blocked (HTTP 403) for job {job_id}: {reason}", file=sys.stderr)
         if hasattr(_BROWSER_WS.transport, "block_api"):
             _BROWSER_WS.transport.block_api(reason, params)
@@ -835,6 +836,14 @@ def _on_browser_ws_message(message: dict) -> None:
                 _save_ingest_checkpoint(job_id, checkpoint)
             except Exception as exc:
                 print(f"[launch] Failed to save checkpoint for api_blocked job {job_id}: {exc}", file=sys.stderr)
+        evidence = None
+        if evidence_data and job_id:
+            try:
+                from browser_bridge.captcha_detector import save_evidence_screenshot
+                evidence = save_evidence_screenshot(job_id, evidence_data, _outputs_root(), HELPER_PORT)
+                print(f"[launch] 📸 Evidence screenshot saved for api_blocked job {job_id}: {evidence['rel_path']}", file=sys.stderr)
+            except Exception as exc:
+                print(f"[launch] Failed to save evidence screenshot for api_blocked job {job_id}: {exc}", file=sys.stderr)
         if job_id:
             result = {
                 "ok": False,
@@ -848,6 +857,10 @@ def _on_browser_ws_message(message: dict) -> None:
             }
             if checkpoint:
                 result["checkpoint"] = checkpoint
+            if evidence:
+                result["evidence_file"] = evidence["rel_path"]
+                result["evidence_url"] = evidence["url"]
+                result["evidence"] = evidence
             _INGEST_RESULTS[job_id] = result
             with _INGEST_JOBS_LOCK:
                 _INGEST_INFLIGHT.pop(job_id, None)
@@ -863,6 +876,10 @@ def _on_browser_ws_message(message: dict) -> None:
             }
             if checkpoint:
                 progress_patch["checkpoint"] = checkpoint
+            if evidence:
+                progress_patch["evidence_file"] = evidence["rel_path"]
+                progress_patch["evidence_url"] = evidence["url"]
+                progress_patch["evidence"] = evidence
             _update_ingest_progress(job_id, progress_patch)
             _persist_ingest_state()
 
@@ -2582,7 +2599,8 @@ class _HelperHandler(BaseHTTPRequestHandler):
                         "status": "queued",
                         "stage": "resumed",
                         "verification_required": False,
-                        "message": "Đã giải quyết xác minh, đang tiếp tục cào",
+                        "api_blocked": False,
+                        "message": "Đã giải quyết xác minh/CAPTCHA, đang tiếp tục cào từ checkpoint",
                         "percent": 5,
                         "error": None,
                     },

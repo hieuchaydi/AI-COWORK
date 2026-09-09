@@ -864,6 +864,82 @@ test('runJob handles api_blocked: sends websocket event, focuses tab, saves stat
   assert.equal(updatedWindows[0].updateProps.focused, true);
 });
 
+test('runJob on 403 detects captcha slider, triggers verification.required and allows resume', async () => {
+  const { context, frames, sockets } = await worker();
+  sockets[0].onopen();
+  context.setTimeout = (fn) => { queueMicrotask(fn); return 1; };
+
+  context.chrome.storage.local = {
+    get: async (keys) => {
+      if (Array.isArray(keys) && keys.includes('checkpoint_job-403-captcha')) {
+        return {
+          'checkpoint_job-403-captcha': {
+            next_offset: 60,
+            rating_type: 5,
+            rows_count: 60,
+          },
+        };
+      }
+      return {};
+    },
+    set: async () => {},
+  };
+  context.chrome.tabs = {
+    get: async (tabId) => ({ id: tabId, windowId: 10 }),
+    update: async (tabId) => ({ id: tabId, windowId: 10 }),
+    captureVisibleTab: async () => 'data:image/png;base64,mocked_403_captcha_screenshot',
+    create: async () => {},
+  };
+  context.chrome.windows = {
+    update: async () => ({ id: 10 }),
+  };
+  vm.runInContext(`
+    extractShopeeReviews = async () => {
+      const err = new Error('Shopee reviews API access denied: HTTP 403');
+      err.failureKind = 'api_blocked';
+      throw err;
+    };
+    detectCaptchaInTab = async () => ({ detected: true, type: 'slider', selector: '.shopee-captcha-slider' });
+    sendIngestRequest = async () => ({ ok: true });
+  `, context);
+
+  const job = {
+    id: 'job-403-captcha',
+    url: 'https://shopee.vn/product/111/222',
+    _targetTabId: 88,
+  };
+
+  await vm.runInContext(`runJob(${JSON.stringify(job)})`, context);
+
+  // State should be awaiting_user_verification because captcha was detected on 403
+  const state = vm.runInContext('extensionState', context);
+  assert.equal(state, 'awaiting_user_verification');
+
+  // WebSocket frame should be verification.required with screenshot and checkpoint
+  const verifFrame = frames.find((f) => f.type === 'verification.required');
+  assert.ok(verifFrame, 'verification.required frame should be sent');
+  assert.equal(verifFrame.params.job_id, 'job-403-captcha');
+  assert.equal(verifFrame.params.evidence_screenshot, 'data:image/png;base64,mocked_403_captcha_screenshot');
+  assert.equal(verifFrame.params.checkpoint.next_offset, 60);
+
+  // Test resumeVerification unpauses and enqueues the job
+  let enqueued = false;
+  context.__testEnqueue = (j) => {
+    enqueued = true;
+    assert.equal(j.id, 'job-403-captcha');
+  };
+  vm.runInContext(`
+    enqueueLegacyJob = (j) => {
+      __testEnqueue(j);
+    };
+  `, context);
+  vm.runInContext('resumeVerification("job-403-captcha")', context);
+  assert.equal(enqueued, true);
+  const postResumeState = vm.runInContext('extensionState', context);
+  assert.equal(postResumeState, 'connected');
+  vm.runInContext('stopVerificationWatcher()', context);
+});
+
 
 
 

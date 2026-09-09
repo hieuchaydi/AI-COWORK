@@ -165,7 +165,7 @@ class WebSocketTransport(BrowserTransport):
 
     def resume_verification(self) -> None:
         with self._lock:
-            if self._state == ExtensionState.AWAITING_USER_VERIFICATION:
+            if self._state in (ExtensionState.AWAITING_USER_VERIFICATION, ExtensionState.API_BLOCKED):
                 self._state = ExtensionState.CONNECTED
                 self._verification_info = None
 
