@@ -616,7 +616,7 @@ DESCRIPTORS: list[ProviderDescriptor] = [
             ),
         ],
         build=_build_cloudflare,
-        recommended_model="@cf/openai/gpt-oss-120b",
+        recommended_model="google/gemini-3.8-flash",
         env_key="CLOUDFLARE_API_TOKEN",
         blurb="Uses Cloudflare's account-scoped OpenAI-compatible Workers AI API.",
     ),

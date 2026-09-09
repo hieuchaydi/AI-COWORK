@@ -424,14 +424,13 @@ def test_cloudflare_builder_never_falls_back_to_openai(monkeypatch):
         build_provider_client("cloudflare", {"account_id": "account-123"}, None)
 
 
-def test_cloudflare_models_are_registered_with_agent_capabilities():
+def test_cloudflare_model_is_registered_with_agent_capabilities():
     from coworker.providers.capabilities import capabilities_for
     from coworker.providers.matrix import models_for_provider
 
     models = models_for_provider("cloudflare")
-    assert "@cf/openai/gpt-oss-120b" in models
-    assert "@cf/meta/llama-3.3-70b-instruct-fp8-fast" in models
-    assert capabilities_for("cloudflare:@cf/openai/gpt-oss-120b").tools
+    assert models == ["google/gemini-3.8-flash"]
+    assert capabilities_for("cloudflare:google/gemini-3.8-flash").tools
 
 
 # -- curated model matrix (labels + capabilities by full routed id) -----------------

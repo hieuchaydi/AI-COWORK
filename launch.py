@@ -3848,8 +3848,7 @@ def _seed_runtime_state() -> None:
             }},
         )
         picker.extend([
-            "cloudflare:@cf/openai/gpt-oss-120b",
-            "cloudflare:@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+            "cloudflare:google/gemini-3.8-flash",
         ])
     # Auto-add Claude models when the key is present — best tool-use quality.
     if ANTHROPIC_KEY:
@@ -3877,6 +3876,8 @@ def _seed_runtime_state() -> None:
         "gemini:gemma-4-26b-a4b-it",            # removed per user request
         "groq:llama-3.3-70b-versatile",        # deprecated 2026-08-16
         "ollama:qwen2.5:7b",
+        "cloudflare:@cf/openai/gpt-oss-120b",
+        "cloudflare:@cf/meta/llama-3.3-70b-instruct-fp8-fast",
         "cloudflare:google/gemini-3.6-flash",
     ]
     for model in hide:
@@ -3898,7 +3899,7 @@ def _seed_runtime_state() -> None:
     elif CEREBRAS_KEY:
         default_model = "cerebras:gpt-oss-120b"
     elif CLOUDFLARE_TOKEN and CLOUDFLARE_ACCOUNT_ID:
-        default_model = "cloudflare:@cf/openai/gpt-oss-120b"
+        default_model = "cloudflare:google/gemini-3.8-flash"
     elif COHERE_KEY:
         default_model = "cohere:command-a-reasoning-08-2025"
     else:

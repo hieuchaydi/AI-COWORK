@@ -127,11 +127,8 @@ MATRIX: dict[str, ModelEntry] = {
         "Gemini 2.5 Flash-Lite · Google", _AGENTIC_VISION, 1_048_576
     ),
     # Cloudflare Workers AI through its account-scoped OpenAI-compatible API.
-    "cloudflare:@cf/openai/gpt-oss-120b": ModelEntry(
-        "GPT-OSS 120B · Cloudflare", _AGENTIC, 128_000
-    ),
-    "cloudflare:@cf/meta/llama-3.3-70b-instruct-fp8-fast": ModelEntry(
-        "Llama 3.3 70B · Cloudflare", _AGENTIC, 24_000
+    "cloudflare:google/gemini-3.8-flash": ModelEntry(
+        "Gemini 3.8 Flash · Cloudflare", _AGENTIC, 1_000_000
     ),
     # -- direct OpenAI-compatible vendors ----------------------------------------
     # Muse Spark (Meta Model API, public preview 2026-07-09): multimodal + tools via
