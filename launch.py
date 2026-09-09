@@ -109,6 +109,8 @@ CEREBRAS_KEY = os.environ.get("CEREBRAS_API_KEY", "")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
 COHERE_KEY = os.environ.get("COHERE_API_KEY", "")
+CLOUDFLARE_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 API_TOKEN = os.environ.get("CONNECT_AI_API_TOKEN") or os.environ.get(
     "COWORKER_API_TOKEN", "connect-ai-dev-token"
 )
@@ -3837,6 +3839,18 @@ def _seed_runtime_state() -> None:
     # (compat providers fail on first use without a key). gpt-oss-120b = best tool use.
     if CEREBRAS_KEY:
         picker.append("cerebras:gpt-oss-120b")
+    if CLOUDFLARE_TOKEN and CLOUDFLARE_ACCOUNT_ID:
+        _ow_post(
+            "/v1/providers",
+            {"name": "cloudflare", "fields": {
+                "api_token": CLOUDFLARE_TOKEN,
+                "account_id": CLOUDFLARE_ACCOUNT_ID,
+            }},
+        )
+        picker.extend([
+            "cloudflare:@cf/openai/gpt-oss-120b",
+            "cloudflare:@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        ])
     # Auto-add Claude models when the key is present — best tool-use quality.
     if ANTHROPIC_KEY:
         picker[:0] = [
@@ -3863,13 +3877,12 @@ def _seed_runtime_state() -> None:
         "gemini:gemma-4-26b-a4b-it",            # removed per user request
         "groq:llama-3.3-70b-versatile",        # deprecated 2026-08-16
         "ollama:qwen2.5:7b",
-        "cloudflare:@cf/openai/gpt-oss-120b",
-        "cloudflare:@cf/meta/llama-3.3-70b-instruct-fp8-fast",
         "cloudflare:google/gemini-3.6-flash",
     ]
     for model in hide:
         _ow_post("/v1/settings/models/remove", {"model": model})
-    _ow_delete("/v1/providers/cloudflare")
+    if not (CLOUDFLARE_TOKEN and CLOUDFLARE_ACCOUNT_ID):
+        _ow_delete("/v1/providers/cloudflare")
 
     # 1c. Select the strongest available model automatically. The picker keeps
     # faster/cheaper alternatives, but adding a provider key should immediately
@@ -3884,6 +3897,8 @@ def _seed_runtime_state() -> None:
         default_model = "groq:openai/gpt-oss-120b"
     elif CEREBRAS_KEY:
         default_model = "cerebras:gpt-oss-120b"
+    elif CLOUDFLARE_TOKEN and CLOUDFLARE_ACCOUNT_ID:
+        default_model = "cloudflare:@cf/openai/gpt-oss-120b"
     elif COHERE_KEY:
         default_model = "cohere:command-a-reasoning-08-2025"
     else:
