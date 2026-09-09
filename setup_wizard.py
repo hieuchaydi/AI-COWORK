@@ -96,6 +96,13 @@ FIELDS = [
         "prefix": "sk-",
     },
     {
+        "env_key": "CEREBRAS_API_KEY",
+        "label": "Cerebras API Key",
+        "required": False,
+        "hint": "cloud.cerebras.ai  (Qwen 3.8 27B, Gemma 4 31B, GPT-OSS 120B)",
+        "link": "https://cloud.cerebras.ai/",
+    },
+    {
         "env_key": "CLOUDFLARE_API_TOKEN",
         "label": "Cloudflare API Token",
         "required": False,
