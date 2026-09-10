@@ -2273,4 +2273,70 @@ test('tryAutoDragShopeeCaptcha executes realistic drag via chrome.debugger', asy
   assert.equal(mouseReleasedCmds[0].params.button, 'left');
 });
 
+test('detectCaptchaInTab finds orange button by track text when standard classes are missing and avoids puzzle image center', async () => {
+  const { context } = await worker();
+  vm.runInContext(`
+    chrome.scripting = {
+      executeScript: async ({ func, args }) => {
+        globalThis.location = { href: "https://shopee.vn/verify/captcha?anti_bot_tracking_id=image_drag_case" };
+        const textTrackNode = {
+          innerText: "Kéo qua để hoàn thiện bức hình",
+          offsetWidth: 200,
+          offsetHeight: 36,
+          parentElement: null,
+          getBoundingClientRect: () => ({ left: 100, top: 320, width: 200, height: 36 }),
+          querySelectorAll: () => [],
+        };
+        const orangeBtn = {
+          offsetWidth: 40,
+          offsetHeight: 40,
+          innerText: "→",
+          getBoundingClientRect: () => ({ left: 60, top: 318, width: 40, height: 40 }),
+          childElementCount: 1,
+        };
+        const trackContainer = {
+          offsetWidth: 300,
+          offsetHeight: 44,
+          getBoundingClientRect: () => ({ left: 50, top: 316, width: 300, height: 44 }),
+          querySelectorAll: (sel) => [orangeBtn],
+          parentElement: null,
+        };
+        textTrackNode.parentElement = trackContainer;
+
+        const modalContainer = {
+          offsetWidth: 340,
+          offsetHeight: 380,
+          getBoundingClientRect: () => ({ left: 30, top: 50, width: 340, height: 380 }),
+          scrollIntoView: () => {},
+        };
+        trackContainer.parentElement = modalContainer;
+
+        globalThis.document = {
+          body: { innerText: "Xác nhận để tiếp tục. Kéo qua để hoàn thiện bức hình." },
+          querySelector: (sel) => {
+            if (sel === ".shopee-captcha-slider") return modalContainer;
+            return null; // All standard button classes missing!
+          },
+          querySelectorAll: (sel) => {
+            if (sel.includes("div, span, p")) return [textTrackNode];
+            if (sel.includes("svg, i, div, span, button")) return [];
+            return [textTrackNode, orangeBtn, trackContainer];
+          },
+        };
+        globalThis.window = {
+          getComputedStyle: () => ({ backgroundColor: "rgb(238, 77, 45)" }),
+        };
+        return [{ result: func(...(args || [])) }];
+      },
+    };
+  `, context);
+
+  const detection = await vm.runInContext('detectCaptchaInTab(701)', context);
+  assert.equal(detection.detected, true);
+  assert.equal(detection.slider.isOrangeHandle, true, 'must find orange handle from track text hierarchy');
+  assert.equal(detection.slider.x, 80, 'must target center of orange button (left 60 + 20)');
+  assert.equal(detection.slider.y, 338, 'must target y=338 (bottom slider bar), NOT y=240 (middle of puzzle image)');
+});
+
+
 

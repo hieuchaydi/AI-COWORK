@@ -2188,7 +2188,9 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
           ".shopee-captcha-slider__track",
           ".verify-slider",
           "div[class*='slider-track']",
-          "div[class*='slider__track']"
+          "div[class*='slider__track']",
+          "div[class*='drag-track']",
+          "div[class*='drag_track']"
         ];
         let trackEl = null;
         for (const sel of trackSelectors) {
@@ -2198,13 +2200,41 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
             break;
           }
         }
+        if (!trackEl) {
+          try {
+            const allNodes = Array.from(document.querySelectorAll("div, span, p"));
+            const trackTextNode = allNodes.find((el) => {
+              const t = (el.innerText || el.textContent || "").toLowerCase();
+              return t.includes("kéo qua để hoàn thiện bức hình") || t.includes("kéo thanh trượt") || t.includes("hoàn thiện bức hình");
+            });
+            if (trackTextNode) {
+              let cur = trackTextNode;
+              for (let i = 0; i < 4 && cur && cur !== document.body; i++) {
+                if (cur.offsetWidth > 150 && cur.offsetHeight >= 24 && cur.offsetHeight <= 90) {
+                  trackEl = cur;
+                  break;
+                }
+                cur = cur.parentElement;
+              }
+            }
+          } catch {}
+        }
 
         const handleSelectors = [
           ".shopee-captcha-slider__btn",
           ".shopee-captcha-slider__button",
           "div[class*='slider__btn']",
           "div[class*='slider-btn']",
-          ".verify-slider__btn"
+          "div[class*='slider__handler']",
+          "div[class*='slider-handler']",
+          "div[class*='slider__handle']",
+          "div[class*='slider-handle']",
+          "div[class*='slider__thumb']",
+          "div[class*='slider-thumb']",
+          "div[class*='drag-btn']",
+          "div[class*='drag-button']",
+          ".verify-slider__btn",
+          "[role='slider']"
         ];
         let handleEl = null;
         for (const sel of handleSelectors) {
@@ -2213,6 +2243,13 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
             handleEl = el;
             break;
           }
+        }
+        if (!handleEl && trackEl) {
+          const trackChildren = Array.from(trackEl.querySelectorAll("div, button, span, i"));
+          handleEl = trackChildren.find((el) => {
+            const r = el.getBoundingClientRect();
+            return r.width >= 24 && r.width <= 80 && r.height >= 24 && r.height <= 80;
+          }) || null;
         }
 
         const trackWidth = trackEl ? trackEl.offsetWidth : (bgEl ? bgEl.offsetWidth : 300);
@@ -2364,12 +2401,14 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
   if (!tabId || !detection?.detected) return { attempted: false, reason: "no_captcha_detection" };
 
   let slider = detection.slider;
-  if (!slider && chrome.scripting?.executeScript) {
+  // Nếu chưa có toạ độ hoặc toạ độ hiện tại chưa phải là Nút trượt cam thật sự (isOrangeHandle: false)
+  if ((!slider || !slider.isOrangeHandle) && chrome.scripting?.executeScript) {
     try {
       const results = await chrome.scripting.executeScript({
         target: { tabId, allFrames: true },
         world: "MAIN",
         func: () => {
+          // 1. Selector chuẩn cho nút trượt
           const handleSelectors = [
             ".shopee-captcha-slider__btn",
             ".shopee-captcha-slider__button",
@@ -2377,10 +2416,20 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
             "div[class*='slider__button']",
             "div[class*='slider-btn']",
             "div[class*='slider-button']",
+            "div[class*='slider__handler']",
+            "div[class*='slider-handler']",
+            "div[class*='slider__handle']",
+            "div[class*='slider-handle']",
+            "div[class*='slider__thumb']",
+            "div[class*='slider-thumb']",
+            "div[class*='drag-btn']",
+            "div[class*='drag-button']",
+            "div[class*='drag__btn']",
+            "div[class*='drag__button']",
             ".verify-slider__btn",
             ".geetest_slider_btn",
             ".shopee-drag-button",
-            "div[class*='drag-btn']"
+            "[role='slider']",
           ];
           for (const selector of handleSelectors) {
             const el = document.querySelector(selector);
@@ -2395,6 +2444,122 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
               isOrangeHandle: true,
             };
           }
+
+          // 2. Tìm theo text thanh trượt "Kéo qua để hoàn thiện bức hình"
+          try {
+            const allNodes = Array.from(document.querySelectorAll("div, span, p"));
+            const trackTextNode = allNodes.find((el) => {
+              const t = (el.innerText || el.textContent || "").toLowerCase();
+              return t.includes("kéo qua để hoàn thiện bức hình") || t.includes("kéo thanh trượt") || t.includes("hoàn thiện bức hình");
+            });
+            if (trackTextNode) {
+              let trackBox = trackTextNode;
+              for (let i = 0; i < 4 && trackBox && trackBox !== document.body; i++) {
+                if (trackBox.offsetWidth > 150 && trackBox.offsetHeight >= 24 && trackBox.offsetHeight <= 90) {
+                  break;
+                }
+                trackBox = trackBox.parentElement;
+              }
+              if (trackBox) {
+                const tRect = trackBox.getBoundingClientRect();
+                const children = Array.from(trackBox.querySelectorAll("div, button, span, i"));
+                const btnInTrack = children.find((el) => {
+                  const r = el.getBoundingClientRect();
+                  return r.width >= 24 && r.width <= 80 && r.height >= 24 && r.height <= 80 && (r.left - tRect.left) < (tRect.width * 0.4);
+                });
+                if (btnInTrack) {
+                  const r = btnInTrack.getBoundingClientRect();
+                  return {
+                    selector: "track-text-btn",
+                    x: Math.round(r.left + r.width / 2),
+                    y: Math.round(r.top + r.height / 2),
+                    width: Math.round(r.width),
+                    height: Math.round(r.height),
+                    isOrangeHandle: true,
+                  };
+                }
+                // Nút luôn ở mép trái của thanh track
+                return {
+                  selector: "track-left-edge",
+                  x: Math.round(tRect.left + Math.min(26, tRect.height / 2)),
+                  y: Math.round(tRect.top + tRect.height / 2),
+                  width: Math.round(tRect.width),
+                  height: Math.round(tRect.height),
+                  isOrangeHandle: true,
+                };
+              }
+            }
+          } catch {}
+
+          // 3. Tìm nút chứa ký tự/icon mũi tên qua phải `→`
+          try {
+            const arrowCandidates = Array.from(document.querySelectorAll("div, button, span, svg, i"));
+            const arrowEl = arrowCandidates.find((el) => {
+              if (!el.offsetWidth || !el.offsetHeight) return false;
+              const txt = el.innerText || el.textContent || "";
+              if (txt.includes("→") || txt.includes("\u2192") || txt.includes("\u279c") || txt.includes("\u2794")) return true;
+              if (el.tagName === "svg" || el.querySelector("svg")) {
+                const s = (el.outerHTML || "").toLowerCase();
+                return s.includes("arrow") || s.includes("path");
+              }
+              return false;
+            });
+            if (arrowEl) {
+              let cur = arrowEl;
+              for (let i = 0; i < 3 && cur && cur !== document.body; i++) {
+                const r = cur.getBoundingClientRect();
+                if (r.width >= 25 && r.width <= 80 && r.height >= 25 && r.height <= 80) {
+                  return {
+                    selector: "arrow-icon-btn",
+                    x: Math.round(r.left + r.width / 2),
+                    y: Math.round(r.top + r.height / 2),
+                    width: Math.round(r.width),
+                    height: Math.round(r.height),
+                    isOrangeHandle: true,
+                  };
+                }
+                cur = cur.parentElement;
+              }
+            }
+          } catch {}
+
+          // 4. Tìm phần tử nút màu cam Shopee linh hoạt
+          try {
+            const candidates = Array.from(document.querySelectorAll("div, button, span, i"));
+            const orangeEl = candidates.find((el) => {
+              if (!el.offsetWidth || !el.offsetHeight) return false;
+              if (el.offsetWidth < 25 || el.offsetWidth > 90 || el.offsetHeight < 25 || el.offsetHeight > 90) return false;
+              const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(el) : null;
+              if (!style) return false;
+              const bg = (style.backgroundColor || "").toLowerCase();
+              const bgImg = (style.backgroundImage || "").toLowerCase();
+              if (bgImg.includes("gradient") && (bgImg.includes("238") || bgImg.includes("255") || bgImg.includes("orange") || bgImg.includes("red"))) {
+                return true;
+              }
+              const m = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+              if (m) {
+                const r = parseInt(m[1], 10);
+                const g = parseInt(m[2], 10);
+                const b = parseInt(m[3], 10);
+                if (r >= 170 && g <= 150 && b <= 120 && (r - g) >= 40) return true;
+              }
+              return bg.includes("238, 77, 45") || bg.includes("ee4d2d") || bg.includes("ff5722");
+            });
+            if (orangeEl) {
+              const r = orangeEl.getBoundingClientRect();
+              return {
+                selector: "shopee-orange-flexible",
+                x: Math.round(r.left + r.width / 2),
+                y: Math.round(r.top + r.height / 2),
+                width: Math.round(r.width),
+                height: Math.round(r.height),
+                isOrangeHandle: true,
+              };
+            }
+          } catch {}
+
+          // 5. Container fallback: TUYỆT ĐỐI KHÔNG dùng rect.top + rect.height / 2 (vì đó là tấm ảnh puzzle)!
+          // Thanh trượt nằm ở vùng 78% chiều cao modal
           const containerSelectors = [
             ".shopee-captcha-slider",
             ".shopee-captcha-slider__button",
@@ -2413,6 +2578,8 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
               selector,
               x: Math.round(rect.left + Math.min(32, rect.width / 2)),
               y: Math.round(rect.top + rect.height / 2),
+              x: Math.round(rect.left + Math.min(36, rect.width * 0.12)),
+              y: Math.round(rect.top + rect.height * 0.78),
               width: Math.round(rect.width),
               height: Math.round(rect.height),
               isOrangeHandle: false,
@@ -2422,9 +2589,29 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
         },
       });
       slider = results?.find((r) => r?.result)?.result || null;
+      const found = results?.find((r) => r?.result)?.result || null;
+      if (found && (found.isOrangeHandle || !slider)) {
+        slider = found;
+      }
     } catch (err) {
       console.warn("[bridge] Slider coordinate lookup failed:", err?.message || err);
     }
+  }
+
+  // Chặn trình duyệt kích hoạt HTML5 native drag trên các thẻ ảnh (gây hiện tượng kéo bóng ảnh)
+  if (chrome.scripting?.executeScript) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        world: "MAIN",
+        func: () => {
+          document.querySelectorAll("img, canvas").forEach((el) => {
+            el.setAttribute("draggable", "false");
+            el.ondragstart = (e) => e.preventDefault();
+          });
+        },
+      });
+    } catch {}
   }
 
   if (!slider || !Number.isFinite(slider.x) || !Number.isFinite(slider.y)) {
@@ -2552,8 +2739,19 @@ async function detectCaptchaInTab(tabId, options = {}) {
           "div[class*='slider__button']",
           "div[class*='slider-btn']",
           "div[class*='slider-button']",
+          "div[class*='slider__handler']",
+          "div[class*='slider-handler']",
+          "div[class*='slider__handle']",
+          "div[class*='slider-handle']",
+          "div[class*='slider__thumb']",
+          "div[class*='slider-thumb']",
+          "div[class*='drag-btn']",
+          "div[class*='drag-button']",
+          "div[class*='drag__btn']",
+          "div[class*='drag__button']",
           ".verify-slider__btn",
           ".geetest_slider_btn",
+          "[role='slider']",
         ];
 
         let handleEl = null;
@@ -2570,17 +2768,88 @@ async function detectCaptchaInTab(tabId, options = {}) {
         }
 
         // Nếu chưa tìm thấy class handle, quét tìm phần tử màu cam Shopee (#ee4d2d / rgb(238, 77, 45)) có hình nút
+        // 2b. Tìm Track theo văn bản hiển thị đặc trưng: "Kéo qua để hoàn thiện bức hình"
+        let trackEl = null;
+        try {
+          const allDivs = Array.from(document.querySelectorAll("div, span, p"));
+          const textTrack = allDivs.find((el) => {
+            const t = (el.innerText || el.textContent || "").toLowerCase();
+            return t.includes("kéo qua để hoàn thiện bức hình") || t.includes("kéo thanh trượt") || t.includes("hoàn thiện bức hình");
+          });
+          if (textTrack) {
+            let cur = textTrack;
+            for (let i = 0; i < 4 && cur && cur !== document.body; i++) {
+              if (cur.offsetWidth > 150 && cur.offsetHeight >= 24 && cur.offsetHeight <= 90) {
+                trackEl = cur;
+                break;
+              }
+              cur = cur.parentElement;
+            }
+            if (trackEl && !handleEl) {
+              const trackChildren = Array.from(trackEl.querySelectorAll("div, button, span, i"));
+              const tRect = trackEl.getBoundingClientRect();
+              handleEl = trackChildren.find((el) => {
+                const r = el.getBoundingClientRect();
+                return r.width >= 24 && r.width <= 80 && r.height >= 24 && r.height <= 80 && (r.left - tRect.left) < (tRect.width * 0.4);
+              }) || null;
+              if (handleEl) handleSelector = "track-text-btn";
+            }
+          }
+        } catch {}
+
+        // 2c. Tìm Nút có chứa icon mũi tên `→`
+        if (!handleEl) {
+          try {
+            const arrowCandidates = Array.from(document.querySelectorAll("div, button, span, svg, i"));
+            const arrowEl = arrowCandidates.find((el) => {
+              if (!el.offsetWidth || !el.offsetHeight) return false;
+              const txt = el.innerText || el.textContent || "";
+              if (txt.includes("→") || txt.includes("\u2192") || txt.includes("\u279c") || txt.includes("\u2794")) return true;
+              if (el.tagName === "svg" || el.querySelector("svg")) {
+                const s = (el.outerHTML || "").toLowerCase();
+                return s.includes("arrow") || s.includes("path");
+              }
+              return false;
+            });
+            if (arrowEl) {
+              let cur = arrowEl;
+              for (let i = 0; i < 3 && cur && cur !== document.body; i++) {
+                const r = cur.getBoundingClientRect();
+                if (r.width >= 25 && r.width <= 80 && r.height >= 25 && r.height <= 80) {
+                  handleEl = cur;
+                  handleSelector = "arrow-icon-btn";
+                  break;
+                }
+                cur = cur.parentElement;
+              }
+            }
+          } catch {}
+        }
+
+        // 2d. Quét tìm phần tử màu cam Shopee linh hoạt
         if (!handleEl && typeof document.querySelectorAll === "function") {
           try {
             const candidates = Array.from(document.querySelectorAll("div, button, span, i"));
             handleEl = candidates.find((el) => {
               if (!el.offsetWidth || !el.offsetHeight) return false;
-              if (el.offsetWidth > 120) return false; // Nút trượt vuông nhỏ khoảng 40-60px
+              if (el.offsetWidth < 25 || el.offsetWidth > 90 || el.offsetHeight < 25 || el.offsetHeight > 90) return false;
               const style = typeof win.getComputedStyle === "function" ? win.getComputedStyle(el) : null;
-              const bg = style?.backgroundColor || "";
-              return bg.includes("238, 77, 45") || bg.includes("ee4d2d");
+              if (!style) return false;
+              const bg = (style?.backgroundColor || "").toLowerCase();
+              const bgImg = (style?.backgroundImage || "").toLowerCase();
+              if (bgImg.includes("gradient") && (bgImg.includes("238") || bgImg.includes("255") || bgImg.includes("orange") || bgImg.includes("red"))) {
+                return true;
+              }
+              const m = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+              if (m) {
+                const r = parseInt(m[1], 10);
+                const g = parseInt(m[2], 10);
+                const b = parseInt(m[3], 10);
+                if (r >= 170 && g <= 150 && b <= 120 && (r - g) >= 40) return true;
+              }
+              return bg.includes("238, 77, 45") || bg.includes("ee4d2d") || bg.includes("ff5722");
             }) || null;
-            if (handleEl) handleSelector = "shopee-orange-handle";
+            if (handleEl) handleSelector = "shopee-orange-flexible";
           } catch {}
         }
 
@@ -2619,7 +2888,7 @@ async function detectCaptchaInTab(tabId, options = {}) {
         }
 
         // Nếu có phần tử Captcha (handle hoặc container)
-        const primaryEl = containerEl || handleEl;
+        const primaryEl = containerEl || trackEl || handleEl;
         if (primaryEl) {
           // Chỉ scroll một lần duy nhất vào trung tâm màn hình, không scroll giật giật lặp lại
           const alreadyScrolled = Boolean(win.__shopeeCaptchaScrolled);
@@ -2646,13 +2915,25 @@ async function detectCaptchaInTab(tabId, options = {}) {
               isOrangeHandle: true,
               handleSelector: handleSelector || null,
             };
+          } else if (trackEl) {
+            const tRect = trackEl.getBoundingClientRect();
+            sliderCoordinates = {
+              x: Math.round(tRect.left + Math.min(26, tRect.height / 2)),
+              y: Math.round(tRect.top + tRect.height / 2),
+              width: Math.round(tRect.width),
+              height: Math.round(tRect.height),
+              isOrangeHandle: true,
+              handleSelector: "track-edge-fallback",
+            };
           } else if (containerEl) {
             const cRect = typeof containerEl.getBoundingClientRect === "function"
               ? containerEl.getBoundingClientRect()
               : { left: 0, top: 0, width: containerEl.offsetWidth || 0, height: containerEl.offsetHeight || 0 };
+            // TUYỆT ĐỐI KHÔNG DÙNG cRect.top + cRect.height / 2 (vì đó là tấm ảnh puzzle)!
+            // Thanh trượt luôn nằm ở khoảng 78% chiều cao của modal
             sliderCoordinates = {
-              x: Math.round(cRect.left + Math.min(32, cRect.width / 2)),
-              y: Math.round(cRect.top + cRect.height / 2),
+              x: Math.round(cRect.left + Math.min(36, cRect.width * 0.12)),
+              y: Math.round(cRect.top + cRect.height * 0.78),
               width: Math.round(cRect.width),
               height: Math.round(cRect.height),
               isOrangeHandle: false,
