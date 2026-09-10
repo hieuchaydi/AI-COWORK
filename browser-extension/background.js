@@ -3177,7 +3177,9 @@ async function handleAction(action, params) {
           try { currentJobExecution.abortController?.abort(); } catch {}
           currentJobExecution = null;
         }
-        jobQueue = jobQueue.filter((entry) => entry?.job?.id !== jobId);
+        for (let i = jobQueue.length - 1; i >= 0; i--) {
+          if (jobQueue[i]?.job?.id === jobId) jobQueue.splice(i, 1);
+        }
         if (activeJobs.size === 0 && jobQueue.length === 0) {
           isQueueRunning = false;
           updateState("connected");
@@ -3193,7 +3195,7 @@ async function handleAction(action, params) {
       const queuedJobIds = jobQueue.map((entry) => entry?.job?.id).filter(Boolean);
       try { currentJobExecution?.abortController?.abort(); } catch {}
       activeJobs.clear();
-      jobQueue = [];
+      jobQueue.length = 0;
       currentJobExecution = null;
       isQueueRunning = false;
       updateState("connected");
