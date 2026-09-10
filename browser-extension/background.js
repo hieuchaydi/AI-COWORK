@@ -2366,8 +2366,6 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
   let slider = detection.slider;
   if (!slider && chrome.scripting?.executeScript) {
     try {
-      const [res] = await chrome.scripting.executeScript({
-        target: { tabId },
       const results = await chrome.scripting.executeScript({
         target: { tabId, allFrames: true },
         world: "MAIN",
@@ -2423,7 +2421,6 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
           return null;
         },
       });
-      slider = res?.result || null;
       slider = results?.find((r) => r?.result)?.result || null;
     } catch (err) {
       console.warn("[bridge] Slider coordinate lookup failed:", err?.message || err);
@@ -2436,48 +2433,26 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
 
   const startX = slider.x;
   const startY = slider.y;
-  const travel = Math.max(240, Number(slider.width || 300) - 18);
-  const endX = startX + travel;
-  const points = [];
-  for (let i = 0; i <= 18; i++) {
-    const t = i / 18;
-    const ease = 1 - Math.pow(1 - t, 2);
-    const jitter = Math.sin(i * 1.7) * 1.5;
-    points.push({ x: Math.round(startX + travel * ease), y: Math.round(startY + jitter) });
-  }
-
-  // Tính khoảng cách cần kéo theo cự ly thực tế
   const distance = await calculatePuzzleDistance(tabId, slider);
   console.log(`[bridge] Calculated puzzle travel: ${distance}px (startX: ${startX}, startY: ${startY})`);
-
-  // Sinh quỹ đạo mô phỏng tay người
   const points = generateHumanTrajectory(startX, startY, distance);
   const endX = startX + distance;
 
-  // Thực thi qua Chrome Debugger API để đạt isTrusted = true
   if (chrome.debugger?.attach && chrome.debugger?.sendCommand && chrome.debugger?.detach) {
     const target = { tabId };
     let attached = false;
     try {
       await chrome.debugger.attach(target, "1.3");
       attached = true;
-      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: startX, y: startY, button: "left" });
-      // 1. Hover
       await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: startX, y: startY, button: "none" });
       await new Promise((r) => setTimeout(r, 60 + Math.random() * 40));
-      // 2. Mousedown
       await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mousePressed", x: startX, y: startY, button: "left", clickCount: 1 });
-      // 3. Mousemove từng điểm
       for (const point of points) {
         await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y, button: "left", buttons: 1 });
-        await new Promise((r) => setTimeout(r, 28 + Math.floor(Math.random() * 18)));
         await new Promise((r) => setTimeout(r, point.delay));
       }
-      // Dừng nhẹ 90-130ms trước khi thả
       await new Promise((r) => setTimeout(r, 90 + Math.random() * 40));
-      // 4. Mouseup
       await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: startY, button: "left", clickCount: 1 });
-      return { attempted: true, method: "debugger", startX, startY, endX };
       return { attempted: true, method: "debugger", startX, startY, endX, distance };
     } catch (err) {
       console.warn("[bridge] Debugger slider drag failed:", err?.message || err);
@@ -2488,13 +2463,10 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
     }
   }
 
-  // Fallback qua DOM events nếu Debugger API không khả dụng
   if (chrome.scripting?.executeScript) {
     const [res] = await chrome.scripting.executeScript({
       target: { tabId },
       world: "MAIN",
-      func: (x, y, toX) => {
-        const target = document.elementFromPoint(x, y);
       func: (pts, sx, sy, fx) => {
         const target = document.elementFromPoint(sx, sy);
         if (!target) return { attempted: false, reason: "element_from_point_missing" };
@@ -2503,22 +2475,15 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
           target.dispatchEvent(new MouseEvent(type, opts));
           if (typeof PointerEvent !== "undefined") target.dispatchEvent(new PointerEvent(type.replace("mouse", "pointer"), { ...opts, pointerId: 1, pointerType: "mouse", isPrimary: true }));
         };
-        fire("mousedown", x, y);
-        for (let i = 1; i <= 16; i++) {
-          const t = i / 16;
-          fire("mousemove", Math.round(x + (toX - x) * t), Math.round(y + Math.sin(i) * 2));
         fire("mousedown", sx, sy);
         for (const pt of pts) {
           fire("mousemove", pt.x, pt.y);
         }
-        fire("mouseup", toX, y);
         fire("mouseup", fx, sy);
         return { attempted: true, method: "dom_events" };
       },
-      args: [startX, startY, endX],
       args: [points, startX, startY, endX],
     });
-    return res?.result || { attempted: true, method: "dom_events" };
     return res?.result || { attempted: true, method: "dom_events", distance };
   }
 
