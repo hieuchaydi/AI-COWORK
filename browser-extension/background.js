@@ -753,13 +753,11 @@ function classifyShopeeFailure(fetchRes) {
   const url = String(fetchRes?.url || "").toLowerCase();
   const pageUrl = String(fetchRes?.pageUrl || "").toLowerCase();
   const sample = String(fetchRes?.textSample || fetchRes?.error || "").toLowerCase();
-  if (shopeeLoginState(fetchRes) === false) return "login";
-
-  const isChallenge = isShopeeChallenge(url, pageUrl, sample);
-  if (isChallenge) return "verification";
-
   const loginState = shopeeLoginState(fetchRes);
   if (loginState === false) return "login";
+
+  if (isShopeeChallenge(url, pageUrl, sample)) return "verification";
+  if (loginState === true) return "api_blocked";
 
   if (fetchRes?.status === 403 || json?.error === 90309999 || sample.includes("90309999") ||
       sample.includes("403") || sample.includes("access denied") || sample.includes("api_blocked")) {
@@ -786,6 +784,7 @@ function formatShopeeFailure(fetchRes) {
 function extractVerificationUrl(input) {
   if (!input) return "";
   const isTarget = (str) => typeof str === "string" && (str.includes("/verify/") || str.includes("anti_bot_tracking_id"));
+  const urlPattern = /https?:\/\/[^\s"'`<>]+(?:verify\/(?:traffic|captcha|slider|[a-zA-Z0-9_-]+)|anti_bot_tracking_id)[^\s"'`<>;,)]*/;
   if (typeof input === "object") {
     if (isTarget(input.verification_url)) return input.verification_url.replace(/[;,.)]+$/, "");
     if (isTarget(input.target_url)) return input.target_url.replace(/[;,.)]+$/, "");
@@ -793,10 +792,10 @@ function extractVerificationUrl(input) {
     if (isTarget(input.url)) return input.url.replace(/[;,.)]+$/, "");
     if (isTarget(input.responseUrl)) return input.responseUrl.replace(/[;,.)]+$/, "");
     const str = `${input.reason || ""} ${input.error || ""} ${input.message || ""} ${input.textSample || ""}`;
-    const match = str.match(/https?:\/\/[^\s"'`<>]+(?:verify\/(?:traffic|captcha|slider|[a-zA-Z0-9_-]+)|anti_bot_tracking_id)[^\s"'`<>;,)]*/);
+    const match = str.match(urlPattern);
     if (match) return match[0].replace(/[;,.)]+$/, "");
   } else if (typeof input === "string") {
-    const match = input.match(/https?:\/\/[^\s"'`<>]+(?:verify\/(?:traffic|captcha|slider|[a-zA-Z0-9_-]+)|anti_bot_tracking_id)[^\s"'`<>;,)]*/);
+    const match = input.match(urlPattern);
     if (match) return match[0].replace(/[;,.)]+$/, "");
   }
   return "";
@@ -2095,6 +2094,114 @@ async function captureTabEvidence(tabId) {
   }
 }
 
+async function tryAutoDragShopeeCaptcha(tabId, detection) {
+  if (!tabId || !detection?.detected) return { attempted: false, reason: "no_captcha_detection" };
+
+  let slider = detection.slider;
+  if (!slider && chrome.scripting?.executeScript) {
+    try {
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: () => {
+          const selectors = [
+            ".shopee-captcha-slider",
+            ".shopee-captcha-slider__button",
+            ".shopee-captcha-slider__btn",
+            ".verify-slider",
+            "[class*='captcha'][class*='slider']",
+          ];
+          for (const selector of selectors) {
+            const el = document.querySelector(selector);
+            if (!el || (!el.offsetWidth && !el.offsetHeight)) continue;
+            if (typeof el.scrollIntoView === "function") {
+              el.scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
+            }
+            const rect = el.getBoundingClientRect();
+            return {
+              selector,
+              x: Math.round(rect.left + Math.min(32, rect.width / 2)),
+              y: Math.round(rect.top + rect.height / 2),
+              width: Math.round(rect.width),
+              height: Math.round(rect.height),
+            };
+          }
+          return null;
+        },
+      });
+      slider = res?.result || null;
+    } catch (err) {
+      console.warn("[bridge] Slider coordinate lookup failed:", err?.message || err);
+    }
+  }
+
+  if (!slider || !Number.isFinite(slider.x) || !Number.isFinite(slider.y)) {
+    return { attempted: false, reason: "slider_coordinates_missing" };
+  }
+
+  const startX = slider.x;
+  const startY = slider.y;
+  const travel = Math.max(240, Number(slider.width || 300) - 18);
+  const endX = startX + travel;
+  const points = [];
+  for (let i = 0; i <= 18; i++) {
+    const t = i / 18;
+    const ease = 1 - Math.pow(1 - t, 2);
+    const jitter = Math.sin(i * 1.7) * 1.5;
+    points.push({ x: Math.round(startX + travel * ease), y: Math.round(startY + jitter) });
+  }
+
+  if (chrome.debugger?.attach && chrome.debugger?.sendCommand && chrome.debugger?.detach) {
+    const target = { tabId };
+    let attached = false;
+    try {
+      await chrome.debugger.attach(target, "1.3");
+      attached = true;
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: startX, y: startY, button: "left" });
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mousePressed", x: startX, y: startY, button: "left", clickCount: 1 });
+      for (const point of points) {
+        await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y, button: "left", buttons: 1 });
+        await new Promise((r) => setTimeout(r, 28 + Math.floor(Math.random() * 18)));
+      }
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: startY, button: "left", clickCount: 1 });
+      return { attempted: true, method: "debugger", startX, startY, endX };
+    } catch (err) {
+      console.warn("[bridge] Debugger slider drag failed:", err?.message || err);
+    } finally {
+      if (attached) {
+        try { await chrome.debugger.detach(target); } catch {}
+      }
+    }
+  }
+
+  if (chrome.scripting?.executeScript) {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: (x, y, toX) => {
+        const target = document.elementFromPoint(x, y);
+        if (!target) return { attempted: false, reason: "element_from_point_missing" };
+        const fire = (type, px, py) => {
+          const opts = { bubbles: true, cancelable: true, clientX: px, clientY: py, screenX: px, screenY: py, buttons: type === "mouseup" ? 0 : 1 };
+          target.dispatchEvent(new MouseEvent(type, opts));
+          if (typeof PointerEvent !== "undefined") target.dispatchEvent(new PointerEvent(type.replace("mouse", "pointer"), { ...opts, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+        };
+        fire("mousedown", x, y);
+        for (let i = 1; i <= 16; i++) {
+          const t = i / 16;
+          fire("mousemove", Math.round(x + (toX - x) * t), Math.round(y + Math.sin(i) * 2));
+        }
+        fire("mouseup", toX, y);
+        return { attempted: true, method: "dom_events" };
+      },
+      args: [startX, startY, endX],
+    });
+    return res?.result || { attempted: true, method: "dom_events" };
+  }
+
+  return { attempted: false, reason: "no_input_backend" };
+}
+
 async function detectCaptchaInTab(tabId) {
   try {
     if (!tabId || !chrome.scripting?.executeScript) return { detected: false, resolved: false };
@@ -2106,8 +2213,6 @@ async function detectCaptchaInTab(tabId) {
         const isVerifyPage = url.includes("/verify/") || url.includes("anti_bot_tracking_id") || url.includes("captcha");
         const bodyText = document.body ? document.body.innerText.toLowerCase() : "";
 
-        // 1. Kiểm tra dấu hiệu ĐÃ GIẢI XONG (Ảnh 2 - Success / Resolved):
-        // Nút kéo chuyển sang màu xanh ngọc với dấu check ✔, hoặc class/style thành công
         const checkPassedSelectors = [
           ".shopee-captcha-slider__btn--success",
           ".captcha-passed",
@@ -2119,42 +2224,38 @@ async function detectCaptchaInTab(tabId) {
         ];
 
         let isResolved = false;
-        if (typeof document.querySelectorAll === "function") {
+        for (const s of checkPassedSelectors) {
           try {
-            const hasGreenCheck = Array.from(document.querySelectorAll("svg, i, div, span, button")).some((el) => {
-              const text = el.innerText || "";
-              const hasCheckChar = text.includes("✔") || text.includes("✓");
-              let isGreen = false;
-              try {
-                const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(el) : null;
-                const bg = style?.backgroundColor || "";
-                const color = style?.color || "";
-                isGreen = bg.includes("38, 170, 153") || bg.includes("32, 178, 170") || color.includes("38, 170, 153");
-              } catch {}
-              return hasCheckChar || isGreen;
-            });
-            if (hasGreenCheck) isResolved = true;
+            const el = document.querySelector(s);
+            if (el && (el.offsetWidth > 0 || el.offsetHeight > 0)) {
+              isResolved = true;
+              break;
+            }
           } catch {}
         }
-        if (!isResolved) {
-          for (const s of checkPassedSelectors) {
-            try {
-              const el = document.querySelector(s);
-              if (el && (el.offsetWidth > 0 || el.offsetHeight > 0)) {
-                isResolved = true;
-                break;
-              }
-            } catch {}
-          }
+        if (!isResolved && typeof document.querySelectorAll === "function") {
+          try {
+            isResolved = Array.from(document.querySelectorAll("svg, i, div, span, button")).some((el) => {
+              const text = el.innerText || "";
+              const hasCheckChar = text.includes("✔") || text.includes("✓");
+              const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(el) : null;
+              const bg = style?.backgroundColor || "";
+              const color = style?.color || "";
+              const isGreen = bg.includes("38, 170, 153") || bg.includes("32, 178, 170") || color.includes("38, 170, 153");
+              return hasCheckChar || isGreen;
+            });
+          } catch {}
         }
 
         if (isResolved) {
           return { detected: false, resolved: true, type: "slider_passed", pageUrl: location.href };
         }
 
-        // 2. Kiểm tra các selector CAPTCHA hoạt động và cuộn vào màn hình:
         const activeSelectors = [
           ".shopee-captcha-slider",
+          ".shopee-captcha-slider__bar",
+          ".shopee-captcha-slider__button",
+          ".shopee-captcha-slider__btn",
           ".captcha_container",
           ".geetest_radar_btn",
           ".geetest_canvas_bg",
@@ -2174,17 +2275,30 @@ async function detectCaptchaInTab(tabId) {
           try {
             const el = document.querySelector(sel);
             if (el && (el.offsetWidth > 0 || el.offsetHeight > 0)) {
-              try {
-                if (typeof el.scrollIntoView === "function") {
-                  el.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
-                }
-              } catch {}
-              return { detected: true, resolved: false, type: "dom_selector", selector: sel, elementFound: true, pageUrl: location.href };
+              if (typeof el.scrollIntoView === "function") {
+                el.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+              }
+              const rect = typeof el.getBoundingClientRect === "function"
+                ? el.getBoundingClientRect()
+                : { left: 0, top: 0, width: el.offsetWidth || 0, height: el.offsetHeight || 0 };
+              return {
+                detected: true,
+                resolved: false,
+                type: "dom_selector",
+                selector: sel,
+                elementFound: true,
+                pageUrl: location.href,
+                slider: {
+                  x: Math.round(rect.left + Math.min(32, rect.width / 2)),
+                  y: Math.round(rect.top + rect.height / 2),
+                  width: Math.round(rect.width),
+                  height: Math.round(rect.height),
+                },
+              };
             }
           } catch {}
         }
 
-        // 3. Kiểm tra cụm từ văn bản trên trang (Ảnh 1 - Active Challenge text):
         const phrases = [
           "kéo qua để hoàn thiện bức hình",
           "hoàn thiện bức hình",
@@ -2251,6 +2365,7 @@ function startVerificationWatcher(details) {
   const referer = details?.referer || details?.url;
 
   let consecutiveAbsentCount = 0;
+  let autoDragAttempts = 0;
 
   const performCheckAndPreflight = async () => {
     if (!verificationInfo || verificationInfo.job_id !== jid || verificationInfo.kind !== "verification") {
@@ -2301,7 +2416,6 @@ function startVerificationWatcher(details) {
           resumeInFlightMap.set(jid, false);
           consecutiveAbsentCount = 0;
 
-          // Nếu API trả 403 mà tab không có challenge -> Chuyển sang api_blocked và DỪNG watcher để tránh loop!
           if (!check?.resolved && (preflightRes?.status === 403 || evalRes.error?.includes("403"))) {
             const currentTab = await chrome.tabs.get(targetTabId).catch(() => null);
             const isStillVerify = currentTab?.url && (currentTab.url.includes("/verify/") || currentTab.url.includes("captcha"));
@@ -2334,8 +2448,14 @@ function startVerificationWatcher(details) {
         }
       }
     } else {
-      // Challenge vẫn tồn tại trên tab
       consecutiveAbsentCount = 0;
+      if (autoDragAttempts < 3) {
+        autoDragAttempts++;
+        console.log(`[bridge] CAPTCHA still visible; attempting Shopee slider drag ${autoDragAttempts}/3 for job ${jid}`);
+        const dragRes = await tryAutoDragShopeeCaptcha(targetTabId, check);
+        console.log("[bridge] CAPTCHA slider drag result:", dragRes);
+        await new Promise((r) => setTimeout(r, 1600));
+      }
     }
   };
 
