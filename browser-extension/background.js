@@ -756,6 +756,7 @@ function classifyShopeeFailure(fetchRes) {
   const loginState = shopeeLoginState(fetchRes);
   if (loginState === false) return "login";
 
+  if (json?.error === 90309999 && json?.redirect_to_error_page === true) return "verification";
   if (isShopeeChallenge(url, pageUrl, sample)) return "verification";
   if (loginState === true) return "api_blocked";
 
@@ -791,6 +792,15 @@ function extractVerificationUrl(input) {
     if (isTarget(input.pageUrl)) return input.pageUrl.replace(/[;,.)]+$/, "");
     if (isTarget(input.url)) return input.url.replace(/[;,.)]+$/, "");
     if (isTarget(input.responseUrl)) return input.responseUrl.replace(/[;,.)]+$/, "");
+    const json = input.json || {};
+    if (json?.redirect_to_error_page === true && typeof json.tracking_id === "string" && json.tracking_id) {
+      let origin = "https://shopee.vn";
+      try {
+        const base = new URL(input.pageUrl || input.url || origin);
+        if (isShopeeHostname(base.hostname)) origin = base.origin;
+      } catch {}
+      return `${origin}/verify/traffic?anti_bot_tracking_id=${encodeURIComponent(json.tracking_id)}`;
+    }
     const str = `${input.reason || ""} ${input.error || ""} ${input.message || ""} ${input.textSample || ""}`;
     const match = str.match(urlPattern);
     if (match) return match[0].replace(/[;,.)]+$/, "");
@@ -845,7 +855,7 @@ function evaluatePreflightResult(fetchRes) {
   const isLoginRequired = explicitLoginState === false;
   const failureKind = classifyShopeeFailure(fetchRes);
   const isVerificationRequired = failureKind === "verification";
-  const isLogin = explicitLoginState === true || Boolean(fetchRes?.ok && !isLoginRequired && !isVerificationRequired);
+  const isLogin = !isVerificationRequired && (explicitLoginState === true || Boolean(fetchRes?.ok && !isLoginRequired));
   let error = null;
   if (isLoginRequired) {
     error = `Shopee login required (HTTP ${status ?? "unknown"}, error=${json?.error ?? "unknown"}, is_login=false) — hãy đăng nhập Shopee trên đúng tab Chrome`;
@@ -2415,6 +2425,28 @@ function startVerificationWatcher(details) {
           console.warn("[bridge] ✘ Preflight failed after challenge disappeared:", evalRes.error || preflightRes?.status || "unusable ratings payload");
           resumeInFlightMap.set(jid, false);
           consecutiveAbsentCount = 0;
+
+          if (classifyShopeeFailure(preflightRes) === "verification") {
+            const verificationUrl = extractVerificationUrl(preflightRes) || details?.verification_url || details?.target_url || details?.url;
+            if (verificationUrl && targetTabId && chrome.tabs?.update) {
+              try {
+                await chrome.tabs.update(targetTabId, { url: verificationUrl, active: true });
+              } catch (err) {
+                console.warn("[bridge] Could not navigate to Shopee verification URL:", err?.message || err);
+              }
+            }
+            await triggerVerificationRequired({
+              ...details,
+              job_id: jid,
+              tab_id: targetTabId,
+              verification_url: verificationUrl,
+              target_url: verificationUrl,
+              reason: evalRes.error || formatShopeeFailure(preflightRes),
+              kind: "verification",
+              checkpoint: details?.checkpoint,
+            });
+            return;
+          }
 
           if (!check?.resolved && (preflightRes?.status === 403 || evalRes.error?.includes("403"))) {
             const currentTab = await chrome.tabs.get(targetTabId).catch(() => null);

@@ -280,6 +280,19 @@ test('classifies Shopee API 403 separately from login and traffic verification',
     json: { error: 90309999, is_login: false },
     textSample: '{"error":90309999,"is_login":false}'
   })`, context), 'login');
+  assert.equal(vm.runInContext(`classifyShopeeFailure({
+    status: 403,
+    url: 'https://shopee.vn/api/v2/item/get_ratings?filter=0&flag=1&itemid=46508948627&limit=1&offset=0&shopid=111138057&type=0',
+    pageUrl: 'https://shopee.vn/product/111138057/46508948627',
+    json: { error: 90309999, is_login: true, action_type: 2, redirect_to_error_page: true, tracking_id: '741514ae635-0656-47de-842d-944857e1f9eb' },
+    textSample: '{"is_customized":false,"is_login":true,"action_type":2,"error":90309999,"tracking_id":"741514ae635-0656-47de-842d-944857e1f9eb","redirect_to_error_page":true}'
+  })`, context), 'verification');
+  assert.equal(vm.runInContext(`extractVerificationUrl({
+    status: 403,
+    url: 'https://shopee.vn/api/v2/item/get_ratings?filter=0&flag=1&itemid=46508948627&limit=1&offset=0&shopid=111138057&type=0',
+    pageUrl: 'https://shopee.vn/product/111138057/46508948627',
+    json: { error: 90309999, is_login: true, redirect_to_error_page: true, tracking_id: '741514ae635-0656-47de-842d-944857e1f9eb' }
+  })`, context), 'https://shopee.vn/verify/traffic?anti_bot_tracking_id=741514ae635-0656-47de-842d-944857e1f9eb');
 });
 
 test('buildTraceEntry includes all 13 required fields and sanitizes sensitive data', async () => {
@@ -414,8 +427,8 @@ test('evaluates preflight login detection and status reporting', async () => {
   assert.equal(unauthEval.isLogin, false);
   assert.match(unauthEval.error, /login required/i);
 
-  // 4. Shopee may block the ratings endpoint while confirming the session is logged in.
-  const blockedEval = vm.runInContext(`
+  // 4. Shopee may return 403 with a traffic-verification redirect while confirming the session is logged in.
+  const verificationEval = vm.runInContext(`
     evaluatePreflightResult({
       ok: false,
       status: 403,
@@ -424,8 +437,8 @@ test('evaluates preflight login detection and status reporting', async () => {
       textSample: '{"error":90309999,"is_login":true}',
     })
   `, context);
-  assert.equal(blockedEval.isLogin, true);
-  assert.match(blockedEval.error, /api access denied/i);
+  assert.equal(verificationEval.isLogin, false);
+  assert.match(verificationEval.error, /verification required/i);
   assert.equal(vm.runInContext(`
     classifyShopeeFailure({
       ok: false,
@@ -433,7 +446,7 @@ test('evaluates preflight login detection and status reporting', async () => {
       url: "https://shopee.vn/api/v2/item/get_ratings",
       json: { error: 90309999, is_login: true, redirect_to_error_page: true },
     })
-  `, context), 'api_blocked');
+  `, context), 'verification');
 });
 
 test('ratings preflight and pagination execute in the Shopee page MAIN world', async () => {
@@ -606,7 +619,7 @@ test('extractShopeeReviews halts with login_required before crawl when preflight
   });
 });
 
-test('extractShopeeReviews reports api_blocked when Shopee confirms login on a 403 response', async () => {
+test('extractShopeeReviews treats Shopee 403 redirect_to_error_page as verification', async () => {
   const { context } = await worker();
   vm.runInContext(`
     chrome.tabs = {
@@ -621,8 +634,9 @@ test('extractShopeeReviews reports api_blocked when Shopee confirms login on a 4
           ok: false,
           status: 403,
           url: "https://shopee.vn/api/v2/item/get_ratings",
-          json: { error: 90309999, is_login: true, redirect_to_error_page: true },
-          textSample: '{"error":90309999,"is_login":true}',
+          pageUrl: "https://shopee.vn/product/111/222",
+          json: { error: 90309999, is_login: true, redirect_to_error_page: true, tracking_id: "741514ae635-0656-47de-842d-944857e1f9eb" },
+          textSample: '{"error":90309999,"is_login":true,"redirect_to_error_page":true}',
         }
       }],
     };
@@ -637,8 +651,8 @@ test('extractShopeeReviews reports api_blocked when Shopee confirms login on a 4
       }, () => {})
     `, context);
   }, (err) => {
-    assert.equal(err.failureKind, 'api_blocked');
-    assert.match(err.message, /api access denied/i);
+    assert.equal(err.failureKind, 'verification');
+    assert.match(err.message, /verification required/i);
     return true;
   });
 });
@@ -1729,6 +1743,58 @@ test('verification watcher transitions to api_blocked when challenge absent but 
   vm.runInContext('stopVerificationWatcher()', context);
 });
 
+test('verification watcher stays in CAPTCHA flow when 403 asks redirect_to_error_page', async () => {
+  const { context, frames, sockets } = await worker();
+  sockets[0].onopen();
+
+  let tabUpdateListener = null;
+  const updatedTabs = [];
+  context.chrome.tabs = {
+    onUpdated: {
+      addListener: (fn) => { tabUpdateListener = fn; },
+      removeListener: () => { tabUpdateListener = null; },
+    },
+    get: async () => ({ id: 89, url: 'https://shopee.vn/product/111138057/46508948627' }),
+    update: async (id, patch) => { updatedTabs.push({ id, patch }); return { id, url: patch.url || 'https://shopee.vn/product/111138057/46508948627' }; },
+  };
+
+  vm.runInContext(`
+    detectCaptchaInTab = async () => ({ detected: false });
+    preflightRatingsInTab = async () => ({
+      ok: false,
+      status: 403,
+      url: "https://shopee.vn/api/v2/item/get_ratings?itemid=46508948627&shopid=111138057",
+      pageUrl: "https://shopee.vn/product/111138057/46508948627",
+      json: { error: 90309999, is_login: true, redirect_to_error_page: true, tracking_id: "741514ae635-0656-47de-842d-944857e1f9eb" },
+      textSample: '{"error":90309999,"is_login":true,"redirect_to_error_page":true}',
+    });
+    enqueueLegacyJob = () => { throw new Error("Should not enqueue yet"); };
+  `, context);
+
+  const details = {
+    job_id: 'job-watcher-redirect-captcha',
+    tab_id: 89,
+    kind: 'verification',
+    url: 'https://shopee.vn/product/111138057/46508948627',
+    checkpoint: { version: 2, itemid: '46508948627', shopid: '111138057' },
+  };
+
+  vm.runInContext(`
+    verificationInfo = { job_id: "job-watcher-redirect-captcha", kind: "verification" };
+    startVerificationWatcher(${JSON.stringify(details)});
+  `, context);
+
+  assert.ok(tabUpdateListener, 'tab update listener must be registered');
+  await tabUpdateListener(89, { status: 'complete' }, { url: 'https://shopee.vn/product/111138057/46508948627' });
+  await tabUpdateListener(89, { status: 'complete' }, { url: 'https://shopee.vn/product/111138057/46508948627' });
+
+  assert.equal(vm.runInContext('extensionState', context), 'awaiting_user_verification');
+  assert.ok(updatedTabs.some((entry) => String(entry.patch.url || '').includes('/verify/traffic?anti_bot_tracking_id=741514ae635-0656-47de-842d-944857e1f9eb')));
+  assert.ok(frames.some((f) => f.type === 'verification.required' && f.params?.job_id === 'job-watcher-redirect-captcha'));
+
+  vm.runInContext('stopVerificationWatcher()', context);
+});
+
 test('resumeVerification recovers job from chrome.storage.local when in-memory pendingVerificationJobs is empty', async () => {
   const { context, frames, sockets } = await worker();
   sockets[0].onopen();
@@ -2049,4 +2115,3 @@ test('startVerificationWatcher immediately triggers preflight when slider_passed
 
   vm.runInContext('stopVerificationWatcher()', context);
 });
-
