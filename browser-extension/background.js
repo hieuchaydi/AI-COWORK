@@ -2114,19 +2114,36 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
         target: { tabId },
         world: "MAIN",
         func: () => {
-          const selectors = [
-            ".shopee-captcha-slider",
-            ".shopee-captcha-slider__button",
+          const handleSelectors = [
             ".shopee-captcha-slider__btn",
+            ".shopee-captcha-slider__button",
+            "div[class*='slider__btn']",
+            "div[class*='slider__button']",
+            "div[class*='slider-btn']",
+            "div[class*='slider-button']",
+            ".verify-slider__btn",
+          ];
+          for (const selector of handleSelectors) {
+            const el = document.querySelector(selector);
+            if (!el || (!el.offsetWidth && !el.offsetHeight)) continue;
+            const rect = el.getBoundingClientRect();
+            return {
+              selector,
+              x: Math.round(rect.left + rect.width / 2),
+              y: Math.round(rect.top + rect.height / 2),
+              width: Math.round(rect.width),
+              height: Math.round(rect.height),
+              isOrangeHandle: true,
+            };
+          }
+          const containerSelectors = [
+            ".shopee-captcha-slider",
             ".verify-slider",
             "[class*='captcha'][class*='slider']",
           ];
-          for (const selector of selectors) {
+          for (const selector of containerSelectors) {
             const el = document.querySelector(selector);
             if (!el || (!el.offsetWidth && !el.offsetHeight)) continue;
-            if (typeof el.scrollIntoView === "function") {
-              el.scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
-            }
             const rect = el.getBoundingClientRect();
             return {
               selector,
@@ -2134,6 +2151,7 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
               y: Math.round(rect.top + rect.height / 2),
               width: Math.round(rect.width),
               height: Math.round(rect.height),
+              isOrangeHandle: false,
             };
           }
           return null;
@@ -2212,23 +2230,28 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
   return { attempted: false, reason: "no_input_backend" };
 }
 
-async function detectCaptchaInTab(tabId) {
+async function detectCaptchaInTab(tabId, options = {}) {
   try {
     if (!tabId || !chrome.scripting?.executeScript) return { detected: false, resolved: false };
+    const shouldScroll = options?.scrollIntoView !== false;
     const [res] = await chrome.scripting.executeScript({
       target: { tabId },
       world: "MAIN",
-      func: () => {
+      func: (allowScroll) => {
+        const win = typeof window !== "undefined" ? window : globalThis;
+        const canScroll = allowScroll !== false;
         const url = location.href.toLowerCase();
         const isVerifyPage = url.includes("/verify/") || url.includes("anti_bot_tracking_id") || url.includes("captcha");
         const bodyText = document.body ? document.body.innerText.toLowerCase() : "";
 
+        // 1. Kiểm tra trạng thái ĐÃ GIẢI XONG (Resolved)
         const checkPassedSelectors = [
           ".shopee-captcha-slider__btn--success",
           ".captcha-passed",
           ".verify-passed",
           ".slider--success",
           ".slider-btn--success",
+          "[class*='btn--success']",
           "[class*='success']",
           "[class*='passed']",
         ];
@@ -2248,11 +2271,11 @@ async function detectCaptchaInTab(tabId) {
             isResolved = Array.from(document.querySelectorAll("svg, i, div, span, button")).some((el) => {
               const text = el.innerText || "";
               const hasCheckChar = text.includes("✔") || text.includes("✓");
-              const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(el) : null;
+              const style = typeof win.getComputedStyle === "function" ? win.getComputedStyle(el) : null;
               const bg = style?.backgroundColor || "";
               const color = style?.color || "";
-              const isGreen = bg.includes("38, 170, 153") || bg.includes("32, 178, 170") || color.includes("38, 170, 153");
-              return hasCheckChar || isGreen;
+              const isGreen = bg.includes("38, 170, 153") || bg.includes("32, 178, 170") || color.includes("38, 170, 153") || bg.includes("26aa99") || bg.includes("210, 236, 231");
+              return hasCheckChar || (isGreen && (el.offsetWidth > 15 || el.offsetHeight > 15));
             });
           } catch {}
         }
@@ -2261,11 +2284,50 @@ async function detectCaptchaInTab(tabId) {
           return { detected: false, resolved: true, type: "slider_passed", pageUrl: location.href };
         }
 
-        const activeSelectors = [
+        // 2. Tìm Nút trượt màu cam (Slider Handle/Button) - Nút người dùng cần kéo
+        const handleSelectors = [
+          ".shopee-captcha-slider__btn",
+          ".shopee-captcha-slider__button",
+          "div[class*='slider__btn']",
+          "div[class*='slider__button']",
+          "div[class*='slider-btn']",
+          "div[class*='slider-button']",
+          ".verify-slider__btn",
+          ".geetest_slider_btn",
+        ];
+
+        let handleEl = null;
+        let handleSelector = null;
+        for (const sel of handleSelectors) {
+          try {
+            const el = document.querySelector(sel);
+            if (el && (el.offsetWidth > 0 || el.offsetHeight > 0)) {
+              handleEl = el;
+              handleSelector = sel;
+              break;
+            }
+          } catch {}
+        }
+
+        // Nếu chưa tìm thấy class handle, quét tìm phần tử màu cam Shopee (#ee4d2d / rgb(238, 77, 45)) có hình nút
+        if (!handleEl && typeof document.querySelectorAll === "function") {
+          try {
+            const candidates = Array.from(document.querySelectorAll("div, button, span, i"));
+            handleEl = candidates.find((el) => {
+              if (!el.offsetWidth || !el.offsetHeight) return false;
+              if (el.offsetWidth > 120) return false; // Nút trượt vuông nhỏ khoảng 40-60px
+              const style = typeof win.getComputedStyle === "function" ? win.getComputedStyle(el) : null;
+              const bg = style?.backgroundColor || "";
+              return bg.includes("238, 77, 45") || bg.includes("ee4d2d");
+            }) || null;
+            if (handleEl) handleSelector = "shopee-orange-handle";
+          } catch {}
+        }
+
+        // 3. Tìm Container hoặc Widget Captcha tổng thể
+        const containerSelectors = [
           ".shopee-captcha-slider",
           ".shopee-captcha-slider__bar",
-          ".shopee-captcha-slider__button",
-          ".shopee-captcha-slider__btn",
           ".captcha_container",
           ".geetest_radar_btn",
           ".geetest_canvas_bg",
@@ -2281,34 +2343,74 @@ async function detectCaptchaInTab(tabId) {
           "div[class*='puzzle-verify']",
         ];
 
-        for (const sel of activeSelectors) {
+        let containerEl = null;
+        let containerSelector = null;
+        for (const sel of containerSelectors) {
           try {
             const el = document.querySelector(sel);
             if (el && (el.offsetWidth > 0 || el.offsetHeight > 0)) {
-              if (typeof el.scrollIntoView === "function") {
-                el.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
-              }
-              const rect = typeof el.getBoundingClientRect === "function"
-                ? el.getBoundingClientRect()
-                : { left: 0, top: 0, width: el.offsetWidth || 0, height: el.offsetHeight || 0 };
-              return {
-                detected: true,
-                resolved: false,
-                type: "dom_selector",
-                selector: sel,
-                elementFound: true,
-                pageUrl: location.href,
-                slider: {
-                  x: Math.round(rect.left + Math.min(32, rect.width / 2)),
-                  y: Math.round(rect.top + rect.height / 2),
-                  width: Math.round(rect.width),
-                  height: Math.round(rect.height),
-                },
-              };
+              containerEl = el;
+              containerSelector = sel;
+              break;
             }
           } catch {}
         }
 
+        // Nếu có phần tử Captcha (handle hoặc container)
+        const primaryEl = containerEl || handleEl;
+        if (primaryEl) {
+          // Chỉ scroll một lần duy nhất vào trung tâm màn hình, không scroll giật giật lặp lại
+          const alreadyScrolled = Boolean(win.__shopeeCaptchaScrolled);
+          if (canScroll && !alreadyScrolled) {
+            try {
+              if (typeof primaryEl.scrollIntoView === "function") {
+                primaryEl.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+                win.__shopeeCaptchaScrolled = true;
+              }
+            } catch {}
+          }
+
+          // Tính toạ độ chuẩn: ƯU TIÊN toạ độ tâm của Nút màu cam (handle)
+          let sliderCoordinates = null;
+          if (handleEl) {
+            const hRect = typeof handleEl.getBoundingClientRect === "function"
+              ? handleEl.getBoundingClientRect()
+              : { left: 0, top: 0, width: handleEl.offsetWidth || 0, height: handleEl.offsetHeight || 0 };
+            sliderCoordinates = {
+              x: Math.round(hRect.left + hRect.width / 2),
+              y: Math.round(hRect.top + hRect.height / 2),
+              width: Math.round(hRect.width),
+              height: Math.round(hRect.height),
+              isOrangeHandle: true,
+              handleSelector: handleSelector || null,
+            };
+          } else if (containerEl) {
+            const cRect = typeof containerEl.getBoundingClientRect === "function"
+              ? containerEl.getBoundingClientRect()
+              : { left: 0, top: 0, width: containerEl.offsetWidth || 0, height: containerEl.offsetHeight || 0 };
+            sliderCoordinates = {
+              x: Math.round(cRect.left + Math.min(32, cRect.width / 2)),
+              y: Math.round(cRect.top + cRect.height / 2),
+              width: Math.round(cRect.width),
+              height: Math.round(cRect.height),
+              isOrangeHandle: false,
+              handleSelector: null,
+            };
+          }
+
+          return {
+            detected: true,
+            resolved: false,
+            type: "dom_selector",
+            selector: containerSelector || handleSelector || ".shopee-captcha-slider",
+            handleSelector: handleSelector || null,
+            elementFound: true,
+            pageUrl: location.href,
+            slider: sliderCoordinates,
+          };
+        }
+
+        // 4. Fallback qua Text match (Tuyệt đối KHÔNG scroll vào thẻ text span chữ để tránh làm lệch màn hình)
         const phrases = [
           "kéo qua để hoàn thiện bức hình",
           "hoàn thiện bức hình",
@@ -2323,16 +2425,6 @@ async function detectCaptchaInTab(tabId) {
 
         for (const p of phrases) {
           if (bodyText.includes(p)) {
-            try {
-              if (typeof document.querySelectorAll === "function") {
-                const matchingEl = Array.from(document.querySelectorAll("div, p, span, h1, h2, h3, label, a, button, section, form")).find(
-                  (e) => e.innerText && e.innerText.toLowerCase().includes(p) && e.children?.length === 0
-                );
-                if (matchingEl && typeof matchingEl.scrollIntoView === "function") {
-                  matchingEl.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
-                }
-              }
-            } catch {}
             return { detected: true, resolved: false, type: "dom_text", phrase: p, elementFound: true, pageUrl: location.href };
           }
         }
@@ -2343,6 +2435,7 @@ async function detectCaptchaInTab(tabId) {
 
         return { detected: false, resolved: false, pageUrl: location.href };
       },
+      args: [shouldScroll],
     });
     return res?.result || { detected: false, resolved: false };
   } catch (err) {
@@ -2382,7 +2475,7 @@ function startVerificationWatcher(details) {
       stopVerificationWatcher();
       return;
     }
-    const check = await detectCaptchaInTab(targetTabId);
+    const check = await detectCaptchaInTab(targetTabId, { scrollIntoView: false });
     if (check?.resolved || !check?.detected) {
       consecutiveAbsentCount++;
       console.log(`[bridge] CAPTCHA absent/resolved count: ${consecutiveAbsentCount}/2 (type: ${check?.type || "none"}) for job ${jid}`);
@@ -2481,12 +2574,9 @@ function startVerificationWatcher(details) {
       }
     } else {
       consecutiveAbsentCount = 0;
-      if (autoDragAttempts < 3) {
-        autoDragAttempts++;
-        console.log(`[bridge] CAPTCHA still visible; attempting Shopee slider drag ${autoDragAttempts}/3 for job ${jid}`);
-        const dragRes = await tryAutoDragShopeeCaptcha(targetTabId, check);
-        console.log("[bridge] CAPTCHA slider drag result:", dragRes);
-        await new Promise((r) => setTimeout(r, 1600));
+      // Chế độ quan sát thụ động (Passive Handover): không tự ý drag bừa 240px làm hỏng CAPTCHA ghép hình.
+      if (check?.slider?.isOrangeHandle) {
+        console.log(`[bridge] Passive handover: Shopee orange slider button active at (${check.slider.x}, ${check.slider.y}). Chờ người dùng thao tác kéo...`);
       }
     }
   };
@@ -2552,6 +2642,12 @@ async function triggerVerificationRequired(details) {
   }
 
   if (details.kind === "verification") {
+    // Căn giữa giao diện CAPTCHA một lần duy nhất lúc handover người dùng
+    if (targetTabId) {
+      try {
+        await detectCaptchaInTab(targetTabId, { scrollIntoView: true });
+      } catch {}
+    }
     startVerificationWatcher(details);
   }
 }

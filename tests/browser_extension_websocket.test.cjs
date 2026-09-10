@@ -2115,3 +2115,53 @@ test('startVerificationWatcher immediately triggers preflight when slider_passed
 
   vm.runInContext('stopVerificationWatcher()', context);
 });
+
+test('detectCaptchaInTab accurately targets orange slider button and avoids repetitive scroll', async () => {
+  const { context } = await worker();
+  vm.runInContext(`
+    globalThis.__scrollCalls = 0;
+    chrome.scripting = {
+      executeScript: async ({ func, args }) => {
+        globalThis.location = { href: "https://shopee.vn/verify/captcha?anti_bot_tracking_id=xyz" };
+        globalThis.document = {
+          body: { innerText: "Kéo qua để hoàn thiện bức hình" },
+          querySelector: (sel) => {
+            if (sel === ".shopee-captcha-slider__btn") {
+              return {
+                offsetWidth: 44,
+                offsetHeight: 44,
+                getBoundingClientRect: () => ({ left: 100, top: 300, width: 44, height: 44 }),
+              };
+            }
+            if (sel === ".shopee-captcha-slider") {
+              return {
+                offsetWidth: 320,
+                offsetHeight: 260,
+                getBoundingClientRect: () => ({ left: 90, top: 100, width: 320, height: 260 }),
+                scrollIntoView: () => { globalThis.__scrollCalls++; },
+              };
+            }
+            return null;
+          },
+          querySelectorAll: () => [],
+        };
+        return [{ result: func(...(args || [])) }];
+      },
+    };
+  `, context);
+
+  // Lần 1: Được phép scroll (handover ban đầu)
+  const d1 = await vm.runInContext('detectCaptchaInTab(401, { scrollIntoView: true })', context);
+  assert.equal(d1.detected, true);
+  assert.equal(d1.slider.isOrangeHandle, true, 'must identify orange handle button');
+  // Tâm nút cam: left=100 + width/2 (22) = 122, top=300 + height/2 (22) = 322
+  assert.equal(d1.slider.x, 122, 'x must target center of orange button');
+  assert.equal(d1.slider.y, 322, 'y must target center of orange button, not middle of puzzle image');
+  assert.equal(vm.runInContext('__scrollCalls', context), 1, 'scrollIntoView should be called once on initial handover');
+
+  // Lần 2: Watcher chạy định kỳ với scrollIntoView: false và đã có cờ __shopeeCaptchaScrolled
+  const d2 = await vm.runInContext('detectCaptchaInTab(401, { scrollIntoView: false })', context);
+  assert.equal(d2.detected, true);
+  assert.equal(vm.runInContext('__scrollCalls', context), 1, 'scrollIntoView must NOT be called again in watcher cycle');
+});
+
