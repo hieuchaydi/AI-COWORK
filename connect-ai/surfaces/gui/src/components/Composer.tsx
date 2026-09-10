@@ -563,9 +563,9 @@ export function Composer(props: Props) {
 }
 
 // Token-usage chip + popover (OPE-42). Trigger: a tiny context-fill meter (only when the
-// active model's window is known) + the session's total token count. Click → per-model
-// breakdown. Tokens only, never dollars (true cost is unknowable client-side — discounted
-// pricing, per-provider cache billing).
+// active model's window is known) + the session's spent token count. Click -> per-model
+// breakdown. Tokens only, never dollars (true cost is unknowable client-side because of
+// discounted pricing and per-provider cache billing).
 function UsageChip({
   usage,
   contextWindow,
@@ -600,11 +600,11 @@ function UsageChip({
         onClick={() => setOpen((v) => !v)}
         aria-haspopup="menu"
         aria-expanded={open}
-        aria-label="Token usage"
+        aria-label="Tokens spent this session"
         title={
           pct !== null
-            ? `Token usage — ${pct}% of the context window used`
-            : "Token usage this session"
+            ? `Tokens spent this session - ${pct}% of the context window used`
+            : "Tokens spent this session"
         }
         data-testid="usage-chip"
       >
@@ -616,6 +616,7 @@ function UsageChip({
             />
           </span>
         )}
+        <span className="text-faint">Spent</span>
         <span className="tabular-nums">{formatTokens(total)}</span>
       </button>
       {open && (
@@ -676,7 +677,7 @@ function UsageChip({
               ))}
             </div>
             <div className="mt-2 pt-2 border-t border-line flex items-baseline justify-between text-[11.5px]">
-              <span className="text-faint">Total</span>
+              <span className="text-faint">Total spent</span>
               <span className="text-ink tabular-nums">{formatTokens(total)} tokens</span>
             </div>
             {model && !modelLabels?.[model] && contextWindow === undefined && (

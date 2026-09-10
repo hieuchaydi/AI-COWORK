@@ -20,8 +20,9 @@ test("usage chip appears after a turn and opens the breakdown popover", async ({
     timeout: 10_000,
   });
 
-  // Chip shows the session total (1k + 200 + 8k + 800 = 10k).
+  // Chip shows the session total spent (1k + 200 + 8k + 800 = 10k).
   const chip = page.getByTestId("usage-chip");
+  await expect(chip).toContainText("Spent");
   await expect(chip).toContainText("10k");
 
   // Popover: context fill (9.8k prompt-side of 200k = 5%) + per-model breakdown.
@@ -39,6 +40,7 @@ test("usage chip appears after a turn and opens the breakdown popover", async ({
   // Total input = fresh 1k + cache_read 8k + cache_write 800 (cumulative billed input).
   await expect(pop).toContainText("Total input");
   await expect(pop).toContainText("9.8k");
+  await expect(pop).toContainText("Total spent");
   await expect(pop).toContainText("10k tokens");
 
   // Second turn accumulates (totals double), and the scrim click closes the popover.
