@@ -11,10 +11,16 @@ request đầu tiên, cả Chromium bundled lẫn Chrome thật, cả khi chưa 
 — extension trong Chrome thường của user chạy bằng cookie thật:
 
 1. `web_fetch("http://127.0.0.1:8766/ingest/job?url=<link>")` → lấy `job.id`
-2. `web_fetch("http://127.0.0.1:8766/ingest/result?id=<job id>")`, `ok:false` thì chờ vài giây
-   hỏi lại (tối đa ~10 lần)
-3. `ok:true` → báo `result.count` + `result.csv`. `result.ok:false` → báo nguyên văn
-   `result.error`
+2. `web_fetch("http://127.0.0.1:8766/ingest/result?id=<job id>")`, `ok:false` thì chờ vài giây hỏi lại (tối đa ~10 lần).
+   - **Xử lý khi gặp CAPTCHA (verification_required)**:
+     Nếu `progress.verification_required` hoặc `result.verification_required` là `true` (hoặc `status == "awaiting_user_verification"`):
+     **BẮT BUỘC HIỂN THỊ NGAY TRONG CHAT**:
+     + ⚠️ **Cảnh báo**: `⚠️ Shopee yêu cầu xác minh danh tính / giải CAPTCHA`
+     + **Link mở tab xác minh**: `[Mở trang xác minh Shopee](<verification_url>)`
+     + **Hình ảnh bằng chứng CAPTCHA**: `![Bằng chứng CAPTCHA](<evidence_url>)` (nếu có `evidence_url`)
+     + **Hướng dẫn thao tác**: Mở tab Chrome để kéo thanh trượt puzzle. Hệ thống đang theo dõi và sẽ tự động tiếp tục (resume) cào ngay khi CAPTCHA được giải xong.
+     + **Link tiếp tục**: `[Tiếp tục cào sau khi giải CAPTCHA](<resume_url>)`.
+3. `ok:true` và `result.ok:true` → báo `result.count` + `result.csv`. `result.ok:false` (nếu không phải đang chờ CAPTCHA) → báo nguyên văn `result.error`
 4. Muốn phân tích thêm: `web_fetch` file JSON ở `result.url`, rồi tóm tắt khen/chê, phân bố sao
 
 Quá 1 phút chưa xong = extension chưa cài hoặc Chrome đang đóng → bảo user mở

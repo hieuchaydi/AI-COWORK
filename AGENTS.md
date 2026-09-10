@@ -88,9 +88,16 @@ Làm đúng 3 bước này, không có bước nào khác:
 1. `web_fetch("http://127.0.0.1:8766/ingest/job?url=<link sản phẩm>")` — xếp job.
    Nhớ lấy `job.id` trong kết quả trả về.
 2. `web_fetch("http://127.0.0.1:8766/ingest/result?id=<job id>")` — hỏi lại sau vài giây.
-   `ok:false` nghĩa là chưa xong, chờ rồi hỏi lại (tối đa ~10 lần, mỗi lần cách vài giây).
-3. `ok:true` → đọc `result.csv` và `result.count`, báo user đường dẫn CSV. Xong.
-   `result.ok:false` → đọc `result.error` và báo nguyên văn, đừng tự chữa.
+   - Nếu phát hiện `verification_required: true` (hoặc `status == "awaiting_user_verification"`):
+     **BẮT BUỘC HIỂN THỊ NGAY TRONG CHAT**:
+     + ⚠️ Cảnh báo: `⚠️ Shopee yêu cầu xác minh danh tính / giải CAPTCHA`
+     + Link giải: `[Mở trang xác minh Shopee](<verification_url>)`
+     + Ảnh bằng chứng: `![Bằng chứng CAPTCHA](<evidence_url>)`
+     + Hướng dẫn: Thao tác giải puzzle trên tab Chrome. Extension đang tự động giải hoặc chờ kéo thanh trượt; sau khi xong sẽ tự động tiếp tục cào.
+     + Link resume: `[Tiếp tục cào sau khi giải CAPTCHA](<resume_url>)`.
+   - `ok:false` (nếu đang chạy bình thường) nghĩa là chưa xong, chờ rồi hỏi lại (tối đa ~10 lần, mỗi lần cách vài giây).
+3. `ok:true` và `result.ok:true` → đọc `result.csv` và `result.count`, báo user đường dẫn CSV. Xong.
+   `result.ok:false` (nếu không phải đang chờ CAPTCHA) → đọc `result.error` và báo nguyên văn, đừng tự chữa.
 
 Extension trong Chrome thường của user chạy job đó bằng cookie thật. Nếu `/ingest/result` mãi
 không xong (>1 phút): extension chưa cài hoặc Chrome đang đóng → bảo user mở

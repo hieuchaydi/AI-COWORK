@@ -902,6 +902,13 @@ def _on_browser_ws_message(message: dict) -> None:
             except Exception as exc:
                 print(f"[launch] Failed to save evidence screenshot: {exc}", file=sys.stderr)
         if job_id:
+            job_obj = _INGEST_ALL_JOBS.get(job_id)
+            verification_url = (
+                params.get("verification_url")
+                or params.get("target_url")
+                or params.get("url")
+                or (job_obj.get("url") if job_obj else "")
+            )
             progress_patch = {
                 "status": "awaiting_user_verification",
                 "stage": "verification_required",
@@ -909,6 +916,8 @@ def _on_browser_ws_message(message: dict) -> None:
                 "message": reason,
                 "error": reason,
                 "url": params.get("url"),
+                "verification_url": verification_url,
+                "resume_url": f"http://127.0.0.1:{HELPER_PORT}/ingest/resume?id={job_id}",
                 "percent": 100,
             }
             if evidence:
@@ -917,6 +926,23 @@ def _on_browser_ws_message(message: dict) -> None:
                 progress_patch["evidence"] = evidence
                 print(f"[launch] ⚠️ Verification required for job {job_id}. Evidence saved: {evidence['rel_path']}", file=sys.stderr)
             _update_ingest_progress(job_id, progress_patch)
+            verif_res = {
+                "ok": False,
+                "error": reason,
+                "status": "awaiting_user_verification",
+                "stage": "verification_required",
+                "verification_required": True,
+                "login_required": False,
+                "api_blocked": False,
+                "url": params.get("url"),
+                "verification_url": verification_url,
+                "resume_url": f"http://127.0.0.1:{HELPER_PORT}/ingest/resume?id={job_id}",
+            }
+            if evidence:
+                verif_res["evidence_file"] = evidence["rel_path"]
+                verif_res["evidence_url"] = evidence["url"]
+                verif_res["evidence"] = evidence
+            _INGEST_RESULTS[job_id] = verif_res
             _persist_ingest_state()
     elif kind == "verification.resolved":
         params = message.get("params") or {}
@@ -1138,6 +1164,12 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
                 print(f"[launch] Failed to save evidence screenshot in payload: {exc}", file=sys.stderr)
 
         if job_id:
+            verif_url = (
+                body.get("verification_url")
+                or body.get("target_url")
+                or body.get("url")
+                or (job_obj.get("url") if job_obj else "")
+            ) if is_verification else ""
             result = {
                 "ok": False,
                 "error": err_msg,
@@ -1147,6 +1179,9 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
                 "login_required": is_login,
                 "api_blocked": is_api_blocked,
             }
+            if is_verification:
+                result["verification_url"] = verif_url
+                result["resume_url"] = f"http://127.0.0.1:{HELPER_PORT}/ingest/resume?id={job_id}"
             if evidence:
                 result["evidence_file"] = evidence["rel_path"]
                 result["evidence_url"] = evidence["url"]
@@ -1164,6 +1199,9 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
                 "error": err_msg,
                 "percent": 100,
             }
+            if is_verification:
+                prog_patch["verification_url"] = verif_url
+                prog_patch["resume_url"] = f"http://127.0.0.1:{HELPER_PORT}/ingest/resume?id={job_id}"
             if evidence:
                 prog_patch["evidence_file"] = evidence["rel_path"]
                 prog_patch["evidence_url"] = evidence["url"]
