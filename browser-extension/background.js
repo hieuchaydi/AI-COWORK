@@ -3110,6 +3110,23 @@ async function handleAction(action, params) {
         extensionState,
       };
 
+    case "captcha.detect": {
+      const targetTabId = params.tabId || (await getActiveTabId());
+      const detection = await detectCaptchaInTab(targetTabId, {
+        scrollIntoView: params.scrollIntoView !== false,
+      });
+      return { tabId: targetTabId, detection };
+    }
+
+    case "captcha.autoDrag": {
+      const targetTabId = params.tabId || (await getActiveTabId());
+      const detection = params.detection || await detectCaptchaInTab(targetTabId, {
+        scrollIntoView: params.scrollIntoView !== false,
+      });
+      const drag = await tryAutoDragShopeeCaptcha(targetTabId, detection);
+      return { tabId: targetTabId, detection, drag };
+    }
+
     case "tab.list": {
       const tabs = await chrome.tabs.query({});
       return {

@@ -13,6 +13,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 class ActionName(str, Enum):
     BROWSER_HEALTH = "browser.health"
+    CAPTCHA_DETECT = "captcha.detect"
+    CAPTCHA_AUTO_DRAG = "captcha.autoDrag"
     TAB_LIST = "tab.list"
     TAB_GET_ACTIVE = "tab.getActive"
     TAB_OPEN = "tab.open"
@@ -207,6 +209,15 @@ class PageScrollParams(BaseActionParams):
     behavior: str = Field(default="smooth", description="smooth | instant | auto")
 
 
+class CaptchaDetectParams(BaseActionParams):
+    tabId: Optional[int] = Field(default=None, description="Target tab ID; active tab if omitted")
+    scrollIntoView: bool = Field(default=True, description="Whether to scroll captcha controls into view")
+
+
+class CaptchaAutoDragParams(BaseActionParams):
+    tabId: Optional[int] = Field(default=None, description="Target tab ID; active tab if omitted")
+
+
 class EmptyParams(BaseActionParams):
     pass
 
@@ -248,6 +259,10 @@ def validate_action_params(action: str, params: Dict[str, Any]) -> BaseModel:
         return JobCancelParams(**params)
     elif action == ActionName.PAGE_SCROLL:
         return PageScrollParams(**params)
+    elif action == ActionName.CAPTCHA_DETECT:
+        return CaptchaDetectParams(**params)
+    elif action == ActionName.CAPTCHA_AUTO_DRAG:
+        return CaptchaAutoDragParams(**params)
     elif action in (
         ActionName.BROWSER_HEALTH,
         ActionName.TAB_LIST,

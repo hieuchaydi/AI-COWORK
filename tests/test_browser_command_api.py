@@ -47,6 +47,25 @@ def test_command_dispatches_with_correlation(command_api):
         "tab.list", {}, deadline_ms=30000, command_id="cmd-7", session_id=None)
 
 
+def test_command_dispatches_captcha_actions(command_api):
+    url, transport = command_api
+    body = {
+        "type": "command",
+        "id": "captcha-1",
+        "action": "captcha.detect",
+        "params": {"tabId": 99, "scrollIntoView": False},
+    }
+    status, response = request_command(url, body)
+    assert status == 200 and response["ok"] and response["id"] == "captcha-1"
+    transport.execute_command.assert_called_once_with(
+        "captcha.detect",
+        {"tabId": 99, "scrollIntoView": False},
+        deadline_ms=30000,
+        command_id="captcha-1",
+        session_id=None,
+    )
+
+
 @pytest.mark.parametrize("token,origin,status", [
     ("wrong", None, 401),
     ("test-bridge-token", "https://example.com", 403),

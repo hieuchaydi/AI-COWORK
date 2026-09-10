@@ -2273,4 +2273,34 @@ test('tryAutoDragShopeeCaptcha executes realistic drag via chrome.debugger', asy
   assert.equal(mouseReleasedCmds[0].params.button, 'left');
 });
 
+test('handleAction exposes captcha detection and auto-drag commands', async () => {
+  const { context } = await worker();
+  vm.runInContext(`
+    getActiveTabId = async () => 777;
+    detectCaptchaInTab = async (tabId, options) => ({
+      detected: true,
+      resolved: false,
+      tabId,
+      options,
+      slider: { x: 10, y: 20, width: 300, isOrangeHandle: true },
+    });
+    tryAutoDragShopeeCaptcha = async (tabId, detection) => ({
+      attempted: true,
+      method: "test",
+      tabId,
+      detection,
+    });
+  `, context);
+
+  const detect = await vm.runInContext('handleAction("captcha.detect", { scrollIntoView: false })', context);
+  assert.equal(detect.tabId, 777);
+  assert.equal(detect.detection.detected, true);
+  assert.equal(detect.detection.options.scrollIntoView, false);
+
+  const drag = await vm.runInContext('handleAction("captcha.autoDrag", { tabId: 888 })', context);
+  assert.equal(drag.tabId, 888);
+  assert.equal(drag.detection.detected, true);
+  assert.equal(drag.drag.attempted, true);
+  assert.equal(drag.drag.method, "test");
+});
 
