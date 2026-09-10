@@ -2165,3 +2165,112 @@ test('detectCaptchaInTab accurately targets orange slider button and avoids repe
   assert.equal(vm.runInContext('__scrollCalls', context), 1, 'scrollIntoView must NOT be called again in watcher cycle');
 });
 
+test('generateHumanTrajectory produces ease-out curve, vertical jitter and correction step', async () => {
+  const { context } = await worker();
+  const points = vm.runInContext('generateHumanTrajectory(100, 200, 150)', context);
+
+  assert.ok(Array.isArray(points), 'points must be an array');
+  assert.ok(points.length >= 24, 'must have at least 24 trajectory steps');
+  assert.equal(points[0].x, 100, 'must start at startX');
+
+  const lastPoint = points[points.length - 1];
+  assert.equal(lastPoint.x, 250, 'must end exactly at startX + distance (250)');
+  assert.equal(lastPoint.y, 200, 'last point y must be aligned with startY');
+
+  // Verify overshoot exists (some points should exceed 250 before correcting back)
+  const maxPointX = Math.max(...points.map((p) => p.x));
+  assert.ok(maxPointX > 250, 'trajectory must include overshoot beyond target');
+
+  // Verify jitter exists on Y axis
+  const distinctY = new Set(points.map((p) => p.y));
+  assert.ok(distinctY.size > 1, 'trajectory must include micro-jitter on Y axis');
+});
+
+test('calculatePuzzleDistance identifies target position from canvas pixel colors', async () => {
+  const { context } = await worker();
+  vm.runInContext(`
+    chrome.scripting = {
+      executeScript: async ({ func }) => {
+        const mockCanvas = {
+          offsetWidth: 300,
+          offsetHeight: 180,
+          width: 300,
+          height: 180,
+          getContext: () => ({
+            getImageData: (sx, sy, w, h) => {
+              const data = new Uint8Array(w * h * 4);
+              // Fill with neutral sand/concrete color (grayish ~ 160)
+              data.fill(160);
+              // Add a red triangle/notch at column x = 180
+              for (let y = 30; y < 150; y++) {
+                const idx = (y * w + 180) * 4;
+                data[idx] = 220;     // Red
+                data[idx + 1] = 40;  // Green
+                data[idx + 2] = 40;  // Blue
+                data[idx + 3] = 255;
+              }
+              return { data };
+            },
+          }),
+        };
+        globalThis.document = {
+          querySelector: (sel) => {
+            if (sel.includes("canvas")) return mockCanvas;
+            if (sel.includes("track") || sel.includes("bar")) return { offsetWidth: 320 };
+            if (sel.includes("btn") || sel.includes("button")) return { offsetWidth: 44 };
+            return null;
+          },
+        };
+        return [{ result: func() }];
+      },
+    };
+  `, context);
+
+  const travel = await vm.runInContext('calculatePuzzleDistance(501, { width: 320 })', context);
+  assert.ok(typeof travel === 'number', 'travel must be a number');
+  assert.ok(travel >= 150 && travel <= 220, `travel (${travel}) should correspond to red notch near column 180`);
+});
+
+test('tryAutoDragShopeeCaptcha executes realistic drag via chrome.debugger', async () => {
+  const { context } = await worker();
+  context.setTimeout = (fn) => { queueMicrotask(fn); return 1; };
+  const debuggerCommands = [];
+  let attached = false;
+  let detached = false;
+
+  context.chrome.debugger = {
+    attach: async (target, ver) => {
+      attached = true;
+      assert.equal(target.tabId, 601);
+      assert.equal(ver, "1.3");
+    },
+    detach: async (target) => {
+      detached = true;
+    },
+    sendCommand: async (target, cmd, params) => {
+      debuggerCommands.push({ cmd, params });
+    },
+  };
+
+  const detection = {
+    detected: true,
+    slider: { x: 100, y: 300, width: 320, isOrangeHandle: true },
+  };
+
+  const result = await vm.runInContext(`tryAutoDragShopeeCaptcha(601, ${JSON.stringify(detection)})`, context);
+  assert.equal(result.attempted, true);
+  assert.equal(result.method, 'debugger');
+  assert.equal(attached, true, 'debugger must be attached');
+  assert.equal(detached, true, 'debugger must be detached');
+
+  const mouseMovedCmds = debuggerCommands.filter((c) => c.cmd === 'Input.dispatchMouseEvent' && c.params.type === 'mouseMoved');
+  const mousePressedCmds = debuggerCommands.filter((c) => c.cmd === 'Input.dispatchMouseEvent' && c.params.type === 'mousePressed');
+  const mouseReleasedCmds = debuggerCommands.filter((c) => c.cmd === 'Input.dispatchMouseEvent' && c.params.type === 'mouseReleased');
+
+  assert.ok(mouseMovedCmds.length >= 24, 'must dispatch at least 24 mouseMoved events');
+  assert.equal(mousePressedCmds.length, 1, 'must dispatch exactly 1 mousePressed event');
+  assert.equal(mouseReleasedCmds.length, 1, 'must dispatch exactly 1 mouseReleased event');
+  assert.equal(mouseReleasedCmds[0].params.button, 'left');
+});
+
+
