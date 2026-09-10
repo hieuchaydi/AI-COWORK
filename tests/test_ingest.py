@@ -547,6 +547,7 @@ def test_shopee_ingest_e2e_zip_and_csv(server, monkeypatch):
     with zipfile.ZipFile(outputs / "zips" / "shopee_22_media.zip") as zf:
         namelist = zf.namelist()
         assert "review_00001_image_01.jpg" in namelist
+        assert zf.getinfo("review_00001_image_01.jpg").compress_type == zipfile.ZIP_STORED
 
     # Check CSV contents
     csv_text = (outputs / "csv" / "shopee_22.csv").read_bytes().decode("utf-8-sig")

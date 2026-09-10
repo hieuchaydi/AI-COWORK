@@ -1593,6 +1593,23 @@ class ZipPath(str):
     parts: list[str] = []
 
 
+_PRECOMPRESSED_MEDIA_EXTENSIONS = frozenset({
+    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".mov", ".m4v", ".webm",
+})
+
+
+def _write_shopee_zip_entry(zf, path: Path, arcname: str) -> None:
+    """Add an archive entry without wasting CPU recompressing image/video media."""
+    import zipfile
+
+    compression = (
+        zipfile.ZIP_STORED
+        if path.suffix.lower() in _PRECOMPRESSED_MEDIA_EXTENSIONS
+        else zipfile.ZIP_DEFLATED
+    )
+    zf.write(path, arcname=arcname, compress_type=compression)
+
+
 def _zip_shopee_media(
     media_root: Path,
     stem: str,
@@ -1648,11 +1665,11 @@ def _zip_shopee_media(
             part_zip = zips_dir / part_name
             with zipfile.ZipFile(part_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                 if part_idx == 1 and csv_path and csv_path.is_file():
-                    zf.write(csv_path, arcname=csv_path.name)
+                    _write_shopee_zip_entry(zf, csv_path, csv_path.name)
                 if manifest_file.exists():
-                    zf.write(manifest_file, arcname="manifest.json")
+                    _write_shopee_zip_entry(zf, manifest_file, "manifest.json")
                 for f in part_files:
-                    zf.write(f, arcname=f.name)
+                    _write_shopee_zip_entry(zf, f, f.name)
             zip_rels.append(f"outputs/zips/{part_name}")
 
         primary = ZipPath(zip_rels[0])
@@ -1664,11 +1681,11 @@ def _zip_shopee_media(
     try:
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             if csv_path and csv_path.is_file():
-                zf.write(csv_path, arcname=csv_path.name)
+                _write_shopee_zip_entry(zf, csv_path, csv_path.name)
             if manifest_file.exists():
-                zf.write(manifest_file, arcname="manifest.json")
+                _write_shopee_zip_entry(zf, manifest_file, "manifest.json")
             for f in sorted(media_files, key=lambda x: str(x)):
-                zf.write(f, arcname=f.name)
+                _write_shopee_zip_entry(zf, f, f.name)
         rel = f"outputs/zips/{zip_path.name}"
         res = ZipPath(rel)
         res.parts = [rel]
