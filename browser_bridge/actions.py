@@ -32,6 +32,7 @@ class ActionName(str, Enum):
     PAGE_SCREENSHOT = "page.screenshot"
     FETCH_SAME_ORIGIN = "fetch.sameOrigin"
     JOB_CANCEL = "job.cancel"
+    JOB_CLEAR_STALE = "job.clearStale"
     PAGE_SCROLL = "page.scroll"
     EXTENSION_RELOAD = "extension.reload"
 
@@ -253,9 +254,9 @@ def validate_action_params(action: str, params: Dict[str, Any]) -> BaseModel:
         ActionName.TAB_GET_ACTIVE,
         ActionName.PAGE_GET_URL,
         ActionName.PAGE_GET_TITLE,
+        ActionName.JOB_CLEAR_STALE,
         ActionName.EXTENSION_RELOAD,
     ):
         return EmptyParams(**params)
 
     raise ValueError(f"Unhandled action schema: '{action}'")
-
