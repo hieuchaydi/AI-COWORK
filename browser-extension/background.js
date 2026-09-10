@@ -2397,7 +2397,7 @@ function generateHumanTrajectory(startX, startY, distance) {
 /**
  * 3. Tự động giải CAPTCHA trượt qua Chrome Debugger API (isTrusted = true)
  */
-async function tryAutoDragShopeeCaptcha(tabId, detection) {
+async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
   if (!tabId || !detection?.detected) return { attempted: false, reason: "no_captcha_detection" };
 
   let slider = detection.slider;
@@ -2501,6 +2501,7 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
               if (el.tagName === "svg" || el.querySelector("svg")) {
                 const s = (el.outerHTML || "").toLowerCase();
                 return s.includes("arrow") || s.includes("path");
+                return s.includes("arrow") || s.includes("chevron") || s.includes("right");
               }
               return false;
             });
@@ -2576,8 +2577,6 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
             const rect = el.getBoundingClientRect();
             return {
               selector,
-              x: Math.round(rect.left + Math.min(32, rect.width / 2)),
-              y: Math.round(rect.top + rect.height / 2),
               x: Math.round(rect.left + Math.min(36, rect.width * 0.12)),
               y: Math.round(rect.top + rect.height * 0.78),
               width: Math.round(rect.width),
@@ -2588,7 +2587,6 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
           return null;
         },
       });
-      slider = results?.find((r) => r?.result)?.result || null;
       const found = results?.find((r) => r?.result)?.result || null;
       if (found && (found.isOrangeHandle || !slider)) {
         slider = found;
@@ -2620,8 +2618,16 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
 
   const startX = slider.x;
   const startY = slider.y;
-  const distance = await calculatePuzzleDistance(tabId, slider);
-  console.log(`[bridge] Calculated puzzle travel: ${distance}px (startX: ${startX}, startY: ${startY})`);
+  let distance = await calculatePuzzleDistance(tabId, slider);
+  const attemptNum = Number(options?.attempt || detection?.attempt || 1);
+  if (attemptNum > 1) {
+    // P1-1: Nếu là lần thử thứ 2+, bù thêm jitter offset ngẫu nhiên để tránh kéo lại đúng vị trí sai
+    const jitter = Math.round((Math.random() < 0.5 ? -1 : 1) * (10 + Math.floor(Math.random() * 15)));
+    distance = Math.max(40, distance + jitter);
+    console.log(`[bridge] Auto-drag retry #${attemptNum}: applying jitter ${jitter >= 0 ? "+" : ""}${jitter}px -> distance: ${distance}px (startX: ${startX}, startY: ${startY})`);
+  } else {
+    console.log(`[bridge] Calculated puzzle travel: ${distance}px (startX: ${startX}, startY: ${startY})`);
+  }
   const points = generateHumanTrajectory(startX, startY, distance);
   const endX = startX + distance;
 
@@ -2650,7 +2656,9 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
     }
   }
 
+  // P1-4: DOM synthetic events fallback (warning: isTrusted=false, Shopee anti-bot usually rejects synthetic events)
   if (chrome.scripting?.executeScript) {
+    console.warn("[bridge] Debugger unavailable; falling back to synthetic DOM mouse events (isTrusted=false, may be rejected by Shopee anti-bot)");
     const [res] = await chrome.scripting.executeScript({
       target: { tabId },
       world: "MAIN",
@@ -2668,10 +2676,12 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
         }
         fire("mouseup", fx, sy);
         return { attempted: true, method: "dom_events" };
+        return { attempted: true, method: "dom_events_untrusted" };
       },
       args: [points, startX, startY, endX],
     });
     return res?.result || { attempted: true, method: "dom_events", distance };
+    return res?.result || { attempted: true, method: "dom_events_untrusted", distance };
   }
 
   return { attempted: false, reason: "no_input_backend" };
@@ -2681,8 +2691,8 @@ async function detectCaptchaInTab(tabId, options = {}) {
   try {
     if (!tabId || !chrome.scripting?.executeScript) return { detected: false, resolved: false };
     const shouldScroll = options?.scrollIntoView !== false;
-    const [res] = await chrome.scripting.executeScript({
-      target: { tabId },
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
       world: "MAIN",
       func: (allowScroll) => {
         const win = typeof window !== "undefined" ? window : globalThis;
@@ -2692,12 +2702,16 @@ async function detectCaptchaInTab(tabId, options = {}) {
         const bodyText = document.body ? document.body.innerText.toLowerCase() : "";
 
         // 1. Kiểm tra trạng thái ĐÃ GIẢI XONG (Resolved)
+        // P1-2: Không dùng [class*='success'] hay [class*='passed'] trơn để tránh false positive từ các phần tử khác ngoài trang
         const checkPassedSelectors = [
           ".shopee-captcha-slider__btn--success",
           ".captcha-passed",
           ".verify-passed",
           ".slider--success",
           ".slider-btn--success",
+          "[class*='slider'][class*='success']",
+          "[class*='captcha'][class*='success']",
+          "[class*='verify'][class*='success']",
           "[class*='btn--success']",
           "[class*='success']",
           "[class*='passed']",
@@ -2723,11 +2737,19 @@ async function detectCaptchaInTab(tabId, options = {}) {
               const color = style?.color || "";
               const isGreen = bg.includes("38, 170, 153") || bg.includes("32, 178, 170") || color.includes("38, 170, 153") || bg.includes("26aa99") || bg.includes("210, 236, 231");
               return hasCheckChar || (isGreen && (el.offsetWidth > 15 || el.offsetHeight > 15));
+              // P1-3: Giới hạn chỉ match khi có ký tự checkmark hoặc phần tử nằm trong ngữ cảnh captcha/slider
+              const inCaptchaContext = hasCheckChar || Boolean(
+                (typeof el.closest === "function" && el.closest(".shopee-captcha-slider, .verify-slider, [class*='captcha'], [class*='verify'], [class*='slider']")) ||
+                (typeof el.className === "string" && (el.className.includes("slider") || el.className.includes("captcha") || el.className.includes("verify")))
+              );
+              return inCaptchaContext && (hasCheckChar || (isGreen && (el.offsetWidth > 15 || el.offsetHeight > 15)));
             });
           } catch {}
         }
 
         if (isResolved) {
+          // P2-3: Reset scroll flag khi thử thách đã hoàn thành
+          try { win.__shopeeCaptchaScrolled = false; } catch {}
           return { detected: false, resolved: true, type: "slider_passed", pageUrl: location.href };
         }
 
@@ -2808,6 +2830,7 @@ async function detectCaptchaInTab(tabId, options = {}) {
               if (el.tagName === "svg" || el.querySelector("svg")) {
                 const s = (el.outerHTML || "").toLowerCase();
                 return s.includes("arrow") || s.includes("path");
+                return s.includes("arrow") || s.includes("chevron") || s.includes("right");
               }
               return false;
             });
@@ -2986,10 +3009,14 @@ async function detectCaptchaInTab(tabId, options = {}) {
           return { detected: true, resolved: false, type: "slider_pending", pageUrl: location.href };
         }
 
+        // P2-3: Khi không còn CAPTCHA trên trang, reset cờ scroll để tab sẵn sàng cho các lần sau
+        try { win.__shopeeCaptchaScrolled = false; } catch {}
         return { detected: false, resolved: false, pageUrl: location.href };
       },
       args: [shouldScroll],
     });
+    // P0-3: allFrames=true → pick the frame that detected/resolved CAPTCHA, fallback to main frame
+    const res = results?.find((r) => r?.result?.detected) || results?.find((r) => r?.result?.resolved) || results?.[0];
     return res?.result || { detected: false, resolved: false };
   } catch (err) {
     return { detected: false, resolved: false, error: err?.message };
@@ -3022,131 +3049,141 @@ function startVerificationWatcher(details) {
 
   let consecutiveAbsentCount = 0;
   let autoDragAttempts = 0;
+  // P2-2: Concurrency guard ngăn chặn thực thi chồng chéo giữa interval, event listener và post-drag
+  let checkInProgress = false;
 
   const performCheckAndPreflight = async () => {
-    if (!verificationInfo || verificationInfo.job_id !== jid || verificationInfo.kind !== "verification") {
-      stopVerificationWatcher();
-      return;
-    }
-    const check = await detectCaptchaInTab(targetTabId, { scrollIntoView: false });
-    if (check?.resolved || !check?.detected) {
-      consecutiveAbsentCount++;
-      console.log(`[bridge] CAPTCHA absent/resolved count: ${consecutiveAbsentCount}/2 (type: ${check?.type || "none"}) for job ${jid}`);
-      if (consecutiveAbsentCount >= 2 || check?.resolved) {
-        if (resumeInFlightMap.get(jid)) {
-          console.log("[bridge] Resume already in-flight for job:", jid);
-          return;
-        }
-        resumeInFlightMap.set(jid, true);
-
-        console.log("[bridge] Challenge resolved/absent! Running preflight API in tab...");
-        let preflightRes = null;
-        try {
-          preflightRes = await preflightRatingsInTab(targetTabId, itemid, shopid, referer);
-        } catch (err) {
-          console.warn("[bridge] Preflight error:", err?.message || err);
-        }
-
-        const evalRes = evaluatePreflightResult(preflightRes);
-        const hasValidRatings = isUsableRatingsPreflight(preflightRes);
-
-        if (hasValidRatings) {
-          console.log("[bridge] ✔ Preflight succeeded (HTTP 200 & valid ratings)! Resuming job:", jid);
-          stopVerificationWatcher();
-          try {
-            const currentTab = await chrome.tabs.get(targetTabId);
-            if (currentTab?.url && (currentTab.url.includes("/verify/") || currentTab.url.includes("captcha"))) {
-              await chrome.tabs.update(targetTabId, { url: referer || details?.url });
-            }
-          } catch {}
-
-          const currentCycle = (verificationCycles.get(jid) || 0) + 1;
-          verificationCycles.set(jid, currentCycle);
-          resumeVerification(jid, {
-            verification_cycle: currentCycle,
-            checkpoint: details?.checkpoint,
-            message: "Thử thách CAPTCHA đã được giải và preflight API thành công (HTTP 200)",
-          });
-        } else {
-          console.warn("[bridge] ✘ Preflight failed after challenge disappeared:", evalRes.error || preflightRes?.status || "unusable ratings payload");
-          resumeInFlightMap.set(jid, false);
-          consecutiveAbsentCount = 0;
-
-          if (classifyShopeeFailure(preflightRes) === "verification") {
-            const verificationUrl = extractVerificationUrl(preflightRes) || details?.verification_url || details?.target_url || details?.url;
-            if (verificationUrl && targetTabId && chrome.tabs?.update) {
-              try {
-                await chrome.tabs.update(targetTabId, { url: verificationUrl, active: true });
-              } catch (err) {
-                console.warn("[bridge] Could not navigate to Shopee verification URL:", err?.message || err);
-              }
-            }
-            await triggerVerificationRequired({
-              ...details,
-              job_id: jid,
-              tab_id: targetTabId,
-              verification_url: verificationUrl,
-              target_url: verificationUrl,
-              reason: evalRes.error || formatShopeeFailure(preflightRes),
-              kind: "verification",
-              checkpoint: details?.checkpoint,
-            });
+    if (checkInProgress) return;
+    checkInProgress = true;
+    try {
+      if (!verificationInfo || verificationInfo.job_id !== jid || verificationInfo.kind !== "verification") {
+        stopVerificationWatcher();
+        return;
+      }
+      const check = await detectCaptchaInTab(targetTabId, { scrollIntoView: false });
+      if (check?.resolved || !check?.detected) {
+        consecutiveAbsentCount++;
+        console.log(`[bridge] CAPTCHA absent/resolved count: ${consecutiveAbsentCount}/2 (type: ${check?.type || "none"}) for job ${jid}`);
+        if (consecutiveAbsentCount >= 2 || check?.resolved) {
+          if (resumeInFlightMap.get(jid)) {
+            console.log("[bridge] Resume already in-flight for job:", jid);
             return;
           }
+          resumeInFlightMap.set(jid, true);
 
-          if (!check?.resolved && (preflightRes?.status === 403 || evalRes.error?.includes("403"))) {
-            const currentTab = await chrome.tabs.get(targetTabId).catch(() => null);
-            const isStillVerify = currentTab?.url && (currentTab.url.includes("/verify/") || currentTab.url.includes("captcha"));
-            if (!isStillVerify) {
-              console.warn("[bridge] Tab has no challenge and is not on verify page, but API is 403 -> transitioning to api_blocked");
-              stopVerificationWatcher();
-              const reason = evalRes.error || "Shopee chặn API đánh giá (HTTP 403 / API Blocked)";
-              updateState("api_blocked", {
+          console.log("[bridge] Challenge resolved/absent! Running preflight API in tab...");
+          let preflightRes = null;
+          try {
+            preflightRes = await preflightRatingsInTab(targetTabId, itemid, shopid, referer);
+          } catch (err) {
+            console.warn("[bridge] Preflight error:", err?.message || err);
+          }
+
+          const evalRes = evaluatePreflightResult(preflightRes);
+          const hasValidRatings = isUsableRatingsPreflight(preflightRes);
+
+          if (hasValidRatings) {
+            console.log("[bridge] ✔ Preflight succeeded (HTTP 200 & valid ratings)! Resuming job:", jid);
+            stopVerificationWatcher();
+            try {
+              const currentTab = await chrome.tabs.get(targetTabId);
+              if (currentTab?.url && (currentTab.url.includes("/verify/") || currentTab.url.includes("captcha"))) {
+                await chrome.tabs.update(targetTabId, { url: referer || details?.url });
+              }
+            } catch {}
+
+            const currentCycle = (verificationCycles.get(jid) || 0) + 1;
+            verificationCycles.set(jid, currentCycle);
+            resumeVerification(jid, {
+              verification_cycle: currentCycle,
+              checkpoint: details?.checkpoint,
+              message: "Thử thách CAPTCHA đã được giải và preflight API thành công (HTTP 200)",
+            });
+          } else {
+            console.warn("[bridge] ✘ Preflight failed after challenge disappeared:", evalRes.error || preflightRes?.status || "unusable ratings payload");
+            resumeInFlightMap.set(jid, false);
+            consecutiveAbsentCount = 0;
+
+            if (classifyShopeeFailure(preflightRes) === "verification") {
+              const verificationUrl = extractVerificationUrl(preflightRes) || details?.verification_url || details?.target_url || details?.url;
+              if (verificationUrl && targetTabId && chrome.tabs?.update) {
+                try {
+                  await chrome.tabs.update(targetTabId, { url: verificationUrl, active: true });
+                } catch (err) {
+                  console.warn("[bridge] Could not navigate to Shopee verification URL:", err?.message || err);
+                }
+              }
+              await triggerVerificationRequired({
+                ...details,
                 job_id: jid,
                 tab_id: targetTabId,
-                reason,
-                kind: "api_blocked",
+                verification_url: verificationUrl,
+                target_url: verificationUrl,
+                reason: evalRes.error || formatShopeeFailure(preflightRes),
+                kind: "verification",
                 checkpoint: details?.checkpoint,
               });
-              if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
-                bridgeSend({
-                  v: 1,
-                  type: "api_blocked",
-                  id: "blocked-" + Date.now(),
-                  params: {
-                    job_id: jid,
-                    status: 403,
-                    reason,
-                    checkpoint: details?.checkpoint,
-                  },
+              return;
+            }
+
+            if (!check?.resolved && (preflightRes?.status === 403 || evalRes.error?.includes("403"))) {
+              const currentTab = await chrome.tabs.get(targetTabId).catch(() => null);
+              const isStillVerify = currentTab?.url && (currentTab.url.includes("/verify/") || currentTab.url.includes("captcha"));
+              if (!isStillVerify) {
+                console.warn("[bridge] Tab has no challenge and is not on verify page, but API is 403 -> transitioning to api_blocked");
+                stopVerificationWatcher();
+                const reason = evalRes.error || "Shopee chặn API đánh giá (HTTP 403 / API Blocked)";
+                updateState("api_blocked", {
+                  job_id: jid,
+                  tab_id: targetTabId,
+                  reason,
+                  kind: "api_blocked",
+                  checkpoint: details?.checkpoint,
                 });
+                if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+                  bridgeSend({
+                    v: 1,
+                    type: "api_blocked",
+                    id: "blocked-" + Date.now(),
+                    params: {
+                      job_id: jid,
+                      status: 403,
+                      reason,
+                      checkpoint: details?.checkpoint,
+                    },
+                  });
+                }
               }
             }
           }
         }
-      }
-    } else {
-      consecutiveAbsentCount = 0;
-      // Chế độ quan sát thụ động (Passive Handover): không tự ý drag bừa 240px làm hỏng CAPTCHA ghép hình.
-      // Thử tự động kéo thông minh tối đa 2 lần nếu CAPTCHA đang hiển thị
-      if (autoDragAttempts < 2) {
-        autoDragAttempts++;
-        try {
-          console.log(`[bridge] CAPTCHA visible; attempting intelligent slider drag ${autoDragAttempts}/2 for job ${jid}...`);
-          const dragRes = await tryAutoDragShopeeCaptcha(targetTabId, check);
-          console.log("[bridge] Intelligent slider drag result:", dragRes);
-          if (dragRes?.attempted) {
-            await new Promise((r) => setTimeout(r, 1200));
-            return performCheckAndPreflight();
+      } else {
+        consecutiveAbsentCount = 0;
+        // Chế độ quan sát thụ động (Passive Handover): không tự ý drag bừa 240px làm hỏng CAPTCHA ghép hình.
+        // Thử tự động kéo thông minh tối đa 2 lần nếu CAPTCHA đang hiển thị
+        if (autoDragAttempts < 2) {
+          autoDragAttempts++;
+          try {
+            console.log(`[bridge] CAPTCHA visible; attempting intelligent slider drag ${autoDragAttempts}/2 for job ${jid}...`);
+            // P1-1: Truyền attempt để tự động bù jitter offset ở lần thử thứ 2
+            const dragRes = await tryAutoDragShopeeCaptcha(targetTabId, check, { attempt: autoDragAttempts });
+            console.log("[bridge] Intelligent slider drag result:", dragRes);
+            if (dragRes?.attempted) {
+              await new Promise((r) => setTimeout(r, 1200));
+              checkInProgress = false;
+              return performCheckAndPreflight();
+            }
+          } catch (err) {
+            console.warn("[bridge] Auto-drag attempt failed:", err?.message || err);
           }
-        } catch (err) {
-          console.warn("[bridge] Auto-drag attempt failed:", err?.message || err);
+        }
+        // Chế độ quan sát thụ động (Passive Handover): Nếu sau 2 lần tự động chưa khớp, nhường quyền kéo tay cho người dùng
+        if (check?.slider?.isOrangeHandle) {
+          console.log(`[bridge] Passive handover: Shopee orange slider button active at (${check.slider.x}, ${check.slider.y}). Chờ người dùng thao tác kéo...`);
         }
       }
-      // Chế độ quan sát thụ động (Passive Handover): Nếu sau 2 lần tự động chưa khớp, nhường quyền kéo tay cho người dùng
-      if (check?.slider?.isOrangeHandle) {
-        console.log(`[bridge] Passive handover: Shopee orange slider button active at (${check.slider.x}, ${check.slider.y}). Chờ người dùng thao tác kéo...`);
-      }
+    } finally {
+      checkInProgress = false;
     }
   };
 

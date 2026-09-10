@@ -72,25 +72,37 @@ def is_captcha_detected(
                 "reason": f"URL matches verification pattern: {pat}",
             }
 
-    # 2. DOM selector check in HTML
-    for sel in CAPTCHA_DOM_SELECTORS:
-        token = ""
-        if "[class*='" in sel:
-            token = sel.split("[class*='")[1].split("']")[0]
-        elif "[src*='" in sel:
-            token = sel.split("[src*='")[1].split("']")[0]
-        elif sel.startswith("."):
-            token = sel[1:]
-        else:
-            token = sel
+    # 2. DOM selector check in HTML (P2-5: Scope check to class/src/id attributes to avoid raw substring false positives)
+    if lowered_html:
+        for sel in CAPTCHA_DOM_SELECTORS:
+            token = ""
+            is_src = False
+            if "[class*='" in sel:
+                token = sel.split("[class*='")[1].split("']")[0]
+            elif "[src*='" in sel:
+                token = sel.split("[src*='")[1].split("']")[0]
+                is_src = True
+            elif sel.startswith("."):
+                token = sel[1:]
+            else:
+                token = sel
 
-        if token and token in lowered_html:
-            return {
-                "detected": True,
-                "kind": "dom_selector",
-                "pattern": sel,
-                "reason": f"DOM contains verification widget selector: {sel}",
-            }
+            if not token:
+                continue
+
+            matched = False
+            if is_src:
+                matched = bool(re.search(rf"""src\s*=\s*['"][^'"]*{re.escape(token)}[^'"]*['"]""", lowered_html))
+            else:
+                matched = bool(re.search(rf"""(?:class|id)\s*=\s*['"][^'"]*{re.escape(token)}[^'"]*['"]""", lowered_html))
+
+            if matched:
+                return {
+                    "detected": True,
+                    "kind": "dom_selector",
+                    "pattern": sel,
+                    "reason": f"DOM contains verification widget selector: {sel}",
+                }
 
     # 3. Text pattern matching
     for pat in CAPTCHA_TEXT_PATTERNS:

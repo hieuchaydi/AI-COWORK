@@ -2338,5 +2338,65 @@ test('detectCaptchaInTab finds orange button by track text when standard classes
   assert.equal(detection.slider.y, 338, 'must target y=338 (bottom slider bar), NOT y=240 (middle of puzzle image)');
 });
 
+test('tryAutoDragShopeeCaptcha applies jitter offset on retry attempt 2', async () => {
+  const { context } = await worker();
+  context.setTimeout = (fn) => { queueMicrotask(fn); return 1; };
+  context.chrome.debugger = {
+    attach: async () => {},
+    detach: async () => {},
+    sendCommand: async () => {},
+  };
 
+  const d1 = {
+    detected: true,
+    slider: { x: 100, y: 300, width: 320, isOrangeHandle: true },
+    attempt: 1,
+  };
+  const r1 = await vm.runInContext(`tryAutoDragShopeeCaptcha(901, ${JSON.stringify(d1)})`, context);
+  assert.equal(r1.attempted, true);
 
+  const d2 = {
+    detected: true,
+    slider: { x: 100, y: 300, width: 320, isOrangeHandle: true },
+    attempt: 2,
+  };
+  const r2 = await vm.runInContext(`tryAutoDragShopeeCaptcha(901, ${JSON.stringify(d2)})`, context);
+  assert.equal(r2.attempted, true);
+  assert.notEqual(r2.distance, r1.distance, 'retry attempt 2 must apply jitter offset to avoid repeating exact failed drag');
+});
+
+test('detectCaptchaInTab does not false-positive resolve on unrelated .success element outside captcha', async () => {
+  const { context } = await worker();
+  vm.runInContext(`
+    chrome.scripting = {
+      executeScript: async ({ func }) => {
+        globalThis.location = { href: "https://shopee.vn/verify/traffic?anti_bot_tracking_id=fake_success" };
+        globalThis.document = {
+          body: { innerText: "Kéo qua để hoàn thiện bức hình" },
+          querySelector: (sel) => null,
+          querySelectorAll: (sel) => {
+            if (sel.includes("div, span, p")) {
+              return [{
+                innerText: "Kéo qua để hoàn thiện bức hình",
+                offsetWidth: 200,
+                offsetHeight: 40,
+                parentElement: null,
+                getBoundingClientRect: () => ({ left: 50, top: 200, width: 200, height: 40 }),
+                querySelectorAll: () => [],
+              }];
+            }
+            return [];
+          },
+        };
+        globalThis.window = {
+          getComputedStyle: () => ({ backgroundColor: "rgb(255, 255, 255)", color: "black" }),
+        };
+        return [{ result: func() }];
+      },
+    };
+  `, context);
+
+  const detection = await vm.runInContext('detectCaptchaInTab(902)', context);
+  assert.equal(detection.detected, true, 'challenge must still be detected');
+  assert.equal(detection.resolved, false, 'must not be marked resolved by unrelated success elements');
+});
