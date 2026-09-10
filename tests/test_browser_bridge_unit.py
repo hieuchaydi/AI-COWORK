@@ -699,7 +699,7 @@ def test_captcha_detector_save_evidence_screenshot(tmp_path):
 
 
 def test_captcha_detector_match_template_grayscale(tmp_path):
-    from PIL import Image
+    Image = pytest.importorskip("PIL.Image")
 
     img1 = Image.new("L", (100, 100), color=128)
     p1 = tmp_path / "img1.png"

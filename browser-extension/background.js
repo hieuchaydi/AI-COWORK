@@ -757,6 +757,9 @@ function classifyShopeeFailure(fetchRes) {
   if (loginState === false) return "login";
 
   if (json?.error === 90309999 && json?.redirect_to_error_page === true) return "verification";
+  // 1. Phản hồi 90309999 từ Shopee API kèm tracking token hoặc redirect -> chắc chắn là verification challenge
+  const hasAntiBotToken = Boolean(json?.["6"]?.["0"] || json?.tracking_id || json?.redirect_to_error_page);
+  if (json?.error === 90309999 && hasAntiBotToken) return "verification";
   if (isShopeeChallenge(url, pageUrl, sample)) return "verification";
   if (loginState === true) return "api_blocked";
 
@@ -793,6 +796,12 @@ function extractVerificationUrl(input) {
     if (isTarget(input.url)) return input.url.replace(/[;,.)]+$/, "");
     if (isTarget(input.responseUrl)) return input.responseUrl.replace(/[;,.)]+$/, "");
     const json = input.json || {};
+    let origin = "https://shopee.vn";
+    try {
+      const base = new URL(input.pageUrl || input.url || origin);
+      if (isShopeeHostname(base.hostname)) origin = base.origin;
+    } catch {}
+
     if (json?.redirect_to_error_page === true && typeof json.tracking_id === "string" && json.tracking_id) {
       let origin = "https://shopee.vn";
       try {
@@ -800,6 +809,10 @@ function extractVerificationUrl(input) {
         if (isShopeeHostname(base.hostname)) origin = base.origin;
       } catch {}
       return `${origin}/verify/traffic?anti_bot_tracking_id=${encodeURIComponent(json.tracking_id)}`;
+    }
+    const trackingId = (typeof json?.["6"]?.["0"] === "string" && json["6"]["0"]) || (typeof json?.tracking_id === "string" ? json.tracking_id : null);
+    if (trackingId) {
+      return `${origin}/verify/captcha?anti_bot_tracking_id=${encodeURIComponent(trackingId)}`;
     }
     const str = `${input.reason || ""} ${input.error || ""} ${input.message || ""} ${input.textSample || ""}`;
     const match = str.match(urlPattern);
@@ -1746,7 +1759,17 @@ async function runJob(job) {
 
       const targetTabId = job._targetTabId;
       // Quét xem tab Shopee có slider CAPTCHA hoặc trang xác minh không
-      const captchaCheck = targetTabId ? await detectCaptchaInTab(targetTabId) : { detected: false };
+      let captchaCheck = { detected: false };
+      let currentTabUrl = "";
+      if (targetTabId && chrome.tabs) {
+        try {
+          const currentTab = await chrome.tabs.get(targetTabId).catch(() => null);
+          currentTabUrl = currentTab?.url || "";
+          captchaCheck = await detectCaptchaInTab(targetTabId);
+        } catch {}
+      }
+      const isChallengeUrl = isShopeeChallenge(job.url, currentTabUrl, message);
+      const isChallenge = captchaCheck?.detected || isChallengeUrl;
       const evidence = targetTabId ? await captureTabEvidence(targetTabId) : null;
 
       // Lưu job vào pending verification để sẵn sàng resume
@@ -1756,11 +1779,14 @@ async function runJob(job) {
         await chrome.storage.local.set({ [`pending_job_${job.id}`]: job });
       } catch {}
 
-      if (captchaCheck?.detected) {
+      if (isChallenge) {
         // --- 1. VERIFICATION_REQUIRED: Tab hiển thị CAPTCHA challenge rõ ràng ---
+        const verificationUrl = extractVerificationUrl(e?.fetchRes) || extractVerificationUrl(message) || currentTabUrl || job.url;
         await triggerVerificationRequired({
           job_id: job.id,
           url: job.url,
+          verification_url: verificationUrl,
+          target_url: verificationUrl,
           tab_id: targetTabId || null,
           reason: `Phát hiện thử thách CAPTCHA khi gọi API Shopee (${captchaCheck.type || "slider"})`,
           kind: "verification",
@@ -2138,12 +2164,17 @@ async function tryAutoDragShopeeCaptcha(tabId, detection) {
           }
           const containerSelectors = [
             ".shopee-captcha-slider",
+            ".shopee-captcha-slider__button",
+            ".shopee-captcha-slider__btn",
             ".verify-slider",
             "[class*='captcha'][class*='slider']",
           ];
           for (const selector of containerSelectors) {
             const el = document.querySelector(selector);
             if (!el || (!el.offsetWidth && !el.offsetHeight)) continue;
+            if (typeof el.scrollIntoView === "function") {
+              el.scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
+            }
             const rect = el.getBoundingClientRect();
             return {
               selector,
@@ -2328,6 +2359,8 @@ async function detectCaptchaInTab(tabId, options = {}) {
         const containerSelectors = [
           ".shopee-captcha-slider",
           ".shopee-captcha-slider__bar",
+          ".shopee-captcha-slider__button",
+          ".shopee-captcha-slider__btn",
           ".captcha_container",
           ".geetest_radar_btn",
           ".geetest_canvas_bg",
@@ -2425,6 +2458,16 @@ async function detectCaptchaInTab(tabId, options = {}) {
 
         for (const p of phrases) {
           if (bodyText.includes(p)) {
+            try {
+              if (typeof document.querySelectorAll === "function") {
+                const matchingEl = Array.from(document.querySelectorAll("div, p, span, h1, h2, h3, label, a, button, section, form")).find(
+                  (e) => e.innerText && e.innerText.toLowerCase().includes(p) && e.children?.length === 0
+                );
+                if (matchingEl && typeof matchingEl.scrollIntoView === "function") {
+                  matchingEl.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+                }
+              }
+            } catch {}
             return { detected: true, resolved: false, type: "dom_text", phrase: p, elementFound: true, pageUrl: location.href };
           }
         }
