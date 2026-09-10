@@ -2719,6 +2719,10 @@ async function handleAction(action, params) {
         version: chrome.runtime.getManifest?.().version || "2.3.0",
         connected: bridgeSocket ? bridgeSocket.readyState === WebSocket.OPEN : false,
         activeJobsCount: activeJobs.size,
+        activeJobIds: Array.from(activeJobs.keys()),
+        queuedJobIds: jobQueue.map((entry) => entry?.job?.id).filter(Boolean),
+        currentJobId: currentJobExecution?.job?.id || null,
+        isQueueRunning,
         extensionState,
       };
 
@@ -3169,9 +3173,32 @@ async function handleAction(action, params) {
       await cleanupPendingJobState(jobId, { clearVerification: true });
       if (activeJobs.has(jobId)) {
         activeJobs.delete(jobId);
+        if (currentJobExecution?.job?.id === jobId) {
+          try { currentJobExecution.abortController?.abort(); } catch {}
+          currentJobExecution = null;
+        }
+        jobQueue = jobQueue.filter((entry) => entry?.job?.id !== jobId);
+        if (activeJobs.size === 0 && jobQueue.length === 0) {
+          isQueueRunning = false;
+          updateState("connected");
+          notifyQueueWaiters();
+        }
         return { cancelled: true, jobId };
       }
       return { cancelled: false, message: "Job not running" };
+    }
+
+    case "job.clearStale": {
+      const activeJobIds = Array.from(activeJobs.keys());
+      const queuedJobIds = jobQueue.map((entry) => entry?.job?.id).filter(Boolean);
+      try { currentJobExecution?.abortController?.abort(); } catch {}
+      activeJobs.clear();
+      jobQueue = [];
+      currentJobExecution = null;
+      isQueueRunning = false;
+      updateState("connected");
+      notifyQueueWaiters();
+      return { cleared: true, activeJobIds, queuedJobIds };
     }
 
     case "page.scroll": {
