@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import sys
+import threading
+import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -13,6 +18,41 @@ import pytest
 from coworker.tools.crawl import make_crawl_tools
 from coworker.tools.media_pipeline import crawl_and_export_bundle, download_media_from_csv
 from coworker.tools.router import categorize_tool, ToolCategory
+
+
+class _MediaFixtureHandler(BaseHTTPRequestHandler):
+    payloads = {
+        "/photo-one.jpg": (b"fake-jpeg-one", "image/jpeg"),
+        "/clip-one.mp4": (b"fake-mp4-one", "video/mp4"),
+    }
+
+    def do_GET(self):
+        payload = self.payloads.get(self.path)
+        if not payload:
+            self.send_response(404)
+            self.end_headers()
+            return
+        body, content_type = payload
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        return
+
+
+@pytest.fixture
+def media_fixture_server():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _MediaFixtureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
 
 
 def test_crawl_and_export_bundle_no_media(tmp_path):
@@ -28,6 +68,68 @@ def test_crawl_and_export_bundle_no_media(tmp_path):
 
     # Cleanup CSV
     Path(res["csv"]["path"]).unlink(missing_ok=True)
+
+
+def test_crawl_and_export_bundle_excel_safe_csv_and_real_media_zip(tmp_path, media_fixture_server):
+    image_url = f"{media_fixture_server}/photo-one.jpg"
+    video_url = f"{media_fixture_server}/clip-one.mp4"
+    rows = [
+        {
+            "title": "Áo &amp; váy &quot;xịn&quot;",
+            "thoi_gian": "2026-09-10 09:30:00",
+            "noi_dung": "Dòng 1&nbsp;đẹp\nDòng 2 &lt;ổn&gt;",
+            "anh_urls": image_url,
+            "video_urls": video_url,
+            "extra_note": "x",
+        },
+        {"title": "", "noi_dung": "", "anh_urls": ""},
+        {
+            "title": "Không media",
+            "noi_dung": "Nội dung bình thường",
+            "extra_note": "y",
+        },
+    ]
+
+    res = crawl_and_export_bundle(
+        rows,
+        job_name="excel_safe_media_bundle",
+        output_dir=str(tmp_path),
+    )
+
+    assert res.get("ok") is True
+    assert res["csv"]["row_count"] == 2
+    csv_path = Path(res["csv"]["path"])
+    raw_csv = csv_path.read_bytes()
+    assert raw_csv.startswith(b"\xef\xbb\xbf")
+    assert b"\r\n" in raw_csv
+
+    text = raw_csv.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text))
+    assert reader.fieldnames[:4] == ["stt", "title", "thoi_gian", "noi_dung"]
+    assert reader.fieldnames.index("noi_dung") < reader.fieldnames.index("anh_urls")
+    assert reader.fieldnames.index("anh_urls") < reader.fieldnames.index("video_urls")
+    parsed_rows = list(reader)
+    assert len(parsed_rows) == 2
+    assert parsed_rows[0]["stt"] == "1"
+    assert parsed_rows[1]["stt"] == "2"
+    assert parsed_rows[0]["title"] == 'Áo & váy "xịn"'
+    assert parsed_rows[0]["noi_dung"] == "Dòng 1 đẹp\nDòng 2 <ổn>"
+    assert parsed_rows[0]["anh_urls"] == image_url
+    assert parsed_rows[0]["video_urls"] == video_url
+
+    assert res["zip"] is not None
+    zip_path = Path(res["zip"]["path"])
+    assert zip_path.exists()
+    assert zipfile.is_zipfile(zip_path)
+    with zipfile.ZipFile(zip_path) as zf:
+        names = set(zf.namelist())
+        assert "manifest.json" in names
+        assert any(name.endswith(".jpg") for name in names)
+        assert any(name.endswith(".mp4") for name in names)
+
+    assert res["zip"]["downloaded_count"] == 2
+    assert res["zip"]["unique_count"] == 2
+    assert res["zip"]["failed_count"] == 0
 
 
 def test_crawl_and_export_bundle_extracts_media_from_rows(tmp_path, monkeypatch):
@@ -557,7 +659,4 @@ def test_download_media_from_csv_error_cases(tmp_path):
     res4 = download_media_from_csv(str(no_media_file), url_columns=["nonexistent_col"])
     assert res4.get("ok") is False
     assert "None of the specified url_columns" in res4["error"]
-
-
-
 

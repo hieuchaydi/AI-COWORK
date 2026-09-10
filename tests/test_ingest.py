@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import os
+import csv
+import io
 import sys
 import threading
 import urllib.error
@@ -70,7 +72,7 @@ def test_ingest_writes_json_and_excel_ready_csv(server):
     raw = (outputs / "csv" / "shopee_123.csv").read_bytes()
     assert raw[:3] == b"\xef\xbb\xbf"  # BOM, else Excel renders Vietnamese as mojibake
     text = raw.decode("utf-8-sig")
-    assert text.startswith("thoi_gian,sao,noi_dung,user\r\n")
+    assert text.startswith("stt,thoi_gian,sao,noi_dung,user\r\n")
     assert '"hàng ngon, giao nhanh"' in text  # embedded comma quoted, not column-split
 
 
@@ -92,6 +94,40 @@ def test_ingest_csv_cleans_cells_and_skips_empty_rows(server):
     assert "Rất\xa0ổn" not in text
     assert "Rất ổn" in text
     assert "https://img/1.jpg | https://img/2.jpg" in text
+
+
+def test_ingest_csv_decodes_entities_preserves_review_newlines_and_orders_columns(server):
+    base, outputs = server
+    rows = [
+        {
+            "title": "Áo &amp; váy &quot;xịn&quot;",
+            "thoi_gian": "2026-09-10 09:30:00",
+            "noi_dung": "Dòng 1&nbsp;đẹp\nDòng 2 &lt;ổn&gt;",
+            "anh_urls": "https://down-vn.img.susercontent.com/file/a.jpg",
+            "video_urls": "https://deo.shopeemobile.com/file/v.mp4",
+            "extra_note": "x",
+        },
+        {"title": "", "thoi_gian": "", "noi_dung": "", "anh_urls": "", "video_urls": ""},
+    ]
+    status, out = _post(base, "/ingest?name=shopee_entities", {"source": "https://shopee.vn/x", "rows": rows})
+    assert status == 200 and out["ok"] and out["count"] == 1
+
+    raw = (outputs / "csv" / "shopee_entities.csv").read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf")
+    assert b"\r\n" in raw
+    text = raw.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text))
+    assert reader.fieldnames[:3] == ["stt", "thoi_gian", "noi_dung"]
+    assert reader.fieldnames.index("noi_dung") < reader.fieldnames.index("anh_urls")
+    assert reader.fieldnames.index("anh_urls") < reader.fieldnames.index("video_urls")
+    assert reader.fieldnames.index("video_urls") < reader.fieldnames.index("title")
+    parsed_rows = list(reader)
+    assert len(parsed_rows) == 1
+    assert parsed_rows[0]["stt"] == "1"
+    assert parsed_rows[0]["title"] == 'Áo & váy "xịn"'
+    assert parsed_rows[0]["noi_dung"] == "Dòng 1 đẹp\nDòng 2 <ổn>"
+    assert parsed_rows[0]["anh_urls"].endswith("/a.jpg")
+    assert parsed_rows[0]["video_urls"].endswith("/v.mp4")
 
 
 def test_shopee_ingest_adds_local_media_paths(tmp_path, monkeypatch):
@@ -132,7 +168,7 @@ def test_ingest_csv_aligns_ragged_rows_under_a_union_header(server):
     """A row missing a key must leave a hole, not shift every later column left."""
     base, outputs = server
     _post(base, "/ingest?name=ragged", {"rows": [{"a": 1}, {"b": 2, "a": 3}]})
-    assert (outputs / "csv" / "ragged.csv").read_bytes().decode("utf-8-sig") == "a,b\r\n1,\r\n3,2\r\n"
+    assert (outputs / "csv" / "ragged.csv").read_bytes().decode("utf-8-sig") == "stt,a,b\r\n1,1,\r\n2,3,2\r\n"
 
 
 def test_ingest_skips_csv_for_non_tabular_payloads(server):

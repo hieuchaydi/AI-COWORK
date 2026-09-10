@@ -135,6 +135,7 @@ def crawl_and_export_bundle(
                 "skipped_count": zip_res.get("skipped_count", 0),
                 "unique_count": zip_res.get("unique_count", zip_res.get("file_count", 0)),
                 "duplicate_count": zip_res.get("duplicate_count", 0),
+                "failed_count": zip_res.get("failed_count", 0),
                 "manifest_path": zip_res.get("manifest_path"),
                 "manifest": zip_res.get("manifest"),
                 "is_in_outputs": _is_in_outputs(zip_res.get("zip_path")),
@@ -502,4 +503,3 @@ def download_media_from_csv(
         "report_url": report_url,
     }
     return result
-

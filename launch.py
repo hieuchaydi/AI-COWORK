@@ -1451,11 +1451,19 @@ def _write_ingest_csv(json_name: str, rows: list) -> str | None:
                 cols.append(k)
     if not cols:
         return None
+    has_stt = any(str(c).lower() in {"stt", "no", "no.", "index"} for c in cols)
+    preferred = list(_SHOPEE_REVIEW_COLUMNS) if "_SHOPEE_REVIEW_COLUMNS" in globals() else []
+    ordered_cols = [c for c in preferred if c in cols]
+    ordered_cols.extend(c for c in cols if c not in ordered_cols)
+    final_cols = (["stt"] + ordered_cols) if not has_stt else ordered_cols
     buf = io.StringIO()
-    w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore", lineterminator="\r\n")
+    w = csv.DictWriter(buf, fieldnames=final_cols, extrasaction="ignore", lineterminator="\r\n")
     w.writeheader()
-    for r in valid_rows:
-        w.writerow({k: _clean_csv_cell(r.get(k, ""), key=k) for k in cols})
+    for idx, r in enumerate(valid_rows, start=1):
+        cleaned = {k: _clean_csv_cell(r.get(k, ""), key=k) for k in ordered_cols}
+        if not has_stt:
+            cleaned["stt"] = idx
+        w.writerow(cleaned)
     out_dir = _outputs_root() / "csv"
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = json_name[:-5] if json_name.endswith(".json") else json_name

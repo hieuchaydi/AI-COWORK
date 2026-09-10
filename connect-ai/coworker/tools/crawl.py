@@ -720,11 +720,21 @@ def _save_csv(
     if not isinstance(rows, list):
         return {"error": "rows must be a list"}
     csv_text = _rows_to_csv(rows, headers=headers, add_stt=add_stt)
+    exported_row_count = 0
+    for row in rows:
+        if isinstance(row, dict):
+            if any(str(v or "").strip() for v in row.values()):
+                exported_row_count += 1
+        elif isinstance(row, (list, tuple)):
+            if any(str(v or "").strip() for v in row):
+                exported_row_count += 1
+        elif row:
+            exported_row_count += 1
     if not filename.lower().endswith(".csv"):
         filename += ".csv"
     r = _save_artifact(csv_text, filename, encoding="utf-8", add_utf8_bom=True, output_dir=output_dir)
     if "url" in r:
-        r["row_count"] = len(rows)
+        r["row_count"] = exported_row_count
         r["headers"] = headers or (list(rows[0].keys()) if rows and isinstance(rows[0], dict) else [])
     return r
 
