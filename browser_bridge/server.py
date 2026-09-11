@@ -547,6 +547,10 @@ class BrowserGatewayServer:
         conn: GatewayClientConnection,
         initial_data: bytes = b"",
     ) -> None:
+        try:
+            sock.settimeout(None)
+        except OSError:
+            pass
         reader = _BufferedSocketReader(sock, initial_data)
         try:
             while True:
