@@ -2421,28 +2421,38 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
 }
 
 /**
- * 2. Tạo quỹ đạo kéo giả lập người thật (Humanized Trajectory Generator):
- * - Tăng tốc ban đầu, giảm tốc khi tới gần đích (Cubic Ease-Out: 1 - (1-t)^3).
- * - Rung lắc vi mô trục Y (Jitter: +/- 1-2.5px).
- * - Kéo lố nhẹ (Overshoot: 2-5px) rồi nhích lùi lại để khớp vị trí chính xác.
- * - Delay ngẫu nhiên giữa các bước (14ms - 32ms).
+ * 2. Tạo quỹ đạo kéo giả lập người thật (Biomechanical Humanized Trajectory Generator):
+ * - Đường cong S-Curve (Cubic Ease-In-Out): Khởi đầu êm (tăng tốc dần), đạt vận tốc đỉnh ở giữa, hãm phanh mượt khi tới gần khe khuyết.
+ * - Rung lắc cơ sinh học trục Y (Spring-Damper Inertial Walk): Mô phỏng độ rung vi mô tự nhiên của bàn tay, không tạo chu kỳ sin nhân tạo.
+ * - Kéo lố nhẹ (Overshoot: 2-4px) rồi nhích lùi tinh chỉnh (Correction) như phản xạ mắt người khi canh mảnh ghép.
+ * - Tần số sự kiện ngẫu nhiên theo nhịp quét chuột phần cứng (12ms - 28ms).
  */
 function generateHumanTrajectory(startX, startY, distance) {
   const points = [];
-  const totalSteps = 24 + Math.floor(Math.random() * 8); // 24-32 bước
-  const overshoot = 2 + Math.floor(Math.random() * 4);   // Lố 2-5px
+  const totalSteps = 26 + Math.floor(Math.random() * 8); // 26-34 bước
+  const overshoot = 2 + Math.floor(Math.random() * 3);   // Lố nhẹ 2-4px
   const targetXWithOvershoot = startX + distance + overshoot;
 
-  // Giai đoạn 1: Kéo từ startX đến điểm lố (Cubic Ease-Out)
+  let currentY = startY;
+  let vy = 0;
+
+  // Giai đoạn 1: Kéo từ startX đến điểm lố nhẹ (S-Curve Ease-In-Out)
   for (let i = 0; i <= totalSteps; i++) {
     const t = i / totalSteps;
-    const ease = 1 - Math.pow(1 - t, 3);
+    // Cubic ease-in-out: khởi đầu êm dịu, tăng tốc mượt, hãm phanh ở cuối
+    const ease = t < 0.5
+      ? 4 * t * t * t
+      : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
     const currentX = Math.round(startX + (targetXWithOvershoot - startX) * ease);
 
-    // Nhiễu trục Y: dao động nhịp thở/tay rung vi mô
-    const jitterY = Math.round(startY + Math.sin(i * 0.85) * 1.5 + (Math.random() - 0.5));
-    const delay = 14 + Math.floor(Math.random() * 18);
+    // Nhiễu cơ sinh học trục Y: bước đi quán tính lò xo hồi quy về trục thanh trượt
+    vy = vy * 0.55 + (Math.random() - 0.5) * 0.7;
+    vy += (startY - currentY) * 0.35;
+    currentY += vy;
+    const jitterY = Math.round(Math.max(startY - 2, Math.min(startY + 2, currentY)));
 
+    const delay = 12 + Math.floor(Math.random() * 16);
     points.push({ x: currentX, y: jitterY, delay });
   }
 
@@ -2452,7 +2462,8 @@ function generateHumanTrajectory(startX, startY, distance) {
   for (let j = 1; j <= correctionSteps; j++) {
     const t = j / correctionSteps;
     const currentX = Math.round(targetXWithOvershoot + (finalX - targetXWithOvershoot) * t);
-    points.push({ x: currentX, y: startY, delay: 26 + Math.floor(Math.random() * 14) });
+    const delay = 24 + Math.floor(Math.random() * 14);
+    points.push({ x: currentX, y: startY, delay });
   }
 
   return points;
@@ -2711,7 +2722,8 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
         await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y, button: "left", buttons: 1 });
         await new Promise((r) => setTimeout(r, point.delay));
       }
-      await new Promise((r) => setTimeout(r, 140 + Math.random() * 40));
+      // Dừng nghỉ ổn định (Settle delay) để DOM và anti-bot script ghi nhận mảnh ghép đã khớp hoàn toàn
+      await new Promise((r) => setTimeout(r, 150 + Math.random() * 50));
       await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: startY, button: "left", clickCount: 1 });
       return { attempted: true, method: "debugger", startX, startY, endX, distance };
     } catch (err) {
