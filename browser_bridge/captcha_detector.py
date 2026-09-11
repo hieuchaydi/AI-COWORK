@@ -122,8 +122,9 @@ def save_evidence_screenshot(
     screenshot_data: str,
     output_dir: Optional[Path] = None,
     server_port: int = 8766,
+    tag: str = "captcha",
 ) -> Optional[Dict[str, Any]]:
-    """Decodes a base64 / data-URL screenshot and stores it in outputs/evidence/<job_id>_captcha_<ts>.png."""
+    """Decodes a base64 / data-URL screenshot and stores it in outputs/evidence/<job_id>_<tag>_<ts>.png."""
     if not job_id or not screenshot_data:
         return None
 
@@ -139,8 +140,9 @@ def save_evidence_screenshot(
         evidence_dir = (output_dir or Path("outputs")) / "evidence"
         evidence_dir.mkdir(parents=True, exist_ok=True)
 
+        clean_tag = re.sub(r"[^a-zA-Z0-9_-]", "_", tag or "captcha")
         timestamp = int(time.time())
-        filename = f"{job_id}_captcha_{timestamp}.png"
+        filename = f"{job_id}_{clean_tag}_{timestamp}.png"
         file_path = evidence_dir / filename
         file_path.write_bytes(image_bytes)
 
@@ -158,6 +160,7 @@ def save_evidence_screenshot(
 
         return {
             "job_id": job_id,
+            "tag": clean_tag,
             "filename": filename,
             "path": str(file_path),
             "rel_path": rel_path,
@@ -170,7 +173,7 @@ def save_evidence_screenshot(
             "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
     except Exception as exc:
-        logger.error("Failed to save evidence screenshot for %s: %s", job_id, exc)
+        logger.error("Failed to save evidence screenshot for %s (%s): %s", job_id, tag, exc)
         return None
 
 

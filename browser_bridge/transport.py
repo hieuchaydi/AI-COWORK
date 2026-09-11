@@ -295,6 +295,9 @@ class WebSocketTransport(BrowserTransport):
                 "tab.getActive",
                 "tab.open",
                 "tab.focus",
+                "page.screenshot",
+                "captcha.detect",
+                "captcha.autoDrag",
             )
             if action not in allowed_during_verification:
                 return False, None, BridgeError.create(

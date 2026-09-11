@@ -2109,21 +2109,47 @@ function startApiBlockedWatcher(details) {
 
 async function captureTabEvidence(tabId) {
   try {
-    if (!chrome.tabs?.captureVisibleTab) return null;
     let targetId = tabId;
     if (!targetId) {
       const active = await getActiveTab();
       targetId = active?.id;
     }
     if (!targetId) return null;
-    const tab = await chrome.tabs.get(targetId);
-    if (!tab || !tab.windowId) return null;
-    try {
-      await chrome.tabs.update(targetId, { active: true });
-      if (tab.windowId && chrome.windows) await chrome.windows.update(tab.windowId, { focused: true });
-      await new Promise((r) => setTimeout(r, 200));
-    } catch {}
-    return await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+    const tab = await chrome.tabs.get(targetId).catch(() => null);
+    if (!tab) return null;
+
+    // 1. First attempt: chrome.tabs.captureVisibleTab
+    if (chrome.tabs?.captureVisibleTab && tab.windowId) {
+      try {
+        if (chrome.debugger) {
+          try { await chrome.debugger.detach({ tabId: targetId }); } catch {}
+        }
+        await chrome.tabs.update(targetId, { active: true });
+        if (chrome.windows) await chrome.windows.update(tab.windowId, { focused: true });
+        await new Promise((r) => setTimeout(r, 200));
+        const shot = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+        if (shot) return shot;
+      } catch (err) {
+        console.warn("[bridge] captureVisibleTab failed, trying debugger fallback:", err?.message || err);
+      }
+    }
+
+    // 2. Second attempt: Chrome Debugger Page.captureScreenshot (captures even if window is minimized/unfocused)
+    if (chrome.debugger?.attach && chrome.debugger?.sendCommand) {
+      const debugTarget = { tabId: targetId };
+      try {
+        await chrome.debugger.attach(debugTarget, "1.3");
+        const res = await chrome.debugger.sendCommand(debugTarget, "Page.captureScreenshot", { format: "png" });
+        try { await chrome.debugger.detach(debugTarget); } catch {}
+        if (res?.data) {
+          return res.data.startsWith("data:") ? res.data : "data:image/png;base64," + res.data;
+        }
+      } catch (dbgErr) {
+        try { await chrome.debugger.detach(debugTarget); } catch {}
+        console.warn("[bridge] Debugger captureScreenshot fallback failed:", dbgErr?.message || dbgErr);
+      }
+    }
+    return null;
   } catch (err) {
     console.warn("[bridge] captureTabEvidence failed:", err?.message || err);
     return null;
@@ -2646,7 +2672,10 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
       }
       await new Promise((r) => setTimeout(r, 90 + Math.random() * 40));
       await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: startY, button: "left", clickCount: 1 });
-      return { attempted: true, method: "debugger", startX, startY, endX, distance };
+      try { await chrome.debugger.detach(target); attached = false; } catch {}
+      await new Promise((r) => setTimeout(r, 600));
+      const postDragScreenshot = await captureTabEvidence(tabId);
+      return { attempted: true, method: "debugger", startX, startY, endX, distance, evidence_screenshot: postDragScreenshot };
     } catch (err) {
       console.warn("[bridge] Debugger slider drag failed:", err?.message || err);
     } finally {
@@ -2675,13 +2704,13 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
           fire("mousemove", pt.x, pt.y);
         }
         fire("mouseup", fx, sy);
-        return { attempted: true, method: "dom_events" };
         return { attempted: true, method: "dom_events_untrusted" };
       },
       args: [points, startX, startY, endX],
     });
-    return res?.result || { attempted: true, method: "dom_events", distance };
-    return res?.result || { attempted: true, method: "dom_events_untrusted", distance };
+    await new Promise((r) => setTimeout(r, 600));
+    const postDragScreenshot = await captureTabEvidence(tabId);
+    return { ...(res?.result || { attempted: true, method: "dom_events" }), startX, startY, endX, distance, evidence_screenshot: postDragScreenshot };
   }
 
   return { attempted: false, reason: "no_input_backend" };
@@ -2700,6 +2729,36 @@ async function detectCaptchaInTab(tabId, options = {}) {
         const url = location.href.toLowerCase();
         const isVerifyPage = url.includes("/verify/") || url.includes("anti_bot_tracking_id") || url.includes("captcha");
         const bodyText = document.body ? document.body.innerText.toLowerCase() : "";
+
+        // 0. Kiểm tra màn hình THỬ THÁCH HẾT HẠN (Challenge Expired / Timeout)
+        // Hình ảnh Shopee: "Lỗi hết thời gian. Xác minh đã hết thời gian. Hãy thử lại sau. [Quay Lại]"
+        const isTimeout = bodyText.includes("lỗi hết thời gian") ||
+          bodyText.includes("xác minh đã hết thời gian") ||
+          (bodyText.includes("hết thời gian") && bodyText.includes("xác minh")) ||
+          bodyText.includes("verification timed out");
+
+        if (isTimeout) {
+          let backBtn = null;
+          try {
+            const allClickables = Array.from(document.querySelectorAll("button, a, div[role='button'], div[class*='btn']"));
+            backBtn = allClickables.find((el) => {
+              const t = (el.innerText || el.textContent || "").trim().toLowerCase();
+              return t === "quay lại" || t === "thử lại" || t === "back" || t === "retry";
+            }) || null;
+            if (backBtn && typeof backBtn.click === "function") {
+              backBtn.click();
+            }
+          } catch {}
+          return {
+            detected: true,
+            resolved: false,
+            expired: true,
+            type: "challenge_expired",
+            pageUrl: location.href,
+            buttonFound: Boolean(backBtn),
+            message: "Shopee báo lỗi hết thời gian xác minh. Đang tự động bấm 'Quay Lại' để sinh thử thách mới.",
+          };
+        }
 
         // 1. Kiểm tra trạng thái ĐÃ GIẢI XONG (Resolved)
         // P1-2: Không dùng [class*='success'] hay [class*='passed'] trơn để tránh false positive từ các phần tử khác ngoài trang
@@ -2831,6 +2890,7 @@ async function detectCaptchaInTab(tabId, options = {}) {
                 const s = (el.outerHTML || "").toLowerCase();
                 return s.includes("arrow") || s.includes("path");
                 return s.includes("arrow") || s.includes("chevron") || s.includes("right");
+                return s.includes("arrow") || s.includes("chevron") || s.includes("right") || s.includes("path");
               }
               return false;
             });
@@ -3061,6 +3121,41 @@ function startVerificationWatcher(details) {
         return;
       }
       const check = await detectCaptchaInTab(targetTabId, { scrollIntoView: false });
+      if (check?.expired) {
+        console.warn(`[bridge] ⚠️ CAPTCHA session expired for job ${jid}. Refreshing challenge...`);
+        let timeoutEvidence = null;
+        try {
+          timeoutEvidence = await captureTabEvidence(targetTabId);
+        } catch {}
+        if (timeoutEvidence && bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+          bridgeSend({
+            v: 1,
+            type: "captcha.drag_evidence",
+            id: "timeout-ev-" + Date.now(),
+            params: {
+              job_id: jid,
+              jobId: jid,
+              tag: "timeout",
+              label: "Lỗi hết thời gian (đang tải lại)",
+              evidence_screenshot: timeoutEvidence,
+            },
+          });
+        }
+        if (verificationInfo && verificationInfo.job_id === jid) {
+          updateState("verification", {
+            ...verificationInfo,
+            evidence_screenshot: timeoutEvidence || verificationInfo.evidence_screenshot,
+            evidence_label: "Lỗi hết thời gian (đang tải lại)",
+          });
+        }
+        try {
+          if (!check.buttonFound && chrome.tabs) {
+            await chrome.tabs.update(targetTabId, { url: referer || details?.url, active: true });
+          }
+        } catch {}
+        checkInProgress = false;
+        return;
+      }
       if (check?.resolved || !check?.detected) {
         consecutiveAbsentCount++;
         console.log(`[bridge] CAPTCHA absent/resolved count: ${consecutiveAbsentCount}/2 (type: ${check?.type || "none"}) for job ${jid}`);
@@ -3085,6 +3180,22 @@ function startVerificationWatcher(details) {
           if (hasValidRatings) {
             console.log("[bridge] ✔ Preflight succeeded (HTTP 200 & valid ratings)! Resuming job:", jid);
             stopVerificationWatcher();
+            let resolvedEvidence = null;
+            try {
+              resolvedEvidence = await captureTabEvidence(targetTabId);
+            } catch {}
+            if (resolvedEvidence && bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+              bridgeSend({
+                v: 1,
+                type: "captcha.resolved_evidence",
+                id: "res-ev-" + Date.now(),
+                params: {
+                  job_id: jid,
+                  jobId: jid,
+                  evidence_screenshot: resolvedEvidence,
+                },
+              });
+            }
             try {
               const currentTab = await chrome.tabs.get(targetTabId);
               if (currentTab?.url && (currentTab.url.includes("/verify/") || currentTab.url.includes("captcha"))) {
@@ -3098,6 +3209,7 @@ function startVerificationWatcher(details) {
               verification_cycle: currentCycle,
               checkpoint: details?.checkpoint,
               message: "Thử thách CAPTCHA đã được giải và preflight API thành công (HTTP 200)",
+              evidence_screenshot: resolvedEvidence,
             });
           } else {
             console.warn("[bridge] ✘ Preflight failed after challenge disappeared:", evalRes.error || preflightRes?.status || "unusable ratings payload");
@@ -3160,8 +3272,8 @@ function startVerificationWatcher(details) {
       } else {
         consecutiveAbsentCount = 0;
         // Chế độ quan sát thụ động (Passive Handover): không tự ý drag bừa 240px làm hỏng CAPTCHA ghép hình.
-        // Thử tự động kéo thông minh tối đa 2 lần nếu CAPTCHA đang hiển thị
-        if (autoDragAttempts < 2) {
+        // Thử tự động kéo thông minh tối đa 2 lần nếu CAPTCHA đang hiển thị và có slider coordinates
+        if (autoDragAttempts < 2 && check?.slider) {
           autoDragAttempts++;
           try {
             console.log(`[bridge] CAPTCHA visible; attempting intelligent slider drag ${autoDragAttempts}/2 for job ${jid}...`);
@@ -3169,6 +3281,34 @@ function startVerificationWatcher(details) {
             const dragRes = await tryAutoDragShopeeCaptcha(targetTabId, check, { attempt: autoDragAttempts });
             console.log("[bridge] Intelligent slider drag result:", dragRes);
             if (dragRes?.attempted) {
+              if (dragRes.evidence_screenshot) {
+                const label = `Lần kéo #${autoDragAttempts}`;
+                if (verificationInfo && verificationInfo.job_id === jid) {
+                  updateState("verification", {
+                    ...verificationInfo,
+                    evidence_screenshot: dragRes.evidence_screenshot,
+                    evidence_label: label,
+                    last_attempt: autoDragAttempts,
+                  });
+                }
+                if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+                  bridgeSend({
+                    v: 1,
+                    type: "captcha.drag_evidence",
+                    id: "drag-ev-" + Date.now(),
+                    params: {
+                      job_id: jid,
+                      jobId: jid,
+                      attempt: autoDragAttempts,
+                      startX: dragRes.startX,
+                      startY: dragRes.startY,
+                      endX: dragRes.endX,
+                      distance: dragRes.distance,
+                      evidence_screenshot: dragRes.evidence_screenshot,
+                    },
+                  });
+                }
+              }
               await new Promise((r) => setTimeout(r, 1200));
               checkInProgress = false;
               return performCheckAndPreflight();
@@ -3209,13 +3349,26 @@ async function triggerVerificationRequired(details) {
   details.target_url = verificationUrl;
   updateState(stateForVerification(details), details);
 
-  // Human Handover: Focus & navigate target tab so user sees the verification UI immediately
   const targetTabId = details?.tab_id;
+  const isVerifyUrl = Boolean(
+    verificationUrl && (
+      verificationUrl.includes("/verify/") ||
+      verificationUrl.includes("anti_bot_tracking_id") ||
+      verificationUrl.includes("captcha")
+    )
+  );
+
+  // Human Handover: Focus & navigate target tab so user sees the verification UI immediately
   if (targetTabId && chrome.tabs) {
     try {
       let tab = null;
-      if (verificationUrl && verificationUrl.includes("/verify/traffic")) {
-        tab = await chrome.tabs.update(targetTabId, { url: verificationUrl, active: true });
+      if (isVerifyUrl) {
+        const currentTab = await chrome.tabs.get(targetTabId).catch(() => null);
+        if (!currentTab?.url || !currentTab.url.includes("/verify/")) {
+          tab = await chrome.tabs.update(targetTabId, { url: verificationUrl, active: true });
+        } else {
+          tab = await chrome.tabs.update(targetTabId, { active: true });
+        }
       } else {
         tab = await chrome.tabs.update(targetTabId, { active: true });
       }
@@ -3232,13 +3385,16 @@ async function triggerVerificationRequired(details) {
     details.evidence_screenshot = await captureTabEvidence(targetTabId);
   }
 
+  updateState(stateForVerification(details), details);
+
   const jid = details?.job_id;
   if (jid && notifiedVerificationJobIds.has(jid)) {
     return; // Đảm bảo gửi một thông báo duy nhất cho người dùng
   }
+  const shouldNotify = !jid || !notifiedVerificationJobIds.has(jid) || Boolean(details.evidence_screenshot);
   if (jid) notifiedVerificationJobIds.add(jid);
 
-  if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+  if (shouldNotify && bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
     bridgeSend({
       v: 1,
       type: "verification.required",
@@ -3291,19 +3447,23 @@ async function resumeVerification(jobId, options = {}) {
   const checkpoint = options.checkpoint || (targetJobId && verificationInfo?.checkpoint) || null;
 
   if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+    const params = {
+      status: "resumed",
+      message: options.message || "User confirmed verification in tab",
+      jobId: targetJobId,
+      job_id: targetJobId,
+      verification_cycle: cycle,
+      recheck: Boolean(options.recheck),
+      checkpoint,
+    };
+    if (options.evidence_screenshot) {
+      params.evidence_screenshot = options.evidence_screenshot;
+    }
     bridgeSend({
       v: 1,
       type: "verification.resolved",
       id: "resumed-" + Date.now(),
-      params: {
-        status: "resumed",
-        message: options.message || "User confirmed verification in tab",
-        jobId: targetJobId,
-        job_id: targetJobId,
-        verification_cycle: cycle,
-        recheck: Boolean(options.recheck),
-        checkpoint,
-      },
+      params,
     });
   }
 
@@ -3427,6 +3587,26 @@ async function handleAction(action, params) {
         isQueueRunning,
         extensionState,
       };
+
+    case "jobs.clear": {
+      jobQueue.length = 0;
+      activeJobs.clear();
+      pendingVerificationJobs.clear();
+      notifiedVerificationJobIds.clear();
+      resumeInFlightMap.clear();
+      verificationCycles.clear();
+      stopVerificationWatcher();
+      stopApiBlockedWatcher();
+      updateState("idle");
+      if (chrome.storage?.local) {
+        try {
+          const allKeys = await chrome.storage.local.get(null);
+          const keysToRemove = Object.keys(allKeys).filter((k) => k.startsWith("pending_job_") || k.startsWith("checkpoint_") || k === "verificationInfo" || k === "lastIngestResult");
+          if (keysToRemove.length) await chrome.storage.local.remove(keysToRemove);
+        } catch {}
+      }
+      return { ok: true, cleared: true };
+    }
 
     case "captcha.detect": {
       const targetTabId = params.tabId || (await getActiveTabId());
@@ -3992,6 +4172,11 @@ async function dispatchEnvelope(envelope) {
       if (envelope.ok) pending.resolve(envelope.result);
       else pending.reject(new Error(envelope.error || "Ingest failed"));
     }
+    return;
+  }
+
+  if (envelope.type === "jobs.clear") {
+    await handleAction("jobs.clear", {});
     return;
   }
 

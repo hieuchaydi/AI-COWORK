@@ -54,6 +54,11 @@
         <div id="jobProgressBar" class="progress-bar"></div>
       </div>
       <div id="jobProgressMeta" class="job-progress-meta"></div>
+      <div id="jobEvidencePreview" style="display: none; margin: 6px 0; text-align: center;">
+        <div id="jobEvidenceTitle" style="font-size: 11px; font-weight: 600; color: #555; margin-bottom: 2px;"></div>
+        <img id="jobEvidenceImg" src="" alt="Ảnh kiểm chứng tiến trình" style="max-width: 100%; max-height: 120px; border-radius: 4px; border: 1px solid #ddd; object-fit: contain;">
+        <div><a id="jobEvidenceLink" href="#" target="_blank" style="font-size: 11px; color: #1976d2;">Xem ảnh kiểm chứng</a></div>
+      </div>
       <button id="btnExportSnapshot" class="btn-secondary job-export">Xuất ZIP hiện tại</button>
       <div id="jobExportMessage" class="job-progress-meta" aria-live="polite"></div>
     </div>
@@ -64,6 +69,7 @@
       <div id="verificationTargetUrl" class="alert-desc" style="font-size: 11px; margin: 4px 0; color: #555; word-break: break-all;"></div>
       <div id="verificationEvidence" style="display: none; margin: 8px 0; text-align: center;">
         <div style="font-size: 11px; font-weight: 600; color: #444; margin-bottom: 4px;">📸 Bằng chứng CAPTCHA đã chụp:</div>
+        <div id="evidenceTitle" style="font-size: 11px; font-weight: 600; color: #444; margin-bottom: 4px;">📸 Bằng chứng CAPTCHA đã chụp:</div>
         <img id="evidenceImage" src="" alt="Bằng chứng CAPTCHA" style="max-width: 100%; max-height: 160px; border-radius: 4px; border: 1px solid #ddd; object-fit: contain;">
         <div style="margin-top: 4px;"><a id="evidenceLink" href="#" target="_blank" style="font-size: 11px; color: #1976d2;">Xem ảnh kích thước gốc</a></div>
       </div>

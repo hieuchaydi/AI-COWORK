@@ -788,6 +788,22 @@ def _update_ingest_progress(job_id: str, patch: dict) -> dict | None:
             _record_shopee_trace(patch["trace"])
         elif patch.get("stage") == "trace" and isinstance(patch.get("debug"), dict):
             _record_shopee_trace(patch["debug"])
+            _record_shopee_trace(patch.get("debug"))
+        ev_data = patch.get("evidence_screenshot") or patch.get("screenshot")
+        if ev_data and not patch.get("evidence_file"):
+            try:
+                from browser_bridge.captcha_detector import save_evidence_screenshot
+                ev_tag = patch.get("evidence_tag") or ("resolved" if patch.get("stage") == "resolved" else "challenge")
+                label = patch.get("evidence_label") or ("Đã giải xong ✔" if ev_tag == "resolved" else "Challenge ban đầu")
+                ev = save_evidence_screenshot(job_id, ev_data, _outputs_root(), HELPER_PORT, tag=ev_tag)
+                if ev:
+                    patch["evidence_file"] = ev["rel_path"]
+                    patch["evidence_url"] = ev["url"]
+                    patch["evidence"] = ev
+                    patch["evidence_label"] = label
+                    _append_evidence_to_progress(job_id, ev, label=label)
+            except Exception as exc:
+                print(f"[launch] Failed to save evidence in progress: {exc}", file=sys.stderr)
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     with _INGEST_PROGRESS_LOCK:
         current = dict(_INGEST_PROGRESS.get(job_id) or {})
@@ -800,6 +816,35 @@ def _update_ingest_progress(job_id: str, patch: dict) -> dict | None:
             with _INGEST_JOBS_LOCK:
                 _INGEST_INFLIGHT.pop(job_id, None)
         return dict(current)
+
+
+def _append_evidence_to_progress(job_id: str, evidence: dict, label: str = "") -> list:
+    if not job_id or not isinstance(evidence, dict):
+        return []
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    with _INGEST_PROGRESS_LOCK:
+        current = dict(_INGEST_PROGRESS.get(job_id) or {})
+        history = list(current.get("evidence_history") or [])
+        item = {
+            "tag": evidence.get("tag") or "captcha",
+            "label": label or evidence.get("tag") or "Evidence",
+            "url": evidence.get("url") or evidence.get("evidence_url"),
+            "file": evidence.get("rel_path") or evidence.get("evidence_file"),
+            "captured_at": evidence.get("captured_at") or now,
+            "width": evidence.get("width"),
+            "height": evidence.get("height"),
+        }
+        if not any(h.get("file") == item["file"] for h in history):
+            history.append(item)
+        current["evidence_history"] = history
+        current["evidence_file"] = item["file"]
+        current["evidence_url"] = item["url"]
+        current["evidence_label"] = item["label"]
+        current["evidence"] = evidence
+        current["updated_at"] = now
+        _INGEST_PROGRESS[job_id] = current
+        _persist_ingest_state()
+        return history
 
 
 def _claim_ingest_jobs(wait_seconds: float) -> list[dict]:
@@ -898,7 +943,7 @@ def _on_browser_ws_message(message: dict) -> None:
         if evidence_data and job_id:
             try:
                 from browser_bridge.captcha_detector import save_evidence_screenshot
-                evidence = save_evidence_screenshot(job_id, evidence_data, _outputs_root(), HELPER_PORT)
+                evidence = save_evidence_screenshot(job_id, evidence_data, _outputs_root(), HELPER_PORT, tag="challenge")
             except Exception as exc:
                 print(f"[launch] Failed to save evidence screenshot: {exc}", file=sys.stderr)
         if job_id:
@@ -924,6 +969,9 @@ def _on_browser_ws_message(message: dict) -> None:
                 progress_patch["evidence_file"] = evidence["rel_path"]
                 progress_patch["evidence_url"] = evidence["url"]
                 progress_patch["evidence"] = evidence
+                progress_patch["evidence_label"] = "Challenge ban đầu"
+                _append_evidence_to_progress(job_id, evidence, label="Challenge ban đầu")
+                progress_patch["evidence_history"] = _INGEST_PROGRESS.get(job_id, {}).get("evidence_history", [])
                 print(f"[launch] ⚠️ Verification required for job {job_id}. Evidence saved: {evidence['rel_path']}", file=sys.stderr)
             _update_ingest_progress(job_id, progress_patch)
             verif_res = {
@@ -942,8 +990,71 @@ def _on_browser_ws_message(message: dict) -> None:
                 verif_res["evidence_file"] = evidence["rel_path"]
                 verif_res["evidence_url"] = evidence["url"]
                 verif_res["evidence"] = evidence
+                verif_res["evidence_label"] = "Challenge ban đầu"
+                verif_res["evidence_history"] = _INGEST_PROGRESS.get(job_id, {}).get("evidence_history", [])
             _INGEST_RESULTS[job_id] = verif_res
             _persist_ingest_state()
+    elif kind == "captcha.drag_evidence":
+        params = message.get("params") or {}
+        job_id = str(params.get("job_id") or params.get("jobId") or "")
+        attempt = params.get("attempt") or 1
+        evidence_data = params.get("evidence_screenshot") or params.get("screenshot")
+        if evidence_data and job_id:
+            tag = f"attempt_{attempt}"
+            label = f"Lần kéo #{attempt}"
+            try:
+                from browser_bridge.captcha_detector import save_evidence_screenshot
+                evidence = save_evidence_screenshot(job_id, evidence_data, _outputs_root(), HELPER_PORT, tag=tag)
+                if evidence:
+                    history = _append_evidence_to_progress(job_id, evidence, label=label)
+                    _update_ingest_progress(job_id, {
+                        "evidence_file": evidence["rel_path"],
+                        "evidence_url": evidence["url"],
+                        "evidence": evidence,
+                        "evidence_label": label,
+                        "evidence_history": history,
+                        "message": f"Đã chụp ảnh sau {label} (khoảng cách: {params.get('distance')}px)",
+                    })
+                    if job_id in _INGEST_RESULTS:
+                        _INGEST_RESULTS[job_id]["evidence_file"] = evidence["rel_path"]
+                        _INGEST_RESULTS[job_id]["evidence_url"] = evidence["url"]
+                        _INGEST_RESULTS[job_id]["evidence"] = evidence
+                        _INGEST_RESULTS[job_id]["evidence_label"] = label
+                        _INGEST_RESULTS[job_id]["evidence_history"] = history
+                    _persist_ingest_state()
+                    print(f"[launch] 📸 Drag attempt #{attempt} evidence saved for job {job_id}: {evidence['rel_path']}", file=sys.stderr)
+            except Exception as exc:
+                print(f"[launch] Failed to save drag evidence screenshot: {exc}", file=sys.stderr)
+    elif kind == "captcha.resolved_evidence":
+        params = message.get("params") or {}
+        job_id = str(params.get("job_id") or params.get("jobId") or "")
+        evidence_data = params.get("evidence_screenshot") or params.get("screenshot")
+        if evidence_data and job_id:
+            tag = "resolved"
+            label = "Đã giải xong ✔"
+            try:
+                from browser_bridge.captcha_detector import save_evidence_screenshot
+                evidence = save_evidence_screenshot(job_id, evidence_data, _outputs_root(), HELPER_PORT, tag=tag)
+                if evidence:
+                    history = _append_evidence_to_progress(job_id, evidence, label=label)
+                    _update_ingest_progress(job_id, {
+                        "evidence_file": evidence["rel_path"],
+                        "evidence_url": evidence["url"],
+                        "evidence": evidence,
+                        "evidence_label": label,
+                        "evidence_history": history,
+                        "message": "Đã chụp ảnh kiểm chứng CAPTCHA hoàn tất thành công ✔",
+                    })
+                    if job_id in _INGEST_RESULTS:
+                        _INGEST_RESULTS[job_id]["evidence_file"] = evidence["rel_path"]
+                        _INGEST_RESULTS[job_id]["evidence_url"] = evidence["url"]
+                        _INGEST_RESULTS[job_id]["evidence"] = evidence
+                        _INGEST_RESULTS[job_id]["evidence_label"] = label
+                        _INGEST_RESULTS[job_id]["evidence_history"] = history
+                    _persist_ingest_state()
+                    print(f"[launch] 📸 Resolved evidence saved for job {job_id}: {evidence['rel_path']}", file=sys.stderr)
+            except Exception as exc:
+                print(f"[launch] Failed to save resolved evidence screenshot: {exc}", file=sys.stderr)
     elif kind == "verification.resolved":
         params = message.get("params") or {}
         job_id = str(params.get("jobId") or params.get("job_id") or "")
@@ -958,6 +1069,16 @@ def _on_browser_ws_message(message: dict) -> None:
                 cycles.add(cycle)
 
         _BROWSER_WS.transport.resume_verification()
+
+        evidence_data = params.get("evidence_screenshot") or params.get("screenshot")
+        if evidence_data and job_id:
+            try:
+                from browser_bridge.captcha_detector import save_evidence_screenshot
+                evidence = save_evidence_screenshot(job_id, evidence_data, _outputs_root(), HELPER_PORT, tag="resolved")
+                if evidence:
+                    _append_evidence_to_progress(job_id, evidence, label="Đã giải xong ✔")
+            except Exception as exc:
+                print(f"[launch] Failed to save verification.resolved evidence: {exc}", file=sys.stderr)
 
         if job_id:
             with _INGEST_JOBS_LOCK:
@@ -987,6 +1108,7 @@ def _on_browser_ws_message(message: dict) -> None:
                     "percent": 5,
                     "error": None,
                     "checkpoint": chk_snapshot,
+                    "evidence_history": _INGEST_PROGRESS.get(job_id, {}).get("evidence_history", []),
                 },
             )
             job = _INGEST_ALL_JOBS.get(job_id)
@@ -1020,6 +1142,9 @@ def _on_browser_ws_message(message: dict) -> None:
             try:
                 from browser_bridge.captcha_detector import save_evidence_screenshot
                 evidence = save_evidence_screenshot(job_id, evidence_data, _outputs_root(), HELPER_PORT)
+                evidence = save_evidence_screenshot(job_id, evidence_data, _outputs_root(), HELPER_PORT, tag="api_blocked")
+                if evidence:
+                    _append_evidence_to_progress(job_id, evidence, label="API Blocked (HTTP 403)")
                 print(f"[launch] 📸 Evidence screenshot saved for api_blocked job {job_id}: {evidence['rel_path']}", file=sys.stderr)
             except Exception as exc:
                 print(f"[launch] Failed to save evidence screenshot for api_blocked job {job_id}: {exc}", file=sys.stderr)
@@ -1040,6 +1165,8 @@ def _on_browser_ws_message(message: dict) -> None:
                 result["evidence_file"] = evidence["rel_path"]
                 result["evidence_url"] = evidence["url"]
                 result["evidence"] = evidence
+                result["evidence_label"] = "API Blocked (HTTP 403)"
+                result["evidence_history"] = _INGEST_PROGRESS.get(job_id, {}).get("evidence_history", [])
             _INGEST_RESULTS[job_id] = result
             with _INGEST_JOBS_LOCK:
                 _INGEST_INFLIGHT.pop(job_id, None)
@@ -1059,6 +1186,8 @@ def _on_browser_ws_message(message: dict) -> None:
                 progress_patch["evidence_file"] = evidence["rel_path"]
                 progress_patch["evidence_url"] = evidence["url"]
                 progress_patch["evidence"] = evidence
+                progress_patch["evidence_label"] = "API Blocked (HTTP 403)"
+                progress_patch["evidence_history"] = _INGEST_PROGRESS.get(job_id, {}).get("evidence_history", [])
             _update_ingest_progress(job_id, progress_patch)
             _persist_ingest_state()
 
@@ -1111,11 +1240,26 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
                 or ("is_login" in lowered and "false" in lowered)
             )
 
-        # 2. API Blocked (HTTP 403 / Access Denied without CAPTCHA or Login)
+        # 2. Verification / CAPTCHA (Challenge requiring user interaction)
         explicit_api_blocked = bool(
             body.get("api_blocked")
             or body.get("stage") == "api_blocked"
         )
+        is_verification = not is_login and not explicit_api_blocked and (
+            body.get("verification_required") is True
+            or (
+                body.get("verification_required") is not False
+                and (
+                    "verification required" in lowered
+                    or "/verify/" in lowered
+                    or "anti_bot_tracking_id" in lowered
+                    or "challenge" in lowered
+                    or ("captcha" in lowered and "không thấy captcha" not in lowered and "không có captcha" not in lowered)
+                )
+            )
+        )
+
+        # 3. API Blocked (HTTP 403 / Access Denied without CAPTCHA or Login)
         text_api_blocked = bool(
             "không thấy captcha" in lowered
             or "không có captcha" in lowered
@@ -1123,23 +1267,9 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
             or "access denied" in lowered
             or "api_blocked" in lowered
             or "api blocked" in lowered
-            or ("403" in lowered and "/verify/traffic" not in lowered and "challenge" not in lowered)
+            or ("403" in lowered and "/verify/" not in lowered and "verification" not in lowered and "challenge" not in lowered and "captcha" not in lowered)
         )
-        is_api_blocked = not is_login and (explicit_api_blocked or text_api_blocked)
-
-        # 3. Verification / CAPTCHA (Challenge requiring user interaction)
-        is_verification = not is_login and not is_api_blocked and (
-            body.get("verification_required") is True
-            or (
-                body.get("verification_required") is not False
-                and (
-                    "verification required" in lowered
-                    or "/verify/traffic" in lowered
-                    or "challenge" in lowered
-                    or ("captcha" in lowered and "không thấy captcha" not in lowered and "không có captcha" not in lowered)
-                )
-            )
-        )
+        is_api_blocked = not is_login and not is_verification and (explicit_api_blocked or text_api_blocked)
 
         if is_login:
             status = "login_required"
@@ -1159,7 +1289,9 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
         if is_verification and evidence_data and job_id:
             try:
                 from browser_bridge.captcha_detector import save_evidence_screenshot
-                evidence = save_evidence_screenshot(job_id, evidence_data, _outputs_root(), HELPER_PORT)
+                evidence = save_evidence_screenshot(job_id, evidence_data, _outputs_root(), HELPER_PORT, tag="challenge")
+                if evidence:
+                    _append_evidence_to_progress(job_id, evidence, label="Challenge ban đầu")
             except Exception as exc:
                 print(f"[launch] Failed to save evidence screenshot in payload: {exc}", file=sys.stderr)
 
@@ -1186,6 +1318,8 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
                 result["evidence_file"] = evidence["rel_path"]
                 result["evidence_url"] = evidence["url"]
                 result["evidence"] = evidence
+                result["evidence_label"] = "Challenge ban đầu"
+                result["evidence_history"] = _INGEST_PROGRESS.get(job_id, {}).get("evidence_history", [])
             _INGEST_RESULTS[job_id] = result
             with _INGEST_JOBS_LOCK:
                 _INGEST_INFLIGHT.pop(job_id, None)
@@ -1206,6 +1340,8 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
                 prog_patch["evidence_file"] = evidence["rel_path"]
                 prog_patch["evidence_url"] = evidence["url"]
                 prog_patch["evidence"] = evidence
+                prog_patch["evidence_label"] = "Challenge ban đầu"
+                prog_patch["evidence_history"] = _INGEST_PROGRESS.get(job_id, {}).get("evidence_history", [])
             _update_ingest_progress(job_id, prog_patch)
             _persist_ingest_state()
             return 200, result
@@ -3051,6 +3187,30 @@ class _HelperHandler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "retried": job_id, "sent": sent, "job": job})
             return
 
+        if self.path.split("?", 1)[0] == "/ingest/clear":
+            with _INGEST_JOBS_LOCK:
+                _INGEST_JOBS.clear()
+                _INGEST_INFLIGHT.clear()
+                _INGEST_ALL_JOBS.clear()
+            with _INGEST_PROGRESS_LOCK:
+                _INGEST_PROGRESS.clear()
+            _INGEST_RESULTS.clear()
+            with _INGEST_CHECKPOINTS_LOCK:
+                _INGEST_CHECKPOINTS.clear()
+            with _INGEST_TRACES_LOCK:
+                _INGEST_TRACES.clear()
+            try:
+                (_outputs_root() / ".ingest_jobs_state.json").unlink(missing_ok=True)
+            except Exception:
+                pass
+            if hasattr(_BROWSER_WS.transport, "resume_verification"):
+                _BROWSER_WS.transport.resume_verification()
+            sent = False
+            if _BROWSER_WS.connected:
+                sent = _BROWSER_WS.send({"v": 1, "type": "jobs.clear"})
+            self._json(200, {"ok": True, "cleared": True, "sent": sent, "message": "Đã xóa toàn bộ trạng thái job"})
+            return
+
         if self.path.split("?", 1)[0] == "/browser/reload":
             _release_inflight_jobs(requeue=True)
             sent = False
@@ -3811,6 +3971,30 @@ class _HelperHandler(BaseHTTPRequestHandler):
                 sent = _BROWSER_WS.send({"type": "ingest.job", "job": job, "retry": True})
             _persist_ingest_state()
             _reply(200, {"ok": True, "retried": job_id, "sent": sent, "job": job})
+            return
+
+        if path_only == "/ingest/clear":
+            with _INGEST_JOBS_LOCK:
+                _INGEST_JOBS.clear()
+                _INGEST_INFLIGHT.clear()
+                _INGEST_ALL_JOBS.clear()
+            with _INGEST_PROGRESS_LOCK:
+                _INGEST_PROGRESS.clear()
+            _INGEST_RESULTS.clear()
+            with _INGEST_CHECKPOINTS_LOCK:
+                _INGEST_CHECKPOINTS.clear()
+            with _INGEST_TRACES_LOCK:
+                _INGEST_TRACES.clear()
+            try:
+                (_outputs_root() / ".ingest_jobs_state.json").unlink(missing_ok=True)
+            except Exception:
+                pass
+            if hasattr(_BROWSER_WS.transport, "resume_verification"):
+                _BROWSER_WS.transport.resume_verification()
+            sent = False
+            if _BROWSER_WS.connected:
+                sent = _BROWSER_WS.send({"v": 1, "type": "jobs.clear"})
+            _reply(200, {"ok": True, "cleared": True, "sent": sent, "message": "Đã xóa toàn bộ trạng thái job"})
             return
 
         if path_only == "/google/refresh":

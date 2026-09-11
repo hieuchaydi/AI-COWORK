@@ -2431,3 +2431,142 @@ test('detectCaptchaInTab does not false-positive resolve on unrelated .success e
   assert.equal(detection.detected, true, 'challenge must still be detected');
   assert.equal(detection.resolved, false, 'must not be marked resolved by unrelated success elements');
 });
+
+test('tryAutoDragShopeeCaptcha captures post-drag screenshot and returns evidence_screenshot', async () => {
+  const { context } = await worker();
+  context.setTimeout = (fn) => { queueMicrotask(fn); return 1; };
+  context.chrome.debugger = {
+    attach: async () => {},
+    sendCommand: async () => {},
+    detach: async () => {},
+  };
+  context.chrome.tabs = {
+    get: async (id) => ({ id, windowId: 1 }),
+    update: async () => {},
+    captureVisibleTab: async () => 'data:image/png;base64,post_drag_attempt_screenshot_123',
+  };
+  context.chrome.windows = { update: async () => {} };
+  vm.runInContext(`
+    calculatePuzzleDistance = async () => 140;
+  `, context);
+
+  const detection = {
+    detected: true,
+    slider: { x: 100, y: 300, width: 320, isOrangeHandle: true },
+    attempt: 1,
+  };
+  const res = await vm.runInContext(`tryAutoDragShopeeCaptcha(903, ${JSON.stringify(detection)})`, context);
+  assert.equal(res.attempted, true);
+  assert.equal(res.evidence_screenshot, 'data:image/png;base64,post_drag_attempt_screenshot_123');
+  assert.equal(res.distance, 140);
+});
+
+test('startVerificationWatcher dispatches captcha.drag_evidence after auto-drag attempt', async () => {
+  const { context, frames } = await worker();
+  context.setTimeout = (fn) => { queueMicrotask(fn); return 1; };
+  context.chrome.debugger = {
+    attach: async () => {},
+    sendCommand: async () => {},
+    detach: async () => {},
+  };
+  context.chrome.tabs = {
+    get: async (id) => ({ id, windowId: 1, url: 'https://shopee.vn/verify/traffic' }),
+    update: async () => {},
+    captureVisibleTab: async () => 'data:image/png;base64,mocked_drag_evidence',
+    onUpdated: { addListener: () => {}, removeListener: () => {} },
+  };
+  context.chrome.windows = { update: async () => {} };
+  context.bridgeFrames = frames;
+  vm.runInContext(`
+    bridgeSocket = { readyState: 1 };
+    bridgeSocket = {
+      readyState: 1,
+      send: (raw) => {
+        bridgeFrames.push(JSON.parse(raw));
+      },
+    };
+    detectCaptchaInTab = async () => ({
+      detected: true,
+      resolved: false,
+      slider: { x: 80, y: 250, width: 300, isOrangeHandle: true },
+    });
+    calculatePuzzleDistance = async () => 120;
+    verificationInfo = { job_id: "job-evidence-test", kind: "verification" };
+  `, context);
+
+  await vm.runInContext(`
+    startVerificationWatcher({
+      job_id: "job-evidence-test",
+      tab_id: 904,
+      url: "https://shopee.vn/verify/traffic",
+    });
+  `, context);
+
+  // Wait for auto-drag and dispatch
+  const listener = vm.runInContext('activeTabUpdateListener', context);
+  await listener(904, { status: 'complete' }, { url: 'https://shopee.vn/verify/traffic' });
+
+  const dragEv = frames.find((m) => m.type === 'captcha.drag_evidence');
+  assert.ok(dragEv, 'must send captcha.drag_evidence frame');
+  assert.equal(dragEv.params.job_id, 'job-evidence-test');
+  assert.equal(dragEv.params.attempt, 1);
+  assert.equal(dragEv.params.evidence_screenshot, 'data:image/png;base64,mocked_drag_evidence');
+
+  vm.runInContext('stopVerificationWatcher()', context);
+});
+
+test('startVerificationWatcher dispatches captcha.resolved_evidence on successful preflight', async () => {
+  const { context, frames } = await worker();
+  context.setTimeout = (fn) => { queueMicrotask(fn); return 1; };
+  context.chrome.tabs = {
+    get: async (id) => ({ id, windowId: 1, url: 'https://shopee.vn/product/1/2' }),
+    update: async () => {},
+    captureVisibleTab: async () => 'data:image/png;base64,mocked_resolved_evidence',
+    onUpdated: { addListener: () => {}, removeListener: () => {} },
+  };
+  context.chrome.windows = { update: async () => {} };
+  context.bridgeFrames = frames;
+  vm.runInContext(`
+    bridgeSocket = { readyState: 1 };
+    bridgeSocket = {
+      readyState: 1,
+      send: (raw) => {
+        bridgeFrames.push(JSON.parse(raw));
+      },
+    };
+    detectCaptchaInTab = async () => ({
+      detected: false,
+      resolved: true,
+      type: "slider_passed",
+    });
+    preflightRatingsInTab = async () => ({
+      status: 200,
+      ok: true,
+      data: { ratings: [{ rating_star: 5, comment: "Tuyệt vời" }] },
+      json: { data: { ratings: [{ cmid: 999 }] } },
+    });
+    verificationInfo = { job_id: "job-resolved-test", kind: "verification" };
+  `, context);
+
+  await vm.runInContext(`
+    startVerificationWatcher({
+      job_id: "job-resolved-test",
+      tab_id: 905,
+      url: "https://shopee.vn/product/1/2",
+    });
+  `, context);
+
+  const listener = vm.runInContext('activeTabUpdateListener', context);
+  await listener(905, { status: 'complete' }, { url: 'https://shopee.vn/product/1/2' });
+
+  const resEv = frames.find((m) => m.type === 'captcha.resolved_evidence');
+  assert.ok(resEv, 'must send captcha.resolved_evidence frame');
+  assert.equal(resEv.params.job_id, 'job-resolved-test');
+  assert.equal(resEv.params.evidence_screenshot, 'data:image/png;base64,mocked_resolved_evidence');
+
+  const resumed = frames.find((m) => m.type === 'verification.resolved');
+  assert.ok(resumed, 'must send verification.resolved');
+  assert.equal(resumed.params.evidence_screenshot, 'data:image/png;base64,mocked_resolved_evidence');
+
+  vm.runInContext('stopVerificationWatcher()', context);
+});

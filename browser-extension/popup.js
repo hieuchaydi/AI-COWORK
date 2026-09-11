@@ -261,12 +261,17 @@ function renderStatus(state, details) {
     }
 
     const verificationEvidence = document.getElementById("verificationEvidence");
+    const evidenceTitle = document.getElementById("evidenceTitle");
     const evidenceImage = document.getElementById("evidenceImage");
     const evidenceLink = document.getElementById("evidenceLink");
     const screenshot = details.verification.evidence_screenshot || details.verification.evidence_url;
     if (verificationEvidence && evidenceImage && screenshot) {
       verificationEvidence.style.display = "block";
       evidenceImage.src = screenshot;
+      if (evidenceTitle) {
+        const label = details.verification.evidence_label || "Đã chụp";
+        evidenceTitle.textContent = `📸 Bằng chứng CAPTCHA (${label}):`;
+      }
       if (evidenceLink) {
         evidenceLink.href = screenshot;
       }
@@ -330,10 +335,31 @@ function renderStatus(state, details) {
       }
     }
     jobProgressMeta.textContent = metaText;
+
+    const jobEvidencePreview = document.getElementById("jobEvidencePreview");
+    const jobEvidenceTitle = document.getElementById("jobEvidenceTitle");
+    const jobEvidenceImg = document.getElementById("jobEvidenceImg");
+    const jobEvidenceLink = document.getElementById("jobEvidenceLink");
+    const jobScreenshot = progress.evidence_screenshot || progress.evidence_url;
+    if (jobEvidencePreview && jobEvidenceImg && jobScreenshot && (!details.verification || !details.verification.evidence_screenshot)) {
+      jobEvidencePreview.style.display = "block";
+      jobEvidenceImg.src = jobScreenshot;
+      if (jobEvidenceTitle) {
+        const label = progress.evidence_label || "Kiểm chứng gần nhất";
+        jobEvidenceTitle.textContent = `📸 Ảnh kiểm chứng (${label}):`;
+      }
+      if (jobEvidenceLink) {
+        jobEvidenceLink.href = jobScreenshot;
+      }
+    } else if (jobEvidencePreview) {
+      jobEvidencePreview.style.display = "none";
+    }
   } else {
     currentJobId = null;
     jobStatusText.textContent = "No job currently running";
     jobProgress.style.display = "none";
+    const jobEvidencePreview = document.getElementById("jobEvidencePreview");
+    if (jobEvidencePreview) jobEvidencePreview.style.display = "none";
   }
 }
 

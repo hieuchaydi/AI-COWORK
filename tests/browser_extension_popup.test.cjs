@@ -195,3 +195,46 @@ test('popup displays correct verify/traffic URL and btnOpenVerificationTab navig
   assert.equal(updatedWindow.focused, true);
 });
 
+test('popup displays verification evidence with dynamic label and job evidence preview', async () => {
+  const { context, elements } = await popup(null);
+
+  // 1. Verification with evidence
+  vm.runInContext(`
+    renderStatus("awaiting_user_verification", {
+      verification: {
+        kind: "verification",
+        job_id: "job-ev-1",
+        reason: "Slide puzzle",
+        evidence_screenshot: "http://127.0.0.1:8766/outputs/evidence/job1_attempt_1.png",
+        evidence_label: "Lần kéo #1",
+      },
+      currentJob: null,
+    });
+  `, context);
+
+  assert.equal(elements.verificationEvidence.style.display, 'block');
+  assert.equal(elements.evidenceImage.src, 'http://127.0.0.1:8766/outputs/evidence/job1_attempt_1.png');
+  assert.equal(elements.evidenceTitle.textContent, '📸 Bằng chứng CAPTCHA (Lần kéo #1):');
+
+  // 2. Running job with evidence preview while verification is cleared
+  vm.runInContext(`
+    renderStatus("connected", {
+      verification: null,
+      currentJob: {
+        id: "job-ev-1",
+        stage: "crawling",
+        _progress: {
+          percent: 50,
+          evidence_url: "http://127.0.0.1:8766/outputs/evidence/job1_resolved.png",
+          evidence_label: "Đã giải xong ✔",
+        }
+      }
+    });
+  `, context);
+
+  assert.equal(elements.verificationBox.style.display, 'none');
+  assert.equal(elements.jobEvidencePreview.style.display, 'block');
+  assert.equal(elements.jobEvidenceImg.src, 'http://127.0.0.1:8766/outputs/evidence/job1_resolved.png');
+  assert.equal(elements.jobEvidenceTitle.textContent, '📸 Ảnh kiểm chứng (Đã giải xong ✔):');
+});
+
