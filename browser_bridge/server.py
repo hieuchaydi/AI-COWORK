@@ -97,8 +97,8 @@ def _read_frame_raw(source: socket.socket | _BufferedSocketReader, max_bytes: in
 
     if rsv != 0:
         raise WebSocketProtocolError("RSV bits must be 0")
-    if not fin:
-        raise WebSocketProtocolError("Fragmented frames not supported")
+    if opcode in (0x8, 0x9, 0xA) and not fin:
+        raise WebSocketProtocolError("Control frames must not be fragmented")
     if not masked:
         raise WebSocketProtocolError("Client frames must be masked")
     if opcode in (0x8, 0x9, 0xA) and size > 125:
@@ -117,8 +117,8 @@ def _read_frame_raw(source: socket.socket | _BufferedSocketReader, max_bytes: in
     for i in range(size):
         payload[i] ^= mask[i % 4]
 
-    return opcode, bytes(payload)
     return opcode, bytes(payload), fin
+
 
 
 def _read_frame(source: socket.socket | _BufferedSocketReader, max_bytes: int = MAX_MESSAGE_BYTES) -> tuple[int, bytes]:
