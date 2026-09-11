@@ -104,6 +104,12 @@ const LAST_SESSION_KEY = "coworker:last-session-by-agent:v1";
 const NAV_COLLAPSED_KEY = "coworker:nav-collapsed:v1";
 
 type LastSession = { sessionId: string; workspace: string; updatedAt: number };
+type ActiveAutomationRun = {
+  taskId: string;
+  runId: string;
+  sessionId: string;
+  returnTo: { sessionId: string; workspace: string; agent: string } | null;
+};
 
 function readLastSessions(): Record<string, LastSession> {
   try {
@@ -204,6 +210,7 @@ export function App() {
   // id going stale (e.g. the automation was deleted) reopened a dead detail —
   // "Loading…" forever (owner-hit 2026-07-20). Nav re-entry should land on the list.
   const [scheduledOpenId, setScheduledOpenId] = useState<string | null>(null);
+  const [scheduledRefreshKey, setScheduledRefreshKey] = useState(0);
   const [gateCreate, setGateCreate] = useState(false);
   // Which Settings section the full-page Settings surface opens on (§ Settings-as-page).
   const [settingsTab, setSettingsTab] = useState<"appearance" | "models" | "voice" | "personas">(
@@ -370,8 +377,8 @@ export function App() {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   // A prompt to auto-send once the next session connects (used by "Run now").
   const pendingPromptRef = useRef<string | null>(null);
-  // The in-flight manual run to finalize after its first turn ({taskId, runId, sessionId}).
-  const activeRunRef = useRef<{ taskId: string; runId: string; sessionId: string } | null>(null);
+  // The in-flight manual run to finalize and clear after its first turn.
+  const activeRunRef = useRef<ActiveAutomationRun | null>(null);
 
   // Fetch ALL sessions + known projects so the sidebar can group them.
   const refreshSessions = useCallback(() => {
@@ -550,14 +557,16 @@ export function App() {
   }, [agent, surfaces]);
 
   useEffect(() => {
-    if (surface === "session") rememberLastSession(agent, sessionId, workspace);
+    if (surface === "session" && !sessionId.startsWith("__")) {
+      rememberLastSession(agent, sessionId, workspace);
+    }
   }, [surface, agent, sessionId, workspace]);
 
   // (re)connect when workspace, session, or agent changes
   useEffect(() => {
     if (booting) return; // wait until boot/resume settles the session before connecting
     if (gatesWorkspace(agent) && !workspace) return; // Code needs a folder (gate handles it)
-    const handleEvent = (ev: WsEvent) => {
+    const handleEvent = (ev: WsEvent, eventSessionId = sessionId) => {
       const d = ev.data || {};
       // An interrupted/errored turn never emits assistant_message, so its streamed partial
       // would otherwise live only in the ephemeral buffer until the next turn_start wipes it
@@ -779,29 +788,68 @@ export function App() {
           // Catch-all artifact refresh: files created via shell or on a brand-new session (whose
           // record only exists after the first save) appear once the turn completes.
           setBrowserRefreshKey((k) => k + 1);
-          // Finalize a manual run after its first turn completes (mark it ok in history).
+          // Finalize one-shot manual runs after their first turn, then leave the internal
+          // __run__ session so the app is not left looking like a task is still active.
           {
             const ar = activeRunRef.current;
-            if (ar && ar.sessionId === sessionId) {
+            if (ar && ar.sessionId === eventSessionId) {
               activeRunRef.current = null;
-              finalizeAutomationRun(ar.taskId, ar.runId).catch(() => {});
+              finalizeAutomationRun(ar.taskId, ar.runId).finally(() => {
+                setRunContext(null);
+                setScheduledOpenId(ar.taskId);
+                setSurface("scheduled");
+                setRunning(false);
+                setStreaming("");
+                setReasoningStream("");
+                setTodo([]);
+                if (ar.returnTo) {
+                  setAgent(ar.returnTo.agent);
+                  setWorkspace(ar.returnTo.workspace || null);
+                  setBranch(null);
+                  setSessionId(ar.returnTo.sessionId);
+                  getSessionMessages(ar.returnTo.sessionId)
+                    .then((messages) => {
+                      setItems(itemsFromMessages(messages));
+                      setUsage(usageFromMessages(messages));
+                    })
+                    .catch(() => {
+                      setItems([]);
+                      setUsage(emptyUsage());
+                    });
+                } else {
+                  setItems([]);
+                  setUsage(emptyUsage());
+                  setSessionId(newId());
+                }
+                refreshSessions();
+                setScheduledRefreshKey((k) => k + 1);
+                announceAutomationsChanged();
+              });
             }
           }
           break;
       }
     };
 
-    const session = new Session(sessionId, workspace || "", agent, {
-      onEvent: handleEvent,
+    let session: Session | null = null;
+    const sendPendingRunPrompt = () => {
+      if (!session) return;
+      const p = pendingPromptRef.current;
+      if (!p || activeRunRef.current?.sessionId !== sessionId) return;
+      pendingPromptRef.current = null;
+      setItems((prev) => [...prev, { kind: "user", text: p, ts: Date.now() / 1000 }]);
+      session.userMessage(p, undefined, model);
+    };
+    session = new Session(sessionId, workspace || "", agent, {
+      onEvent: (event) => {
+        handleEvent(event, sessionId);
+        if (event.type === "ready") sendPendingRunPrompt();
+      },
       onOpen: () => {
         setConnected(true);
-        // Auto-send the task prompt once a "Run now" session connects.
-        const p = pendingPromptRef.current;
-        if (p) {
-          pendingPromptRef.current = null;
-          setItems((prev) => [...prev, { kind: "user", text: p, ts: Date.now() / 1000 }]);
-          sessionRef.current?.userMessage(p);
-        }
+        // Auto-send the task prompt once a "Run now" session connects. The ready-event
+        // path below covers mocked/fast sockets whose open callback races the ref update.
+        sendPendingRunPrompt();
       },
       onClose: () => setConnected(false),
     });
@@ -1156,10 +1204,13 @@ export function App() {
     selectSession(sessionId, ws, ag);
   };
   const runTaskNow = async (taskId: string, title?: string) => {
+    const returnTo = !sessionId.startsWith("__")
+      ? { sessionId, workspace: workspace || "", agent }
+      : null;
     const r = await runAutomation(taskId);
     if (!r || !r.ok) return;
     pendingPromptRef.current = r.prompt;
-    activeRunRef.current = { taskId, runId: r.run_id, sessionId: r.session_id };
+    activeRunRef.current = { taskId, runId: r.run_id, sessionId: r.session_id, returnTo };
     openRunSession(r.session_id, r.workspace, r.agent, { id: taskId, title: title || "" });
   };
 
@@ -1368,6 +1419,7 @@ export function App() {
           onOpenRun={openRunSession}
           onRunNow={runTaskNow}
           initialOpenId={scheduledOpenId}
+          refreshKey={scheduledRefreshKey}
         />
       ) : surface === "integrations" ? (
         <IntegrationsView />
@@ -1593,7 +1645,7 @@ export function App() {
               </div>
             )}
 
-            {agent !== "chat" && <WakeControls sessionId={sessionId} />}
+            {agent !== "chat" && !sessionId.startsWith("__") && <WakeControls sessionId={sessionId} />}
             <Composer
               mode={mode}
               model={model}

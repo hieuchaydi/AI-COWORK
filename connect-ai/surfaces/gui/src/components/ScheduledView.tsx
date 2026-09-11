@@ -61,9 +61,10 @@ interface Props {
   onRunNow: (taskId: string, title?: string) => void;
   // Open directly on a task's detail (set by the run banner's "Back to runs").
   initialOpenId?: string | null;
+  refreshKey?: number;
 }
 
-export function ScheduledView({ onOpenRun, onRunNow, initialOpenId }: Props) {
+export function ScheduledView({ onOpenRun, onRunNow, initialOpenId, refreshKey = 0 }: Props) {
   const [tasks, setTasks] = useState<Automation[]>([]);
   const [openId, setOpenId] = useState<string | null>(initialOpenId ?? null);
   const [showForm, setShowForm] = useState(false);
@@ -113,6 +114,7 @@ export function ScheduledView({ onOpenRun, onRunNow, initialOpenId }: Props) {
         onBack={() => { setOpenId(null); refresh(); }}
         onOpenRun={onOpenRun}
         onRunNow={onRunNow}
+        refreshKey={refreshKey}
       />
     );
   }
@@ -277,6 +279,7 @@ function TaskDetail({
   onBack,
   onOpenRun,
   onRunNow,
+  refreshKey,
 }: {
   id: string;
   onBack: () => void;
@@ -287,6 +290,7 @@ function TaskDetail({
     task?: { id: string; title: string },
   ) => void;
   onRunNow: (taskId: string, title?: string) => void;
+  refreshKey: number;
 }) {
   const [task, setTask] = useState<Automation | null>(null);
   const [runs, setRuns] = useState<AutomationRun[]>([]);
@@ -324,6 +328,9 @@ function TaskDetail({
       .then(() => announceAutomationsChanged())
       .catch(() => {});
   }, [id]);
+  useEffect(() => {
+    if (refreshKey > 0) refresh();
+  }, [refreshKey]);
 
   if (!task)
     return (

@@ -2400,3 +2400,56 @@ test('detectCaptchaInTab does not false-positive resolve on unrelated .success e
   assert.equal(detection.detected, true, 'challenge must still be detected');
   assert.equal(detection.resolved, false, 'must not be marked resolved by unrelated success elements');
 });
+
+test('calculatePuzzleDistance calls local Python CV solver endpoint when available and returns exact travel', async () => {
+  const { context } = await worker();
+  context.setTimeout = (fn) => { queueMicrotask(fn); return 1; };
+  let cvRequestSent = null;
+
+  context.fetch = async (url, options) => {
+    if (url.includes('/browser/solve_puzzle_cv')) {
+      cvRequestSent = { url, body: JSON.parse(options.body) };
+      return {
+        ok: true,
+        json: async () => ({
+          ok: true,
+          travel: 76,
+          max_travel: 242,
+          method: 'circular_receptacle',
+          confidence: 0.95,
+        }),
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+
+  context.chrome.tabs = {
+    captureVisibleTab: async () => 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+    get: async () => ({ windowId: 10 }),
+    update: async () => {},
+  };
+
+  vm.runInContext(`
+    chrome.scripting = {
+      executeScript: async ({ func }) => {
+        globalThis.document = {
+          querySelector: (sel) => {
+            if (sel.includes("canvas")) return { offsetWidth: 282, getBoundingClientRect: () => ({ left: 65, top: 98, width: 282, height: 152 }) };
+            if (sel.includes("track") || sel.includes("bar")) return { offsetWidth: 282, getBoundingClientRect: () => ({ left: 65, top: 261, width: 282, height: 40 }) };
+            if (sel.includes("btn") || sel.includes("button")) return { offsetWidth: 40, getBoundingClientRect: () => ({ left: 70, top: 261, width: 40, height: 40 }) };
+            return null;
+          },
+        };
+        globalThis.window = { devicePixelRatio: 1.0 };
+        return [{ result: func() }];
+      },
+    };
+  `, context);
+
+  const travel = await vm.runInContext('calculatePuzzleDistance(903, { width: 282 })', context);
+  assert.equal(travel, 76, 'must return exact travel from Python CV solver');
+  assert.ok(cvRequestSent !== null, 'must have dispatched POST request to /browser/solve_puzzle_cv');
+  assert.equal(cvRequestSent.body.canvas_rect.width, 282);
+  assert.equal(cvRequestSent.body.track_rect.width, 282);
+});
+

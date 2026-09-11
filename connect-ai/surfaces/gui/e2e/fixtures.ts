@@ -1451,6 +1451,23 @@ export async function mockApi(page: import("@playwright/test").Page) {
         prompt: task.instructions,
       });
     }
+    if (/\/v1\/automations\/[^/]+\/runs\/[^/]+\/finalize$/.test(p) && m === "POST") {
+      const parts = p.split("/");
+      const taskId = parts[3];
+      const runId = parts[5];
+      const task = automations.find((t) => t.id === taskId);
+      const run = automationRuns.find((r) => r.task_id === taskId && r.run_id === runId);
+      if (!task || !run) return json({ ok: false, error: "not found" });
+      if (run.status === "running") {
+        run.finished_at = Math.floor(Date.now() / 1000);
+        run.status = "ok";
+        run.result_text = "Echo: " + task.instructions;
+        task.last_run = run.finished_at;
+        task.last_status = "ok";
+        task.run_count += 1;
+      }
+      return json({ ok: true, run });
+    }
     if (/\/v1\/automations\/[^/]+$/.test(p) && m === "GET") {
       const id = p.split("/").pop();
       const task = automations.find((t) => t.id === id) ?? automations[0];

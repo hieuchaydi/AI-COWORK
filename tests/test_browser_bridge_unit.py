@@ -741,4 +741,98 @@ def test_transport_api_blocked_state_and_envelope():
     assert transport.get_state() == ExtensionState.API_BLOCKED
 
 
+def test_solve_puzzle_cv_validation_and_errors():
+    from browser_bridge.captcha_detector import solve_puzzle_cv
+
+    # Missing / None
+    res = solve_puzzle_cv(None)
+    assert res["ok"] is False
+    assert res["error"] == "missing_screenshot_data"
+
+    # Corrupt string
+    res = solve_puzzle_cv("not_a_base64_image_!!!")
+    assert res["ok"] is False
+    assert "error" in res
+
+
+def test_solve_puzzle_cv_circular_receptacle():
+    import cv2
+    import numpy as np
+    from browser_bridge.captcha_detector import solve_puzzle_cv
+
+    # Create synthetic mortar & pestle scene: 280x150
+    # Background light gray
+    canvas = np.full((150, 280, 3), 220, dtype=np.uint8)
+    # Target circular mortar at x=180, y=75, r=40
+    cv2.circle(canvas, (180, 75), 40, (120, 120, 120), -1)
+    cv2.circle(canvas, (180, 75), 15, (40, 40, 40), -1) # dark hole
+    # Movable pestle on left: bounding box x=20 to x=90, y=60 to y=120
+    cv2.rectangle(canvas, (20, 60), (90, 120), (80, 100, 140), -1)
+
+    res = solve_puzzle_cv(
+        canvas,
+        canvas_rect={"x": 0, "y": 0, "width": 280, "height": 150},
+        track_rect={"x": 0, "y": 160, "width": 280, "height": 40},
+        handle_rect={"x": 0, "y": 160, "width": 40, "height": 40},
+        device_pixel_ratio=1.0,
+    )
+    assert res["ok"] is True
+    assert res["method"] == "circular_receptacle"
+    assert res["confidence"] >= 0.90
+    # Expected travel: hole (180) - pestle tip (90) = ~90px
+    assert 75 <= res["travel"] <= 105
+
+
+def test_solve_puzzle_cv_colored_piece_and_slot():
+    import cv2
+    import numpy as np
+    from browser_bridge.captcha_detector import solve_puzzle_cv
+
+    # Create synthetic scene with red piece and white slot: 280x150
+    canvas = np.full((150, 280, 3), 200, dtype=np.uint8)
+    # Movable red piece on left: x=30 to x=60 (center ~45)
+    cv2.rectangle(canvas, (30, 40), (60, 90), (40, 40, 220), -1) # Bright Red (BGR)
+    # Target slot on right: x=140 to x=200 (center ~170), y=50 to y=80
+    cv2.rectangle(canvas, (140, 50), (200, 80), (70, 70, 70), -1)
+
+    res = solve_puzzle_cv(
+        canvas,
+        canvas_rect={"x": 0, "y": 0, "width": 280, "height": 150},
+        track_rect={"x": 0, "y": 160, "width": 280, "height": 40},
+        handle_rect={"x": 0, "y": 160, "width": 40, "height": 40},
+        device_pixel_ratio=1.0,
+    )
+    assert res["ok"] is True
+    assert res["method"] == "colored_piece_slot"
+    assert res["confidence"] >= 0.90
+    # Expected travel: slot (170) - piece (45) = ~125px
+    assert 110 <= res["travel"] <= 140
+
+
+def test_solve_puzzle_cv_dpr_scaling():
+    import cv2
+    import numpy as np
+    from browser_bridge.captcha_detector import solve_puzzle_cv
+
+    # Canvas at 1.5x DPR: 420x225 (CSS: 280x150)
+    canvas = np.full((225, 420, 3), 200, dtype=np.uint8)
+    # Red piece at x=45 (center)
+    cv2.rectangle(canvas, (30, 60), (60, 135), (40, 40, 220), -1)
+    # Slot at x=255 (center)
+    cv2.rectangle(canvas, (210, 75), (300, 120), (70, 70, 70), -1)
+    # Physical delta = 255 - 45 = 210 px.
+    # At DPR 1.5, CSS delta = 210 / 1.5 = 140 CSS px.
+
+    res = solve_puzzle_cv(
+        canvas,
+        canvas_rect={"x": 0, "y": 0, "width": 280, "height": 150},
+        track_rect={"x": 0, "y": 160, "width": 280, "height": 40},
+        handle_rect={"x": 0, "y": 160, "width": 40, "height": 40},
+        device_pixel_ratio=1.5,
+    )
+    assert res["ok"] is True
+    assert 130 <= res["travel"] <= 150
+
+
+
 

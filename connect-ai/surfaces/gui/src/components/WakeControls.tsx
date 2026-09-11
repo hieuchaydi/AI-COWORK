@@ -7,8 +7,8 @@ export function WakeControls({ sessionId }: { sessionId: string }) {
   const [wakes, setWakes] = useState<SessionWake[]>([]);
   const [auto, setAuto] = useState(true);
   const refresh = () => getSessionWakes(sessionId).then((x) => {
-    setWakes(x.wakes);
-    setAuto(x.auto);
+    setWakes(Array.isArray(x.wakes) ? x.wakes : []);
+    setAuto(typeof x.auto === "boolean" ? x.auto : true);
   }).catch(() => {});
 
   useEffect(() => {

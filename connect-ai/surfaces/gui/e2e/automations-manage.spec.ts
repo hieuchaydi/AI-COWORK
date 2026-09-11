@@ -5,9 +5,9 @@ import { expect } from "@playwright/test";
 import { test } from "./fixtures";
 
 async function openAutomations(page) {
+  await page.addInitScript(() => localStorage.removeItem("coworker:nav-collapsed:v1"));
   await page.goto("/");
-  await page.getByTestId("account-row").click();
-  await page.getByTestId("account-menu").getByRole("button", { name: "Automations", exact: true }).click();
+  await page.getByTestId("nav-automations").dispatchEvent("click");
   await expect(page.getByText("Recurring tasks Workspace runs on a schedule.")).toBeVisible();
 }
 
@@ -19,14 +19,24 @@ test("lists a scheduled task with its schedule and run count", async ({ page }) 
   await expect(card).toContainText("last running");
 });
 
-test("Run now triggers a manual run and opens its live session", async ({ page }) => {
+test("Run now completes as a one-shot and clears the live run session", async ({ page }) => {
   await openAutomations(page);
   await page.locator(".sched-card", { hasText: "Daily AI News" }).click();
-  await page.getByRole("button", { name: /Run now/ }).click();
-  // The manual run opens as a session with the automation-context banner.
-  const banner = page.getByTestId("run-banner");
-  await expect(banner).toBeVisible();
-  await expect(banner).toContainText("Daily AI News");
+  const runPrepared = page.waitForResponse(
+    (res) => /\/v1\/automations\/task-1\/run$/.test(new URL(res.url()).pathname) && res.request().method() === "POST",
+  );
+  const runFinalized = page.waitForResponse(
+    (res) => /\/v1\/automations\/task-1\/runs\/[^/]+\/finalize$/.test(new URL(res.url()).pathname) && res.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: /Run now/ }).dispatchEvent("click");
+  await runPrepared;
+  await runFinalized;
+
+  // Once its first turn is done, the UI finalizes the run, returns to the task detail,
+  // and clears the internal __run__ session from the active view.
+  await expect(page.getByRole("button", { name: /Run now/ })).toBeVisible();
+  await expect(page.getByTestId("run-banner")).toHaveCount(0);
+  await expect(page.locator(".sched-run", { hasText: "manual" }).first()).toContainText("ok");
 });
 
 test("enable toggle pauses the task", async ({ page }) => {

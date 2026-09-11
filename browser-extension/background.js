@@ -2256,6 +2256,31 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
         const handleWidth = handleEl ? handleEl.offsetWidth : 44;
         const maxTravel = Math.max(120, trackWidth - handleWidth);
 
+        const bgRect = bgEl && typeof bgEl.getBoundingClientRect === "function" ? {
+          x: bgEl.getBoundingClientRect().left,
+          y: bgEl.getBoundingClientRect().top,
+          width: bgEl.getBoundingClientRect().width,
+          height: bgEl.getBoundingClientRect().height,
+        } : null;
+        const trackRect = trackEl && typeof trackEl.getBoundingClientRect === "function" ? {
+          x: trackEl.getBoundingClientRect().left,
+          y: trackEl.getBoundingClientRect().top,
+          width: trackEl.getBoundingClientRect().width,
+          height: trackEl.getBoundingClientRect().height,
+        } : null;
+        const handleRect = handleEl && typeof handleEl.getBoundingClientRect === "function" ? {
+          x: handleEl.getBoundingClientRect().left,
+          y: handleEl.getBoundingClientRect().top,
+          width: handleEl.getBoundingClientRect().width,
+          height: handleEl.getBoundingClientRect().height,
+        } : null;
+        const domInfo = {
+          bgRect,
+          trackRect,
+          handleRect,
+          devicePixelRatio: typeof window !== "undefined" ? (window.devicePixelRatio || 1) : 1,
+        };
+
         // 3. Phân tích pixel canvas nếu khả dụng
         if (bgEl && typeof bgEl.getContext === "function") {
           try {
@@ -2312,7 +2337,8 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
                   method: "canvas_pixel_analysis",
                   targetX: bestX,
                   travel: Math.max(40, Math.min(targetTravel, maxTravel)),
-                  maxTravel
+                  maxTravel,
+                  domInfo
                 };
               }
             }
@@ -2330,7 +2356,7 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
             const defaultTargetX = (bRect.width - pRect.width) * 0.58;
             const targetTravel = Math.round((defaultTargetX - pieceInitialX) * (maxTravel / bRect.width));
             if (targetTravel > 40 && targetTravel < maxTravel) {
-              return { method: "dom_piece_estimate", travel: targetTravel, maxTravel };
+              return { method: "dom_piece_estimate", travel: targetTravel, maxTravel, domInfo };
             }
           }
         }
@@ -2339,12 +2365,42 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
         return {
           method: "golden_ratio_fallback",
           travel: Math.round(maxTravel * 0.58),
-          maxTravel
+          maxTravel,
+          domInfo
         };
       }
     });
 
     const validResult = results?.find((r) => r?.result?.travel);
+    const domInfo = validResult?.result?.domInfo || null;
+
+    // Hướng 2: Gọi Python CV Solver qua HTTP với ảnh chụp tab sạch (bypasses canvas tainting CORS restriction)
+    try {
+      const screenshot = await captureTabEvidence(tabId);
+      if (screenshot && typeof fetch === "function") {
+        const cvRes = await fetch(`${HELPER}/browser/solve_puzzle_cv`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            screenshot,
+            canvas_rect: domInfo?.bgRect,
+            track_rect: domInfo?.trackRect,
+            handle_rect: domInfo?.handleRect,
+            device_pixel_ratio: domInfo?.devicePixelRatio || 1,
+          }),
+        });
+        if (cvRes.ok) {
+          const cvData = await cvRes.json();
+          if (cvData?.ok && typeof cvData.travel === "number" && cvData.travel > 0) {
+            console.log(`[bridge] CV puzzle solver success: method=${cvData.method}, travel=${cvData.travel}px, confidence=${cvData.confidence}`);
+            return cvData.travel;
+          }
+        }
+      }
+    } catch (cvErr) {
+      console.warn("[bridge] CV puzzle solver call failed, falling back to heuristics:", cvErr?.message || cvErr);
+    }
+
     if (validResult?.result?.travel) {
       return validResult.result.travel;
     }

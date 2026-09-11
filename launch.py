@@ -888,6 +888,21 @@ def _on_browser_ws_message(message: dict) -> None:
         _ack_ingest_job(job_id)
     elif kind in ("bridge.ping", "ping"):
         _BROWSER_WS.send({"type": "bridge.pong", "at": time.time()})
+    elif kind == "cv.solve_puzzle":
+        msg_id = message.get("id") or ""
+        params = message.get("params") or {}
+        try:
+            from browser_bridge.captcha_detector import solve_puzzle_cv
+            result = solve_puzzle_cv(
+                screenshot_data=params.get("screenshot") or "",
+                canvas_rect=params.get("canvas_rect"),
+                track_rect=params.get("track_rect"),
+                handle_rect=params.get("handle_rect"),
+                device_pixel_ratio=float(params.get("device_pixel_ratio") or 1.0),
+            )
+            _BROWSER_WS.send({"type": "cv.solve_puzzle.result", "id": msg_id, "result": result})
+        except Exception as exc:
+            _BROWSER_WS.send({"type": "cv.solve_puzzle.result", "id": msg_id, "result": {"ok": False, "error": str(exc)}})
     elif kind == "verification.required":
         params = message.get("params") or {}
         job_id = str(params.get("job_id") or params.get("jobId") or "")
@@ -3574,6 +3589,26 @@ class _HelperHandler(BaseHTTPRequestHandler):
                 _ensure_chrome_with_extension()
             _reply(200, {"ok": True, "reloaded": True, "sent": sent})
             return
+
+        if path_only == "/browser/solve_puzzle_cv":
+            from browser_bridge.captcha_detector import solve_puzzle_cv
+            body = _read_json()
+            screenshot = body.get("screenshot") or ""
+            canvas_rect = body.get("canvas_rect")
+            track_rect = body.get("track_rect")
+            handle_rect = body.get("handle_rect")
+            dpr = float(body.get("device_pixel_ratio") or 1.0)
+
+            result = solve_puzzle_cv(
+                screenshot_data=screenshot,
+                canvas_rect=canvas_rect,
+                track_rect=track_rect,
+                handle_rect=handle_rect,
+                device_pixel_ratio=dpr,
+            )
+            _reply(200 if result.get("ok") else 400, result)
+            return
+
 
         if path_only == "/browser/command":
             from browser_bridge.protocol import MAX_MESSAGE_BYTES, MessageEnvelope
