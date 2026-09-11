@@ -4307,9 +4307,34 @@ async function connectBridge() {
       ]);
       if (!current()) return;
       if (stored.connectionEnabled === false) {
-        connectionEnabled = false;
-        closeBridgeSocket({ rejectPending: true });
-        return;
+        let shouldAutoRecover = false;
+        if (stored.connectionConflict) {
+          try {
+            const statusUrl = new URL(wsUrl || "ws://127.0.0.1:8766/browser/v1/ws");
+            statusUrl.protocol = statusUrl.protocol === "wss:" ? "https:" : "http:";
+            if (statusUrl.port === "8767") statusUrl.port = "8766";
+            statusUrl.pathname = "/browser/status";
+            statusUrl.search = statusUrl.hash = "";
+            const statusRes = await fetch(statusUrl.toString(), { cache: "no-store" });
+            if (statusRes.ok) {
+              const statusData = await statusRes.json();
+              if (statusData && statusData.connected === false) {
+                shouldAutoRecover = true;
+              }
+            }
+          } catch {}
+        }
+        if (!shouldAutoRecover) {
+          connectionEnabled = false;
+          closeBridgeSocket({ rejectPending: true });
+          return;
+        }
+        connectionEnabled = true;
+        await chrome.storage.local.set({
+          connectionEnabled: true,
+          connectionConflict: null,
+          lastConnectionError: "",
+        });
       }
       let token = stored.pairingToken;
       let wsUrl = stored.gatewayUrl || "ws://127.0.0.1:8766/browser/v1/ws";
@@ -4560,6 +4585,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     chrome.storage.local.remove("lastCompletedResult", () => {
       sendResponse({ ok: !chrome.runtime.lastError });
     });
+    return true;
+  }
+  if (msg.action === "autoPair") {
+    connectionGeneration++;
+    connectionEnabled = true;
+    chrome.storage.local.set({ connectionEnabled: true, connectionConflict: null, lastConnectionError: "" }, () => {
+      connectBridge();
+    });
+    sendResponse({ ok: true });
     return true;
   }
   if (msg.action === "connect" || msg.action === "disconnect") {
