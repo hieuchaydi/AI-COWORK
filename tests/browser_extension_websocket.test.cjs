@@ -2186,49 +2186,74 @@ test('generateHumanTrajectory produces ease-out curve, vertical jitter and corre
   assert.ok(distinctY.size > 1, 'trajectory must include micro-jitter on Y axis');
 });
 
-test('calculatePuzzleDistance identifies target position from canvas pixel colors', async () => {
+test('calculatePuzzleDistance identifies target position via screenshot computer vision and falls back smartly', async () => {
   const { context } = await worker();
   vm.runInContext(`
     chrome.scripting = {
       executeScript: async ({ func }) => {
-        const mockCanvas = {
-          offsetWidth: 300,
-          offsetHeight: 180,
-          width: 300,
-          height: 180,
-          getContext: () => ({
-            getImageData: (sx, sy, w, h) => {
-              const data = new Uint8Array(w * h * 4);
-              // Fill with neutral sand/concrete color (grayish ~ 160)
-              data.fill(160);
-              // Add a red triangle/notch at column x = 180
-              for (let y = 30; y < 150; y++) {
-                const idx = (y * w + 180) * 4;
-                data[idx] = 220;     // Red
-                data[idx + 1] = 40;  // Green
-                data[idx + 2] = 40;  // Blue
-                data[idx + 3] = 255;
-              }
-              return { data };
-            },
-          }),
-        };
         globalThis.document = {
           querySelector: (sel) => {
-            if (sel.includes("canvas")) return mockCanvas;
-            if (sel.includes("track") || sel.includes("bar")) return { offsetWidth: 320 };
-            if (sel.includes("btn") || sel.includes("button")) return { offsetWidth: 44 };
+            if (sel.includes("piece") || sel.includes("slice")) return { offsetWidth: 44, width: 44, getBoundingClientRect: () => ({ left: 50, top: 100, width: 44, height: 44 }) };
+            if (sel.includes("canvas") || sel.includes("bg")) return { offsetWidth: 300, offsetHeight: 180, width: 300, height: 180, getBoundingClientRect: () => ({ left: 50, top: 100, width: 300, height: 180 }) };
+            if (sel.includes("track") || sel.includes("bar")) return { offsetWidth: 320, getBoundingClientRect: () => ({ left: 50, top: 290, width: 320, height: 44 }) };
+            if (sel.includes("btn") || sel.includes("button")) return { offsetWidth: 44, getBoundingClientRect: () => ({ left: 50, top: 290, width: 44, height: 44 }) };
             return null;
           },
         };
         return [{ result: func() }];
       },
     };
+    captureTabEvidence = async () => 'data:image/png;base64,mocked_screenshot';
+    findHoleXFromScreenshot = async () => 180;
   `, context);
 
   const travel = await vm.runInContext('calculatePuzzleDistance(501, { width: 320 })', context);
   assert.ok(typeof travel === 'number', 'travel must be a number');
-  assert.ok(travel >= 150 && travel <= 220, `travel (${travel}) should correspond to red notch near column 180`);
+  assert.ok(travel >= 150 && travel <= 220, `travel (${travel}) should correspond to hole near column 180`);
+
+  // Test fallback behavior when CV returns null / no hole found
+  vm.runInContext(`
+    findHoleXFromScreenshot = async () => null;
+  `, context);
+  const fallbackTravel = await vm.runInContext('calculatePuzzleDistance(501, { width: 320 })', context);
+  assert.ok(typeof fallbackTravel === 'number', 'fallbackTravel must be a number');
+  assert.ok(fallbackTravel >= 100 && fallbackTravel <= 150, `fallbackTravel (${fallbackTravel}) should use ~42% ratio`);
+});
+
+test('findHoleXFromScreenshot detects dark notch coordinate from pixel data', async () => {
+  const { context } = await worker();
+  vm.runInContext(`
+    globalThis.fetch = async () => ({
+      blob: async () => ({})
+    });
+    globalThis.createImageBitmap = async () => ({ width: 300, height: 180 });
+    globalThis.OffscreenCanvas = class {
+      constructor(w, h) { this.width = w; this.height = h; }
+      getContext() {
+        return {
+          drawImage: () => {},
+          getImageData: () => {
+            const data = new Uint8Array(300 * 180 * 4);
+            data.fill(200); // bright background
+            // create dark hole around x = 160
+            for (let y = 40; y < 140; y++) {
+              for (let x = 155; x < 165; x++) {
+                const idx = (y * 300 + x) * 4;
+                data[idx] = 30;
+                data[idx + 1] = 30;
+                data[idx + 2] = 30;
+              }
+            }
+            return { data };
+          }
+        };
+      }
+    };
+  `, context);
+
+  const holeX = await vm.runInContext('findHoleXFromScreenshot("data:image/png;base64,test", { wImage: 300, hImage: 180 })', context);
+  assert.ok(typeof holeX === 'number', 'holeX must be a number');
+  assert.ok(holeX >= 150 && holeX <= 170, `detected hole (${holeX}) must be around x=160`);
 });
 
 test('tryAutoDragShopeeCaptcha executes realistic drag via chrome.debugger', async () => {
@@ -2478,6 +2503,7 @@ test('startVerificationWatcher dispatches captcha.drag_evidence after auto-drag 
   context.chrome.windows = { update: async () => {} };
   context.bridgeFrames = frames;
   vm.runInContext(`
+    bridgeSocket = { readyState: 1 };
     bridgeSocket = {
       readyState: 1,
       send: (raw) => {
@@ -2501,6 +2527,8 @@ test('startVerificationWatcher dispatches captcha.drag_evidence after auto-drag 
     });
   `, context);
 
+  // Wait for auto-drag and dispatch
+  await new Promise((r) => setTimeout(r, 50));
   // Trigger listener
   const listener = vm.runInContext('activeTabUpdateListener', context);
   await listener(904, { status: 'complete' }, { url: 'https://shopee.vn/verify/traffic' });
@@ -2526,6 +2554,7 @@ test('startVerificationWatcher dispatches captcha.resolved_evidence on successfu
   context.chrome.windows = { update: async () => {} };
   context.bridgeFrames = frames;
   vm.runInContext(`
+    bridgeSocket = { readyState: 1 };
     bridgeSocket = {
       readyState: 1,
       send: (raw) => {
@@ -2554,6 +2583,7 @@ test('startVerificationWatcher dispatches captcha.resolved_evidence on successfu
     });
   `, context);
 
+  await new Promise((r) => setTimeout(r, 50));
   const listener = vm.runInContext('activeTabUpdateListener', context);
   await listener(905, { status: 'complete' }, { url: 'https://shopee.vn/product/1/2' });
 

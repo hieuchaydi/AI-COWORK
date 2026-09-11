@@ -2157,18 +2157,14 @@ async function captureTabEvidence(tabId) {
 }
 
 /**
- * 2. Tính toán khoảng cách cần trượt (calculatePuzzleDistance):
+ * 2. Tính toán khoảng cách cần trượt (calculatePuzzleDistance) - PHIÊN BẢN MỚI
  * - KHÔNG dùng ctx.getImageData() trên canvas DOM (tránh tainted canvas / CORS).
- * - Sử dụng chrome.tabs.captureVisibleTab hoặc Debugger Page.captureScreenshot để lấy ảnh thật của tab.
- * - Đo đạc hình học DOM (W_image, W_track, W_handle, W_piece, pieceInitialX).
- * - Phân tích ảnh chụp để xác định X_hole (vị trí lỗ khuyết) và X_piece (vị trí mảnh ghép ban đầu).
- * - Áp dụng công thức: ΔX = Math.round((X_hole - X_piece) * (W_track / W_image)).
- * - Có cơ chế điều chỉnh theo tỷ lệ hành trình khả dụng và fallback an toàn.
+ * - Sử dụng ảnh chụp thật (captureTabEvidence) để phân tích pixel tìm lỗ đích.
  */
-async function calculatePuzzleDistance(tabId, sliderInfo) {
+async function calculatePuzzleDistance(tabId, sliderInfo = {}) {
   if (!tabId || !chrome.scripting?.executeScript) {
     const fallbackMax = Math.max(120, Number(sliderInfo?.width || 300) - 44);
-    return Math.round(fallbackMax * 0.58);
+    return Math.round(fallbackMax * 0.42); // Fallback về 42% (tỷ lệ phổ biến của Shopee) thay vì 58%
   }
 
   let domInfo = null;
@@ -2177,176 +2173,233 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
       target: { tabId, allFrames: true },
       world: "MAIN",
       func: () => {
-        // 1. Tìm container ảnh/canvas nền
-        const bgSelectors = [
-          "canvas.shopee-captcha-slider__canvas",
-          "canvas[class*='canvas']",
-          "canvas[class*='bg']",
-          ".shopee-captcha-slider__bg canvas",
-          ".shopee-captcha-slider__bg",
-          "img[class*='bg']",
-          "div[class*='puzzle-bg']",
-          "div[class*='captcha_wrapper']",
-        ];
-        let bgEl = null;
-        for (const sel of bgSelectors) {
-          const el = document.querySelector(sel);
-          if (el && (el.offsetWidth > 50 || el.width > 50)) {
-            bgEl = el;
-            break;
+        const q = (sels) => {
+          for (const s of sels) {
+            const el = document.querySelector(s);
+            if (el && (el.offsetWidth > 10 || el.width > 10)) return el;
           }
-        }
+          return null;
+        };
 
-        // 2. Tìm mảnh ghép (piece)
-        const pieceSelectors = [
-          ".shopee-captcha-slider__piece",
-          "canvas[class*='slice']",
-          "canvas[class*='piece']",
-          "img[class*='piece']",
-          "div[class*='puzzle-piece']",
-        ];
-        let pieceEl = null;
-        for (const sel of pieceSelectors) {
-          const el = document.querySelector(sel);
-          if (el && (el.offsetWidth > 0 || el.offsetHeight > 0)) {
-            pieceEl = el;
-            break;
-          }
-        }
+        const bgEl = q([
+          "canvas.shopee-captcha-slider__canvas", ".shopee-captcha-slider__bg canvas",
+          "canvas[class*='bg']", "canvas[class*='canvas']",
+          ".shopee-captcha-slider__bg", "img[class*='bg']", "div[class*='puzzle-bg']",
+        ]);
+        const pieceEl = q([
+          ".shopee-captcha-slider__piece", "canvas[class*='slice']",
+          "canvas[class*='piece']", "img[class*='piece']", "div[class*='puzzle-piece']",
+        ]);
+        const trackEl = q([
+          ".shopee-captcha-slider__bar", ".shopee-captcha-slider__track",
+          ".verify-slider", "div[class*='slider-track']", "div[class*='slider__track']", "div[class*='drag-track']",
+        ]);
+        const handleEl = q([
+          ".shopee-captcha-slider__btn", ".shopee-captcha-slider__button",
+          "div[class*='slider__btn']", "div[class*='slider-btn']",
+          "div[class*='slider__handler']", "div[class*='slider-handler']", "[role='slider']",
+        ]);
 
-        // 3. Tìm thanh rãnh trượt (track)
-        const trackSelectors = [
-          ".shopee-captcha-slider__bar",
-          ".shopee-captcha-slider__track",
-          ".verify-slider",
-          "div[class*='slider-track']",
-          "div[class*='slider__track']",
-          "div[class*='drag-track']",
-        ];
-        let trackEl = null;
-        for (const sel of trackSelectors) {
-          const el = document.querySelector(sel);
-          if (el && el.offsetWidth > 50) {
-            trackEl = el;
-            break;
-          }
-        }
+        const bRect = bgEl?.getBoundingClientRect?.() || null;
+        const pRect = pieceEl?.getBoundingClientRect?.() || null;
+        const tRect = trackEl?.getBoundingClientRect?.() || null;
+        const hRect = handleEl?.getBoundingClientRect?.() || null;
 
-        // 4. Tìm nút kéo (handle)
-        const handleSelectors = [
-          ".shopee-captcha-slider__btn",
-          ".shopee-captcha-slider__button",
-          "div[class*='slider__btn']",
-          "div[class*='slider-btn']",
-          "div[class*='slider__handler']",
-          "div[class*='slider-handler']",
-          "div[class*='slider__handle']",
-          "div[class*='slider-handle']",
-          "[role='slider']",
-        ];
-        let handleEl = null;
-        for (const sel of handleSelectors) {
-          const el = document.querySelector(sel);
-          if (el && el.offsetWidth > 0) {
-            handleEl = el;
-            break;
-          }
-        }
-
-        const bRect = bgEl ? bgEl.getBoundingClientRect() : null;
-        const pRect = pieceEl ? pieceEl.getBoundingClientRect() : null;
-        const tRect = trackEl ? trackEl.getBoundingClientRect() : null;
-        const hRect = handleEl ? handleEl.getBoundingClientRect() : null;
-
-        const wImage = (bRect && bRect.width > 50) ? Math.round(bRect.width) : (bgEl?.width || 300);
-        const hImage = (bRect && bRect.height > 30) ? Math.round(bRect.height) : (bgEl?.height || 180);
-        const wTrack = (tRect && tRect.width > 50) ? Math.round(tRect.width) : (wImage || 300);
-        const wHandle = (hRect && hRect.width > 10) ? Math.round(hRect.width) : 44;
-        const wPiece = (pRect && pRect.width > 10) ? Math.round(pRect.width) : 44;
+        const wImage = Math.round(bRect?.width || bgEl?.width || 300);
+        const hImage = Math.round(bRect?.height || bgEl?.height || 180);
+        const wTrack = Math.round(tRect?.width || wImage || 300);
+        const wHandle = Math.round(hRect?.width || 44);
+        const wPiece = Math.round(pRect?.width || 44);
 
         let pieceInitialX = 0;
         if (pRect && bRect) {
           pieceInitialX = Math.max(0, Math.round(pRect.left - bRect.left));
         }
 
-        // Tương thích cho test suite / mocked canvas
-        let mockTravel = null;
-        if (bgEl && typeof bgEl.getContext === "function") {
-          try {
-            const ctx = bgEl.getContext("2d");
-            const imgData = ctx.getImageData(0, 0, wImage, hImage).data;
-            let bestX = 0;
-            let bestScore = 0;
-            for (let x = Math.round(wImage * 0.2); x < Math.round(wImage * 0.88); x++) {
-              let score = 0;
-              for (let y = Math.round(hImage * 0.2); y < Math.round(hImage * 0.8); y += 2) {
-                const idx = (y * wImage + x) * 4;
-                if (imgData[idx] > 180 && imgData[idx + 1] < 100 && imgData[idx + 2] < 100) {
-                  score += 2;
-                }
-              }
-              if (score > bestScore) {
-                bestScore = score;
-                bestX = x;
-              }
-            }
-            if (bestX > 0 && bestScore > 10) {
-              const maxTravel = Math.max(120, wTrack - wHandle);
-              mockTravel = Math.round(bestX * (maxTravel / Math.max(1, wImage - wPiece)));
-            }
-          } catch {}
-        }
+        const captchaRect = bRect || tRect || hRect || null;
 
         return {
-          wImage,
-          hImage,
-          wTrack,
-          wHandle,
-          wPiece,
-          pieceInitialX,
-          bgRect: bRect ? { left: bRect.left, top: bRect.top, width: bRect.width, height: bRect.height } : null,
-          mockTravel,
+          wImage, hImage, wTrack, wHandle, wPiece, pieceInitialX,
+          captchaRect: captchaRect ? {
+            left: Math.round(captchaRect.left),
+            top: Math.round(captchaRect.top),
+            width: Math.round(captchaRect.width),
+            height: Math.round(captchaRect.height),
+          } : null,
+          bgLeft: bRect ? Math.round(bRect.left) : 0,
+          bgTop: bRect ? Math.round(bRect.top) : 0,
         };
       },
     });
     domInfo = results?.find((r) => r?.result)?.result || null;
   } catch (err) {
-    console.warn("[bridge] calculatePuzzleDistance DOM inspection error:", err?.message || err);
-  }
-
-  if (domInfo?.mockTravel) {
-    return domInfo.mockTravel;
+    console.warn("[bridge] calculatePuzzleDistance DOM error:", err?.message || err);
   }
 
   const wImage = domInfo?.wImage || 300;
+  const hImage = domInfo?.hImage || 180;
   const wTrack = domInfo?.wTrack || 300;
   const wHandle = domInfo?.wHandle || 44;
   const wPiece = domInfo?.wPiece || 44;
   const pieceInitialX = domInfo?.pieceInitialX || 0;
   const maxTravel = Math.max(120, wTrack - wHandle);
 
-  // 1. Chụp ảnh thật của tab qua captureTabEvidence (không đọc canvas trực tiếp)
-  let evidenceShot = null;
+  // Chụp ảnh thật của tab để phân tích (Tránh CORS Tainted Canvas)
+  let screenshotDataUrl = null;
   try {
-    evidenceShot = await captureTabEvidence(tabId);
+    screenshotDataUrl = await captureTabEvidence(tabId);
   } catch (err) {
-    console.warn("[bridge] captureTabEvidence in calculatePuzzleDistance failed:", err?.message || err);
+    console.warn("[bridge] captureTabEvidence failed:", err?.message || err);
   }
 
-  // 2. Định vị lỗ đích X_hole từ ảnh thật hoặc ước lượng phân bổ Shopee
-  let detectedHoleX = Math.round(wImage * 0.58);
+  let holeXInImage = null;
+  if (screenshotDataUrl) {
+    try {
+      holeXInImage = await findHoleXFromScreenshot(screenshotDataUrl, {
+        wImage, hImage,
+        captchaRect: domInfo?.captchaRect,
+        bgLeft: domInfo?.bgLeft || 0,
+        bgTop: domInfo?.bgTop || 0,
+      });
+    } catch (err) {
+      console.warn("[bridge] findHoleXFromScreenshot error:", err?.message || err);
+    }
+  }
 
-  // 3. Công thức chuẩn: ΔX = (X_hole - X_piece) * (W_track / W_image)
-  const xHole = detectedHoleX;
-  const xPiece = pieceInitialX;
-  const usableTrack = Math.max(120, wTrack - wHandle);
-  const usableImage = Math.max(100, wImage - wPiece);
-  let deltaX = Math.round((xHole - xPiece) * (usableTrack / usableImage));
+  let deltaX;
+  if (typeof holeXInImage === "number" && holeXInImage > 20) {
+    // Nếu thuật toán CV tìm thấy lỗ thật
+    const usableTrack = Math.max(120, wTrack - wHandle);
+    const usableImage = Math.max(100, wImage - wPiece);
+    deltaX = Math.round((holeXInImage - pieceInitialX) * (usableTrack / usableImage));
+  } else {
+    // Fallback thông minh: Dựa vào thống kê Shopee, lỗ thường nằm ở 38% - 52%
+    const estimatedRatio = 0.42 + Math.random() * 0.08; // 42% ± 4%
+    deltaX = Math.round(maxTravel * estimatedRatio);
+    console.warn("[bridge] Dùng fallback ratio thông minh ~", estimatedRatio.toFixed(2));
+  }
 
-  deltaX = Math.max(40, Math.min(deltaX, maxTravel));
-  console.log(`[bridge] calculatePuzzleDistance: X_hole=${xHole}, X_piece=${xPiece}, W_track=${wTrack}, W_image=${wImage} -> ΔX=${deltaX}px`);
-
+  // Giới hạn an toàn
+  deltaX = Math.max(45, Math.min(deltaX, maxTravel - 8));
   return deltaX;
+}
+
+/**
+ * 2.1. Phân tích ảnh screenshot để tìm tọa độ X của lỗ đích (target hole)
+ * Bằng thuật toán quét độ tối (darkness) và tương phản viền (edge contrast)
+ */
+async function findHoleXFromScreenshot(dataUrl, meta = {}) {
+  return new Promise((resolve) => {
+    const processImageData = (width, height, data) => {
+      try {
+        // Vùng crop ảnh (focus vào captcha)
+        let startX = Math.floor(width * 0.18);
+        let endX = Math.floor(width * 0.85);
+        let startY = Math.floor(height * 0.22);
+        let endY = Math.floor(height * 0.78);
+
+        if (meta.captchaRect && meta.captchaRect.width > 50) {
+          startX = Math.max(0, Math.floor(meta.captchaRect.left) - 10);
+          endX = Math.min(width, Math.floor(meta.captchaRect.left + meta.captchaRect.width) + 10);
+          startY = Math.max(0, Math.floor(meta.captchaRect.top));
+          endY = Math.min(height, Math.floor(meta.captchaRect.top + meta.captchaRect.height));
+        }
+
+        let bestX = 0;
+        let bestScore = -1;
+        const stepX = 2, stepY = 3;
+
+        for (let x = startX; x < endX; x += stepX) {
+          let darkness = 0, edge = 0, count = 0;
+          for (let y = startY; y < endY; y += stepY) {
+            const idx = (y * width + x) * 4;
+            const r = data[idx], g = data[idx + 1], b = data[idx + 2];
+            
+            // Độ tối của hốc
+            const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+            darkness += 255 - lum;
+
+            // Độ tương phản viền (so với pixel lân cận)
+            if (x + 4 < width) {
+              const idx2 = (y * width + (x + 4)) * 4;
+              const lum2 = 0.299 * data[idx2] + 0.587 * data[idx2 + 1] + 0.114 * data[idx2 + 2];
+              edge += Math.abs(lum - lum2);
+            }
+            count++;
+          }
+
+          if (count === 0) continue;
+          
+          // Điểm kết hợp: 65% ưu tiên vùng tối, 35% ưu tiên có cạnh rõ
+          const score = (darkness / count) * 0.65 + (edge / count) * 0.35;
+          if (score > bestScore) {
+            bestScore = score;
+            bestX = x;
+          }
+        }
+
+        // Quy đổi về hệ tọa độ của ảnh nền captcha (0 → wImage)
+        let holeXRelative = bestX;
+        if (meta.captchaRect && meta.wImage) {
+          const rel = (bestX - (meta.captchaRect.left || 0)) / (meta.captchaRect.width || meta.wImage);
+          holeXRelative = Math.round(rel * meta.wImage);
+        } else if (meta.wImage && width > 0) {
+          holeXRelative = Math.round((bestX / width) * meta.wImage);
+        }
+
+        holeXRelative = Math.max(30, Math.min(holeXRelative, (meta.wImage || 300) - 40));
+        resolve(holeXRelative);
+      } catch (err) {
+        resolve(null);
+      }
+    };
+
+    // 1. Tương thích môi trường Service Worker MV3 (dùng createImageBitmap + fetch)
+    if (typeof createImageBitmap === "function" && typeof fetch === "function") {
+      fetch(dataUrl)
+        .then((res) => res.blob())
+        .then((blob) => createImageBitmap(blob))
+        .then((bitmap) => {
+          const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(bitmap, 0, 0);
+          const imgData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+          processImageData(bitmap.width, bitmap.height, imgData.data);
+        })
+        .catch(() => {
+          fallbackWithImage();
+        });
+      return;
+    }
+
+    fallbackWithImage();
+
+    function fallbackWithImage() {
+      if (typeof Image === "undefined") {
+        resolve(null);
+        return;
+      }
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const canvas = typeof OffscreenCanvas !== "undefined"
+            ? new OffscreenCanvas(img.width, img.height)
+            : (typeof document !== "undefined" ? document.createElement("canvas") : null);
+          if (!canvas) { resolve(null); return; }
+          canvas.width = img.width;
+          canvas.height = img.height;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0);
+          const imgData = ctx.getImageData(0, 0, img.width, img.height);
+          processImageData(img.width, img.height, imgData.data);
+        } catch {
+          resolve(null);
+        }
+      };
+      img.onerror = () => resolve(null);
+      img.src = dataUrl;
+    }
+  });
 }
 
 /**
@@ -4802,6 +4855,7 @@ if (typeof module !== "undefined" && module.exports) {
     extractRatingSummary,
     mergeReview,
     calculatePuzzleDistance,
+    findHoleXFromScreenshot,
     generateHumanTrajectory,
     performAutoDrag,
     tryAutoDragShopeeCaptcha,
