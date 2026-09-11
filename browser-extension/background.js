@@ -2274,8 +2274,15 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
           width: handleEl.getBoundingClientRect().width,
           height: handleEl.getBoundingClientRect().height,
         } : null;
+        const pieceRect = pieceEl && typeof pieceEl.getBoundingClientRect === "function" ? {
+          x: pieceEl.getBoundingClientRect().left,
+          y: pieceEl.getBoundingClientRect().top,
+          width: pieceEl.getBoundingClientRect().width,
+          height: pieceEl.getBoundingClientRect().height,
+        } : null;
         const domInfo = {
           bgRect,
+          pieceRect,
           trackRect,
           handleRect,
           devicePixelRatio: typeof window !== "undefined" ? (window.devicePixelRatio || 1) : 1,
@@ -2384,6 +2391,7 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
           body: JSON.stringify({
             screenshot,
             canvas_rect: domInfo?.bgRect,
+            piece_rect: domInfo?.pieceRect,
             track_rect: domInfo?.trackRect,
             handle_rect: domInfo?.handleRect,
             device_pixel_ratio: domInfo?.devicePixelRatio || 1,
@@ -2677,10 +2685,13 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
   let distance = await calculatePuzzleDistance(tabId, slider);
   const attemptNum = Number(options?.attempt || detection?.attempt || 1);
   if (attemptNum > 1) {
-    // P1-1: Nếu là lần thử thứ 2+, bù thêm jitter offset ngẫu nhiên để tránh kéo lại đúng vị trí sai
-    const jitter = Math.round((Math.random() < 0.5 ? -1 : 1) * (10 + Math.floor(Math.random() * 15)));
+    // P1-1: Nếu là lần thử thứ 2+, bù trừ micro-jitter có định hướng (+4px, -4px, +8px, -8px)
+    // để khắc phục triệt để hiện tượng kéo "gần tới" (thiếu) hoặc "kéo quá 1 chút" (thừa)
+    const sign = attemptNum % 2 === 0 ? 1 : -1;
+    const step = 4 + Math.floor((attemptNum - 2) / 2) * 4;
+    const jitter = sign * step;
     distance = Math.max(40, distance + jitter);
-    console.log(`[bridge] Auto-drag retry #${attemptNum}: applying jitter ${jitter >= 0 ? "+" : ""}${jitter}px -> distance: ${distance}px (startX: ${startX}, startY: ${startY})`);
+    console.log(`[bridge] Auto-drag retry #${attemptNum}: applying micro-jitter ${jitter >= 0 ? "+" : ""}${jitter}px -> distance: ${distance}px (startX: ${startX}, startY: ${startY})`);
   } else {
     console.log(`[bridge] Calculated puzzle travel: ${distance}px (startX: ${startX}, startY: ${startY})`);
   }
@@ -2700,7 +2711,7 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
         await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y, button: "left", buttons: 1 });
         await new Promise((r) => setTimeout(r, point.delay));
       }
-      await new Promise((r) => setTimeout(r, 90 + Math.random() * 40));
+      await new Promise((r) => setTimeout(r, 140 + Math.random() * 40));
       await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: startY, button: "left", clickCount: 1 });
       return { attempted: true, method: "debugger", startX, startY, endX, distance };
     } catch (err) {
@@ -4307,6 +4318,9 @@ async function connectBridge() {
       ]);
       if (!current()) return;
       if (stored.connectionEnabled === false) {
+        connectionEnabled = false;
+        closeBridgeSocket({ rejectPending: true });
+        return;
         let shouldAutoRecover = false;
         if (stored.connectionConflict) {
           try {

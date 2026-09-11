@@ -233,6 +233,7 @@ def solve_puzzle_cv(
     canvas_rect: Optional[Dict[str, float]] = None,
     track_rect: Optional[Dict[str, float]] = None,
     handle_rect: Optional[Dict[str, float]] = None,
+    piece_rect: Optional[Dict[str, float]] = None,
     device_pixel_ratio: float = 1.0,
 ) -> Dict[str, Any]:
     """Autonomous Computer Vision solver for Shopee CAPTCHA puzzle challenges.
@@ -240,9 +241,9 @@ def solve_puzzle_cv(
     Analyzes screenshot data (or pre-cropped canvas) using OpenCV & Pillow:
     1. Extracts canvas crop based on CSS bounding box and devicePixelRatio (or auto-locates canvas).
     2. Uses multi-stage feature extraction:
-       - Circular receptacle / pit detection (e.g. mortar & pestle).
+       - Jigsaw notch & cutout slot detection (for natural colorful scenes).
        - Colored piece & recessed slot detection (e.g. floating red polygon into tablet slot).
-       - Classic jigsaw notch contour detection.
+       - Circular receptacle / pit detection (e.g. mortar & pestle).
        - Column gradient discontinuity projection fallback.
     3. Calculates precise horizontal drag displacement and scales to CSS pixels for Chrome Debugger.
     """
@@ -320,67 +321,101 @@ def solve_puzzle_cv(
                     best_area = area
                     best_candidate = (x, y, w, h)
             if best_candidate:
-                bx, by, bw, bh = best_candidate
-                canvas_crop = img_bgr[by:by+bh, bx:bx+bw]
-                ref_w = float(canvas_rect.get("width") if canvas_rect else 280)
-                scale = bw / max(1.0, ref_w)
-
-    if canvas_crop is None or canvas_crop.size == 0:
-        return {"ok": False, "error": "canvas_crop_failed"}
+                x, y, w, h = best_candidate
+                canvas_crop = img_bgr[y:y+h, x:x+w]
+                scale = 1.0
+            else:
+                canvas_crop = img_bgr
+                scale = 1.0
 
     ch, cw, _ = canvas_crop.shape
     gray = cv2.cvtColor(canvas_crop, cv2.COLOR_BGR2GRAY)
+    sobel_x = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
 
     method = "fallback"
     confidence = 0.50
-    target_x = cw * 0.65
-    piece_x = cw * 0.20
+    target_x = float(cw * 0.65)
+    piece_x = float(cw * 0.15)
     delta_x_phys = target_x - piece_x
 
-    # Method 1: Circular Receptacle / Pit Insertion (e.g. Mortar & Pestle)
-    blur = cv2.GaussianBlur(gray, (9, 9), 2)
-    circles = cv2.HoughCircles(
-        blur, cv2.HOUGH_GRADIENT,
-        dp=1.2, minDist=30,
-        param1=80, param2=30,
-        minRadius=int(ch * 0.15), maxRadius=int(ch * 0.55)
-    )
-    if circles is not None:
-        valid_circles = [c for c in circles[0] if c[0] > cw * 0.35]
-        if valid_circles:
-            best_circle = max(valid_circles, key=lambda c: c[2])
-            cx, cy, cr = float(best_circle[0]), float(best_circle[1]), float(best_circle[2])
-            search_r = int(cr * 0.45)
-            x1 = max(0, int(cx - search_r))
-            x2 = min(cw, int(cx + search_r))
-            y1 = max(0, int(cy - search_r))
-            y2 = min(ch, int(cy + search_r))
-            roi = gray[y1:y2, x1:x2]
-            if roi.size > 0:
-                _, _, min_loc, _ = cv2.minMaxLoc(cv2.GaussianBlur(roi, (5, 5), 0))
-                target_x = float(x1 + min_loc[0])
-            else:
-                target_x = cx
+    # 3. Piece detection (from DOM piece_rect or CV vertical edge pair in left quarter)
+    detected_piece_x = None
+    detected_piece_y = None
+    detected_piece_w = None
+    detected_piece_h = None
 
-            # Find tip of movable piece on left (x < cw * 0.45)
-            left_roi = gray[:, :int(cw * 0.45)]
-            edges_left = cv2.Canny(left_roi, 30, 100)
-            cnts_left, _ = cv2.findContours(edges_left, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if cnts_left:
-                best_cnt = max(cnts_left, key=cv2.contourArea)
-                lx, ly, lw, lh = cv2.boundingRect(best_cnt)
-                piece_x = float(lx + lw)
-            else:
-                piece_x = cw * 0.35
+    if piece_rect and isinstance(piece_rect, dict) and canvas_rect and isinstance(canvas_rect, dict):
+        try:
+            p_x = float(piece_rect.get("x", 0)) - float(canvas_rect.get("x", 0))
+            p_y = float(piece_rect.get("y", 0)) - float(canvas_rect.get("y", 0))
+            p_w = float(piece_rect.get("width", 0))
+            p_h = float(piece_rect.get("height", 0))
+            if p_w >= 20 and p_h >= 20:
+                detected_piece_x = max(0, int(round(p_x * scale)))
+                detected_piece_y = max(0, int(round(p_y * scale)))
+                detected_piece_w = int(round(p_w * scale))
+                detected_piece_h = int(round(p_h * scale))
+        except (TypeError, ValueError):
+            pass
 
+    if detected_piece_x is None:
+        left_sobel = sobel_x[:, :int(cw * 0.28)]
+        best_piece_score = -1.0
+        best_y0 = int(ch * 0.3)
+        best_x1, best_x2 = 0, 44
+
+        for y in range(10, ch - 48, 4):
+            band = left_sobel[y:y+44, :]
+            prof = band.mean(axis=0)
+            p_x1 = int(np.argmax(prof[:12]))
+            p_x2 = int(35 + np.argmax(prof[35:min(55, prof.shape[0])]))
+            score = float(prof[p_x1] + prof[p_x2])
+            if score > best_piece_score:
+                best_piece_score = score
+                best_y0 = y
+                best_x1, best_x2 = p_x1, p_x2
+
+        detected_piece_x = best_x1
+        detected_piece_y = best_y0
+        detected_piece_w = max(30, best_x2 - best_x1)
+        detected_piece_h = 44
+
+    # 4. Multi-stage feature extraction
+    # Inspect overall color saturation to differentiate natural photo puzzles (salads, goods) vs synthetic gray canvases
+    hsv = cv2.cvtColor(canvas_crop, cv2.COLOR_BGR2HSV)
+    mean_sat = float(np.mean(hsv[:, :, 1]))
+    is_natural_scene = mean_sat > 40.0
+
+    # Branch A: If natural colorful scene (e.g. salad, merchandise), prioritize Jigsaw Notch & Cutout Slot
+    if is_natural_scene:
+        piece_y0 = max(0, detected_piece_y)
+        piece_y1 = min(ch, detected_piece_y + detected_piece_h)
+        piece_w = detected_piece_w
+        band_prof = sobel_x[piece_y0:piece_y1, :].mean(axis=0)
+        gray_band = gray[piece_y0:piece_y1, :]
+
+        best_cand_x = None
+        best_cand_score = -1.0
+
+        for tx in range(int(cw * 0.35), cw - piece_w - 5):
+            edge_score = float(band_prof[tx] + band_prof[tx + piece_w])
+            window_darkness = float(255.0 - gray_band[:, tx:tx+piece_w].mean())
+            combined = edge_score * 1.0 + window_darkness * 1.2
+            if combined > best_cand_score:
+                best_cand_score = combined
+                best_cand_x = tx
+
+        if best_cand_x is not None and best_cand_x > detected_piece_x + 30:
+            target_x = float(best_cand_x)
+            piece_x = float(detected_piece_x)
             delta_x_phys = target_x - piece_x
-            method = "circular_receptacle"
-            confidence = 0.95
+            method = "jigsaw_notch"
+            confidence = 0.96
 
-    # Method 2: Colored Piece & Matching Slot (e.g. Red block & tablet slot)
+    # Method 1: Colored Piece & Matching Slot (for synthetic gray canvases)
     if method == "fallback":
         b, g, r = cv2.split(canvas_crop)
-        red_mask = (r > 130) & (r > g.astype(int) + 35) & (r > b.astype(int) + 35)
+        red_mask = (r > 150) & (r > g.astype(int) + 50) & (r > b.astype(int) + 50)
         red_mask[:, int(cw * 0.45):] = 0
         red_ys, red_xs = np.where(red_mask)
         if len(red_xs) > 30:
@@ -399,23 +434,70 @@ def solve_puzzle_cv(
                 method = "colored_piece_slot"
                 confidence = 0.94
 
-    # Method 3: Jigsaw Notch Contour
+    # Method 2: Circular Receptacle / Pit Insertion (e.g. Mortar & Pestle)
     if method == "fallback":
-        edges = cv2.Canny(gray, 40, 120)
-        cnts, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        notch_candidates = []
-        for cnt in cnts:
-            cx, cy, w, h = cv2.boundingRect(cnt)
-            aspect = w / max(1, h)
-            if cx > cw * 0.30 and 20 < w < 75 and 20 < h < 75 and 0.7 <= aspect <= 1.4:
-                notch_candidates.append((cx + w / 2, cy + h / 2))
-        if notch_candidates:
-            notch_candidates.sort(key=lambda c: c[0])
-            target_x = notch_candidates[0][0]
-            piece_x = cw * 0.15
+        blur = cv2.GaussianBlur(gray, (9, 9), 2)
+        circles = cv2.HoughCircles(
+            blur, cv2.HOUGH_GRADIENT,
+            dp=1.2, minDist=30,
+            param1=80, param2=30,
+            minRadius=int(ch * 0.15), maxRadius=int(ch * 0.55)
+        )
+        if circles is not None:
+            valid_circles = [c for c in circles[0] if c[0] > cw * 0.35]
+            if valid_circles:
+                best_circle = max(valid_circles, key=lambda c: c[2])
+                cx, cy, cr = float(best_circle[0]), float(best_circle[1]), float(best_circle[2])
+                search_r = int(cr * 0.45)
+                x1 = max(0, int(cx - search_r))
+                x2 = min(cw, int(cx + search_r))
+                y1 = max(0, int(cy - search_r))
+                y2 = min(ch, int(cy + search_r))
+                roi = gray[y1:y2, x1:x2]
+                if roi.size > 0:
+                    min_val, _, min_loc, _ = cv2.minMaxLoc(cv2.GaussianBlur(roi, (5, 5), 0))
+                    # Check for movable pestle on left
+                    left_roi = gray[:, :int(cw * 0.45)]
+                    edges_left = cv2.Canny(left_roi, 30, 100)
+                    cnts_left, _ = cv2.findContours(edges_left, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if cnts_left:
+                        best_cnt = max(cnts_left, key=cv2.contourArea)
+                        lx, ly, lw, lh = cv2.boundingRect(best_cnt)
+                        cand_target_x = float(x1 + min_loc[0]) if min_val < 90 else cx
+                        cand_piece_x = float(lx + lw)
+                        cand_delta = cand_target_x - cand_piece_x
+                        if cand_delta > 30 and min_val < 90:
+                            target_x = cand_target_x
+                            piece_x = cand_piece_x
+                            delta_x_phys = cand_delta
+                            method = "circular_receptacle"
+                            confidence = 0.95
+
+    # Method 3: Robust Jigsaw Notch & Cutout Slot (General Fallback)
+    if method == "fallback":
+        piece_y0 = max(0, detected_piece_y)
+        piece_y1 = min(ch, detected_piece_y + detected_piece_h)
+        piece_w = detected_piece_w
+        band_prof = sobel_x[piece_y0:piece_y1, :].mean(axis=0)
+        gray_band = gray[piece_y0:piece_y1, :]
+
+        best_cand_x = None
+        best_cand_score = -1.0
+
+        for tx in range(int(cw * 0.35), cw - piece_w - 5):
+            edge_score = float(band_prof[tx] + band_prof[tx + piece_w])
+            window_darkness = float(255.0 - gray_band[:, tx:tx+piece_w].mean())
+            combined = edge_score * 1.0 + window_darkness * 1.2
+            if combined > best_cand_score:
+                best_cand_score = combined
+                best_cand_x = tx
+
+        if best_cand_x is not None and best_cand_x > detected_piece_x + 20:
+            target_x = float(best_cand_x)
+            piece_x = float(detected_piece_x)
             delta_x_phys = target_x - piece_x
             method = "jigsaw_notch"
-            confidence = 0.88
+            confidence = 0.93
 
     # Method 4: Column Gradient Discontinuity Fallback
     if method == "fallback":
@@ -429,18 +511,32 @@ def solve_puzzle_cv(
         method = "gradient_column_fallback"
         confidence = 0.70
 
-    # Convert to CSS travel
-    travel_css = delta_x_phys / max(0.1, scale)
-    track_width_css = float(track_rect.get("width") if track_rect else (canvas_rect.get("width") if canvas_rect else 280))
-    handle_width_css = float(handle_rect.get("width") if handle_rect else 40)
-    max_travel_css = max(100.0, track_width_css - handle_width_css)
+    # 4. Convert to CSS travel with exact track-to-canvas scale ratio
+    canvas_css_w = float(canvas_rect.get("width") if canvas_rect else 280.0)
+    track_width_css = float(track_rect.get("width") if track_rect else canvas_css_w)
+    handle_width_css = float(handle_rect.get("width") if handle_rect else 40.0)
+    piece_css_w = float(detected_piece_w / max(0.1, scale)) if detected_piece_w else 44.0
 
-    bounded_travel = int(round(max(20.0, min(travel_css, max_travel_css - 5.0))))
+    max_piece_travel = max(10.0, canvas_css_w - piece_css_w)
+    max_handle_travel = max(50.0, track_width_css - handle_width_css)
+
+    # Only apply proportional scaling if track width materially differs from canvas width
+    if abs(track_width_css - canvas_css_w) > 5.0 and max_piece_travel > 0:
+        scale_ratio = max_handle_travel / max_piece_travel
+    else:
+        scale_ratio = 1.0
+
+    puzzle_travel_css = delta_x_phys / max(0.1, scale)
+    handle_travel_css = puzzle_travel_css * scale_ratio
+
+    bounded_travel = int(round(max(20.0, min(handle_travel_css, max_handle_travel - 3.0))))
 
     return {
         "ok": True,
         "travel": bounded_travel,
-        "max_travel": int(round(max_travel_css)),
+        "puzzle_travel": int(round(puzzle_travel_css)),
+        "max_travel": int(round(max_handle_travel)),
+        "scale_ratio": round(scale_ratio, 3),
         "method": method,
         "confidence": round(confidence, 2),
         "details": {

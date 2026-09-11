@@ -898,6 +898,7 @@ def _on_browser_ws_message(message: dict) -> None:
                 canvas_rect=params.get("canvas_rect"),
                 track_rect=params.get("track_rect"),
                 handle_rect=params.get("handle_rect"),
+                piece_rect=params.get("piece_rect"),
                 device_pixel_ratio=float(params.get("device_pixel_ratio") or 1.0),
             )
             _BROWSER_WS.send({"type": "cv.solve_puzzle.result", "id": msg_id, "result": result})
@@ -3597,6 +3598,7 @@ class _HelperHandler(BaseHTTPRequestHandler):
             canvas_rect = body.get("canvas_rect")
             track_rect = body.get("track_rect")
             handle_rect = body.get("handle_rect")
+            piece_rect = body.get("piece_rect")
             dpr = float(body.get("device_pixel_ratio") or 1.0)
 
             result = solve_puzzle_cv(
@@ -3604,6 +3606,7 @@ class _HelperHandler(BaseHTTPRequestHandler):
                 canvas_rect=canvas_rect,
                 track_rect=track_rect,
                 handle_rect=handle_rect,
+                piece_rect=piece_rect,
                 device_pixel_ratio=dpr,
             )
             _reply(200 if result.get("ok") else 400, result)

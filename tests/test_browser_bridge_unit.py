@@ -834,5 +834,66 @@ def test_solve_puzzle_cv_dpr_scaling():
     assert 130 <= res["travel"] <= 150
 
 
+def test_solve_puzzle_cv_jigsaw_notch():
+    import cv2
+    import numpy as np
+    from browser_bridge.captcha_detector import solve_puzzle_cv
+
+    # Create colorful natural scene (mean saturation > 40)
+    np.random.seed(42)
+    canvas = np.random.randint(50, 220, (150, 280, 3), dtype=np.uint8)
+    # Add strong color saturation (e.g. green vegetables and orange peppers)
+    canvas[:, :, 1] = np.clip(canvas[:, :, 1].astype(int) + 60, 0, 255).astype(np.uint8)
+
+    # Cutout piece at left: x=2..44, y=50..94
+    cv2.rectangle(canvas, (2, 50), (44, 94), (255, 255, 255), 2)
+    # Matching dark slot at right: x=172..214 (delta = 170px)
+    cv2.rectangle(canvas, (172, 50), (214, 94), (20, 20, 20), 2)
+    # Dark shadow inside slot
+    canvas[52:92, 174:212] = (canvas[52:92, 174:212] * 0.4).astype(np.uint8)
+
+    res = solve_puzzle_cv(
+        canvas,
+        canvas_rect={"x": 0, "y": 0, "width": 280, "height": 150},
+        track_rect={"x": 0, "y": 160, "width": 280, "height": 40},
+        handle_rect={"x": 0, "y": 160, "width": 40, "height": 40},
+        device_pixel_ratio=1.0,
+    )
+    assert res["ok"] is True
+    assert res["method"] == "jigsaw_notch"
+    assert res["confidence"] >= 0.90
+    assert 165 <= res["travel"] <= 175
+
+
+def test_solve_puzzle_cv_track_scaling():
+    import cv2
+    import numpy as np
+    from browser_bridge.captcha_detector import solve_puzzle_cv
+
+    canvas = np.random.randint(50, 220, (150, 280, 3), dtype=np.uint8)
+    canvas[:, :, 1] = np.clip(canvas[:, :, 1].astype(int) + 60, 0, 255).astype(np.uint8)
+    cv2.rectangle(canvas, (2, 50), (44, 94), (255, 255, 255), 2)
+    cv2.rectangle(canvas, (172, 50), (214, 94), (20, 20, 20), 2)
+    canvas[52:92, 174:212] = (canvas[52:92, 174:212] * 0.4).astype(np.uint8)
+
+    # Track width is 320px vs canvas 280px
+    # max_piece_travel = 280 - 42 = 238
+    # max_handle_travel = 320 - 40 = 280
+    # scale_ratio = 280 / 238 = 1.176
+    res = solve_puzzle_cv(
+        canvas,
+        canvas_rect={"x": 0, "y": 0, "width": 280, "height": 150},
+        track_rect={"x": 0, "y": 160, "width": 320, "height": 40},
+        handle_rect={"x": 0, "y": 160, "width": 40, "height": 40},
+        piece_rect={"x": 2, "y": 50, "width": 42, "height": 44},
+        device_pixel_ratio=1.0,
+    )
+    assert res["ok"] is True
+    assert res["scale_ratio"] > 1.10
+    # Scaled travel should be around 170 * 1.176 = ~200px
+    assert 190 <= res["travel"] <= 210
+
+
+
 
 
