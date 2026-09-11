@@ -856,6 +856,7 @@ def solve_puzzle_cv(
             method = "jigsaw_notch"
             confidence = 0.96
 
+    # Method 1: Colored Piece & Matching Slot (for synthetic gray canvases)
     # Method 1: Colored Piece & Matching Slot (for synthetic gray canvases with red polygon)
     if method == "fallback":
         b, g, r = cv2.split(canvas_crop)
@@ -887,8 +888,11 @@ def solve_puzzle_cv(
                 method = "colored_piece_slot"
                 confidence = 0.94
 
+    # Method 2: Circular Receptacle / Pit Insertion (e.g. Mortar & Pestle)
     # Method 2: Compartment Receptacle / Dispenser Slot Fitting (e.g. Dishwasher tablet into dispenser, tray into slot)
     if method == "fallback":
+        left_quarter = int(cw * 0.32)
+        left_gray = gray[:, :left_quarter]
         receptacle_res = solve_compartment_receptacle(
             canvas_crop,
             canvas_rect=canvas_rect,
@@ -899,6 +903,62 @@ def solve_puzzle_cv(
         )
         if receptacle_res.get("ok") and receptacle_res.get("confidence", 0) >= 0.90:
             return receptacle_res
+
+        # Detect bright or distinctive foreground object in left region (excluding full-background contours)
+        _, thresh_l = cv2.threshold(left_gray, 220, 255, cv2.THRESH_BINARY)
+        cnts_l, _ = cv2.findContours(thresh_l, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best_pl = None
+        max_pl_a = 0
+        for c in cnts_l:
+            a = cv2.contourArea(c)
+            x, y, w, h = cv2.boundingRect(c)
+            if a > 180 and 15 <= w <= int(left_quarter * 0.75) and 25 <= h <= int(ch * 0.85):
+                if a > max_pl_a:
+                    max_pl_a = a
+                    best_pl = (x, y, w, h)
+        if best_pl:
+            p_x_ref, _, p_w_ref, _ = best_pl
+        else:
+            p_w_ref = detected_piece_w if detected_piece_w else 34
+            p_x_ref = detected_piece_x if detected_piece_x is not None else 10
+
+        piece_center_x = float(p_x_ref + p_w_ref / 2.0)
+
+        min_rx = int(cw * 0.35)
+        max_rx = int(cw * 0.88)
+        right_roi = gray[:, min_rx:max_rx]
+
+        edges_right = cv2.Canny(right_roi, 30, 95)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        edges_closed = cv2.morphologyEx(edges_right, cv2.MORPH_CLOSE, kernel)
+        cnts_r, _ = cv2.findContours(edges_closed, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+        cavity_cands = []
+        for c in cnts_r:
+            x, y, w, h = cv2.boundingRect(c)
+            area = cv2.contourArea(c)
+            if (0.8 * p_w_ref <= w <= 2.4 * p_w_ref) and (15 <= h <= ch * 0.6) and area > 350 and (w >= 1.1 * h):
+                pad_x = max(2, int(w * 0.15))
+                pad_y = max(2, int(h * 0.15))
+                interior = right_roi[y+pad_y:y+h-pad_y, x+pad_x:x+w-pad_x]
+                if interior.size >= 25:
+                    std_dev = float(np.std(interior))
+                    if std_dev < 42:
+                        abs_x = min_rx + x
+                        cavity_center_x = abs_x + w / 2.0
+                        delta = cavity_center_x - piece_center_x
+                        if delta > 30:
+                            score = area / (std_dev + 5.0)
+                            cavity_cands.append((score, cavity_center_x, piece_center_x, delta))
+
+        if cavity_cands:
+            cavity_cands.sort(key=lambda item: item[0], reverse=True)
+            best_score, best_target_x, best_piece_x, best_delta = cavity_cands[0]
+            target_x = float(best_target_x)
+            piece_x = float(best_piece_x)
+            delta_x_phys = float(best_delta)
+            method = "compartment_receptacle"
+            confidence = 0.96
 
     # Method 3: Circular Receptacle / Pit Insertion (e.g. Mortar & Pestle)
     if method == "fallback":
