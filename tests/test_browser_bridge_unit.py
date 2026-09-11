@@ -894,6 +894,115 @@ def test_solve_puzzle_cv_track_scaling():
     assert 190 <= res["travel"] <= 210
 
 
+def test_solve_puzzle_cv_compartment_receptacle():
+    import cv2
+    import numpy as np
+    from browser_bridge.captcha_detector import solve_puzzle_cv
+
+    # Create synthetic compartment/drawer scene (e.g. dishwasher tablet into dispenser)
+    # Background light gray 280x157
+    canvas = np.full((157, 280, 3), 210, dtype=np.uint8)
+    # Movable tablet on left: x=17..49 (center ~33), y=20..100
+    cv2.rectangle(canvas, (17, 20), (49, 100), (245, 245, 245), -1)
+    cv2.rectangle(canvas, (17, 20), (49, 100), (80, 80, 80), 1)
+
+    # Receptacle dispenser cavity on right: x=114..178 (center ~146), y=60..100 (w=64, h=40)
+    cv2.rectangle(canvas, (114, 60), (178, 100), (160, 160, 160), -1)
+    cv2.rectangle(canvas, (114, 60), (178, 100), (50, 50, 50), 2)
+
+    res = solve_puzzle_cv(
+        canvas,
+        canvas_rect={"x": 0, "y": 0, "width": 280, "height": 157},
+        track_rect={"x": 0, "y": 170, "width": 280, "height": 40},
+        handle_rect={"x": 0, "y": 170, "width": 40, "height": 40},
+        device_pixel_ratio=1.0,
+    )
+    assert res["ok"] is True
+    assert res["method"] == "compartment_receptacle"
+    assert res["confidence"] >= 0.95
+    # Target center ~146, piece center ~33 -> delta ~113px
+    assert 105 <= res["travel"] <= 120
+
+
+def test_solve_compartment_receptacle_subpixel_and_adaptive_jitter():
+    import cv2
+    import numpy as np
+    from browser_bridge.captcha_detector import solve_compartment_receptacle
+
+    canvas = np.full((157, 280, 3), 210, dtype=np.uint8)
+    cv2.rectangle(canvas, (17, 20), (49, 100), (245, 245, 245), -1)
+    cv2.rectangle(canvas, (17, 20), (49, 100), (80, 80, 80), 1)
+    cv2.rectangle(canvas, (114, 60), (178, 100), (160, 160, 160), -1)
+    cv2.rectangle(canvas, (114, 60), (178, 100), (50, 50, 50), 2)
+
+    # Attempt 1: base delta
+    res1 = solve_compartment_receptacle(canvas, attempt=1)
+    assert res1["ok"] is True
+    assert res1["method"] == "compartment_receptacle"
+    assert res1["confidence"] >= 0.95
+    assert isinstance(res1["travel"], int)
+    assert isinstance(res1["travel_distance"], float)
+    assert "debug_info" in res1
+    dbg1 = res1["debug_info"]
+    assert "piece_box" in dbg1
+    assert "slot_box" in dbg1
+    assert "delta_center" in dbg1
+    assert "delta_edge" in dbg1
+    assert "delta_optimal" in dbg1
+    assert dbg1["retry_jitter"] == 0
+
+    base_travel = res1["travel"]
+
+    # Attempt 2: +4px jitter
+    res2 = solve_compartment_receptacle(canvas, attempt=2)
+    assert res2["debug_info"]["retry_jitter"] == 4
+    assert res2["travel"] == base_travel + 4
+
+    # Attempt 3: -4px jitter
+    res3 = solve_compartment_receptacle(canvas, attempt=3)
+    assert res3["debug_info"]["retry_jitter"] == -4
+    assert res3["travel"] == base_travel - 4
+
+    # Attempt 4: +8px jitter
+    res4 = solve_compartment_receptacle(canvas, attempt=4)
+    assert res4["debug_info"]["retry_jitter"] == 8
+    assert res4["travel"] == base_travel + 8
+
+    # Attempt 5: -8px jitter
+    res5 = solve_compartment_receptacle(canvas, attempt=5)
+    assert res5["debug_info"]["retry_jitter"] == -8
+    assert res5["travel"] == base_travel - 8
+
+
+def test_visualize_debug_output(tmp_path):
+    import numpy as np
+    from browser_bridge.captcha_detector import visualize_debug
+
+    dummy_canvas = np.full((150, 280, 3), 200, dtype=np.uint8)
+    dummy_res = {
+        "ok": True,
+        "travel": 128,
+        "travel_distance": 128.24,
+        "confidence": 0.96,
+        "method": "compartment_receptacle",
+        "debug_info": {
+            "piece_center": [46.1, 76.9],
+            "piece_box": [[39, 68], [56, 68], [56, 88], [39, 88]],
+            "slot_center": [175.1, 77.2],
+            "slot_box": [[148, 59], [220, 59], [220, 100], [148, 100]],
+            "delta_optimal": 128.24,
+            "retry_jitter": 0,
+            "attempt": 1,
+        },
+    }
+    out_file = tmp_path / "test_debug_viz.png"
+    ret = visualize_debug(dummy_canvas, dummy_res, out_file)
+    assert ret.is_file()
+    assert ret.stat().st_size > 500
+
+
+
+
 
 
 

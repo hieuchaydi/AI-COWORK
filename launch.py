@@ -3600,6 +3600,7 @@ class _HelperHandler(BaseHTTPRequestHandler):
             handle_rect = body.get("handle_rect")
             piece_rect = body.get("piece_rect")
             dpr = float(body.get("device_pixel_ratio") or 1.0)
+            attempt = int(body.get("attempt") or 1)
 
             result = solve_puzzle_cv(
                 screenshot_data=screenshot,
@@ -3608,6 +3609,7 @@ class _HelperHandler(BaseHTTPRequestHandler):
                 handle_rect=handle_rect,
                 piece_rect=piece_rect,
                 device_pixel_ratio=dpr,
+                attempt=attempt,
             )
             _reply(200 if result.get("ok") else 400, result)
             return

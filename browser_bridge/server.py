@@ -85,7 +85,7 @@ def _encode_frame(payload: bytes, opcode: int = 0x1) -> bytes:
     return head + bytes([127]) + struct.pack("!Q", size) + payload
 
 
-def _read_frame(source: socket.socket | _BufferedSocketReader, max_bytes: int = MAX_MESSAGE_BYTES) -> tuple[int, bytes]:
+def _read_frame_raw(source: socket.socket | _BufferedSocketReader, max_bytes: int = MAX_MESSAGE_BYTES) -> tuple[int, bytes, bool]:
     read_fn = source.read_exact if isinstance(source, _BufferedSocketReader) else lambda sz: _read_exact(source, sz)
 
     first, second = read_fn(2)
@@ -118,6 +118,32 @@ def _read_frame(source: socket.socket | _BufferedSocketReader, max_bytes: int = 
         payload[i] ^= mask[i % 4]
 
     return opcode, bytes(payload)
+    return opcode, bytes(payload), fin
+
+
+def _read_frame(source: socket.socket | _BufferedSocketReader, max_bytes: int = MAX_MESSAGE_BYTES) -> tuple[int, bytes]:
+    opcode, payload, fin = _read_frame_raw(source, max_bytes)
+    if fin or opcode in (0x8, 0x9, 0xA):
+        return opcode, payload
+
+    # Reassemble fragmented message
+    message_opcode = opcode
+    chunks = [payload]
+    total_size = len(payload)
+
+    while not fin:
+        cont_opcode, cont_payload, fin = _read_frame_raw(source, max_bytes - total_size)
+        if cont_opcode in (0x8, 0x9, 0xA):
+            # Interleaved control frame
+            return cont_opcode, cont_payload
+        if cont_opcode != 0x0:
+            raise WebSocketProtocolError(f"Expected continuation opcode 0x0, got {cont_opcode}")
+        chunks.append(cont_payload)
+        total_size += len(cont_payload)
+        if total_size > max_bytes:
+            raise WebSocketProtocolError(f"Fragmented message size {total_size} exceeds limit {max_bytes}")
+
+    return message_opcode, b"".join(chunks)
 
 
 class GatewayClientConnection:

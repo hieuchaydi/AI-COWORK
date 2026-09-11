@@ -295,6 +295,12 @@ class WebSocketTransport(BrowserTransport):
                 "tab.getActive",
                 "tab.open",
                 "tab.focus",
+                "page.screenshot",
+                "page.snapshot",
+                "dom.query",
+                "dom.queryAll",
+                "dom.getText",
+                "dom.getAttribute",
             )
             if action not in allowed_during_verification:
                 return False, None, BridgeError.create(

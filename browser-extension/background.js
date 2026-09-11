@@ -2124,6 +2124,43 @@ async function captureTabEvidence(tabId) {
       await new Promise((r) => setTimeout(r, 200));
     } catch {}
     return await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+
+    // 1. Thử capture qua chrome.tabs.captureVisibleTab
+    if (chrome.tabs?.captureVisibleTab) {
+      try {
+        const tab = await chrome.tabs.get(targetId);
+        if (tab?.windowId) {
+          await chrome.tabs.update(targetId, { active: true });
+          if (tab.windowId && chrome.windows) await chrome.windows.update(tab.windowId, { focused: true });
+          await new Promise((r) => setTimeout(r, 150));
+          const res = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+          if (res) return res;
+        }
+      } catch (tabsErr) {
+        console.warn("[bridge] captureVisibleTab failed, trying debugger fallback:", tabsErr?.message || tabsErr);
+      }
+    }
+
+    // 2. Dự phòng bằng Chrome Debugger API Page.captureScreenshot (luôn hoạt động)
+    if (chrome.debugger?.attach && chrome.debugger?.sendCommand && chrome.debugger?.detach) {
+      const target = { tabId: targetId };
+      let attached = false;
+      try {
+        await chrome.debugger.attach(target, "1.3");
+        attached = true;
+        const res = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", { format: "png" });
+        if (res?.data) {
+          return `data:image/png;base64,${res.data}`;
+        }
+      } catch (dbgErr) {
+        console.warn("[bridge] Debugger Page.captureScreenshot failed:", dbgErr?.message || dbgErr);
+      } finally {
+        if (attached) {
+          try { await chrome.debugger.detach(target); } catch {}
+        }
+      }
+    }
+    return null;
   } catch (err) {
     console.warn("[bridge] captureTabEvidence failed:", err?.message || err);
     return null;
@@ -2136,7 +2173,7 @@ async function captureTabEvidence(tabId) {
  * - Phân tích pixel cột canvas để định vị điểm nhấn màu đỏ (red notch) hoặc cạnh viền puzzle.
  * - Áp dụng hệ số tỉ lệ scale = trackUsableWidth / bgUsableWidth.
  */
-async function calculatePuzzleDistance(tabId, sliderInfo) {
+async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
   if (!tabId || !chrome.scripting?.executeScript) {
     const fallbackMax = Math.max(120, Number(sliderInfo?.width || 300) - 44);
     return Math.round(fallbackMax * 0.58);
@@ -2395,6 +2432,7 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
             track_rect: domInfo?.trackRect,
             handle_rect: domInfo?.handleRect,
             device_pixel_ratio: domInfo?.devicePixelRatio || 1,
+            attempt: Number(attempt || 1),
           }),
         });
         if (cvRes.ok) {
@@ -2447,8 +2485,8 @@ function generateHumanTrajectory(startX, startY, distance) {
     const currentX = Math.round(startX + (targetXWithOvershoot - startX) * ease);
 
     // Nhiễu cơ sinh học trục Y: bước đi quán tính lò xo hồi quy về trục thanh trượt
-    vy = vy * 0.55 + (Math.random() - 0.5) * 0.7;
-    vy += (startY - currentY) * 0.35;
+    vy = vy * 0.5 + (Math.random() - 0.5) * 1.8;
+    vy += (startY - currentY) * 0.3;
     currentY += vy;
     const jitterY = Math.round(Math.max(startY - 2, Math.min(startY + 2, currentY)));
 
@@ -2577,6 +2615,7 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
                 const s = (el.outerHTML || "").toLowerCase();
                 return s.includes("arrow") || s.includes("path");
                 return s.includes("arrow") || s.includes("chevron") || s.includes("right");
+                return s.includes("arrow") || s.includes("chevron") || s.includes("right") || s.includes("path");
               }
               return false;
             });
@@ -2722,8 +2761,12 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
         await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y, button: "left", buttons: 1 });
         await new Promise((r) => setTimeout(r, point.delay));
       }
+      await new Promise((r) => setTimeout(r, 90 + Math.random() * 40));
+      await new Promise((r) => setTimeout(r, 140 + Math.random() * 40));
       // Dừng nghỉ ổn định (Settle delay) để DOM và anti-bot script ghi nhận mảnh ghép đã khớp hoàn toàn
       await new Promise((r) => setTimeout(r, 150 + Math.random() * 50));
+      // Dừng nghỉ ổn định (Settle delay: 140-190ms) để DOM và anti-bot script ghi nhận mảnh ghép đã khớp hoàn toàn
+      await new Promise((r) => setTimeout(r, 140 + Math.random() * 50));
       await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: startY, button: "left", clickCount: 1 });
       return { attempted: true, method: "debugger", startX, startY, endX, distance };
     } catch (err) {
@@ -3238,13 +3281,12 @@ function startVerificationWatcher(details) {
         }
       } else {
         consecutiveAbsentCount = 0;
-        // Chế độ quan sát thụ động (Passive Handover): không tự ý drag bừa 240px làm hỏng CAPTCHA ghép hình.
-        // Thử tự động kéo thông minh tối đa 2 lần nếu CAPTCHA đang hiển thị
-        if (autoDragAttempts < 2) {
+        // Thử tự động kéo thông minh tối đa 5 lần (với micro-jitter +4px, -4px, +8px, -8px) nếu CAPTCHA đang hiển thị
+        if (autoDragAttempts < 5) {
           autoDragAttempts++;
           try {
-            console.log(`[bridge] CAPTCHA visible; attempting intelligent slider drag ${autoDragAttempts}/2 for job ${jid}...`);
-            // P1-1: Truyền attempt để tự động bù jitter offset ở lần thử thứ 2
+            console.log(`[bridge] CAPTCHA visible; attempting intelligent slider drag ${autoDragAttempts}/5 for job ${jid}...`);
+            // P1-1: Truyền attempt để tự động bù micro-jitter offset ở các lần thử tiếp theo
             const dragRes = await tryAutoDragShopeeCaptcha(targetTabId, check, { attempt: autoDragAttempts });
             console.log("[bridge] Intelligent slider drag result:", dragRes);
             if (dragRes?.attempted) {
@@ -3256,7 +3298,7 @@ function startVerificationWatcher(details) {
             console.warn("[bridge] Auto-drag attempt failed:", err?.message || err);
           }
         }
-        // Chế độ quan sát thụ động (Passive Handover): Nếu sau 2 lần tự động chưa khớp, nhường quyền kéo tay cho người dùng
+        // Chế độ quan sát thụ động (Passive Handover): Nếu sau 5 lần tự động chưa khớp, nhường quyền kéo tay cho người dùng
         if (check?.slider?.isOrangeHandle) {
           console.log(`[bridge] Passive handover: Shopee orange slider button active at (${check.slider.x}, ${check.slider.y}). Chờ người dùng thao tác kéo...`);
         }
@@ -3817,10 +3859,34 @@ async function handleAction(action, params) {
           await new Promise((r) => setTimeout(r, 150));
         } catch {}
       }
-      const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-        format: params.format === "jpeg" ? "jpeg" : "png",
-        quality: params.quality,
-      });
+      let dataUrl = null;
+      try {
+        dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
+          format: params.format === "jpeg" ? "jpeg" : "png",
+          quality: params.quality,
+        });
+      } catch (capErr) {
+        if (chrome.debugger?.attach && chrome.debugger?.sendCommand && chrome.debugger?.detach) {
+          const target = { tabId: targetTabId };
+          let attached = false;
+          try {
+            await chrome.debugger.attach(target, "1.3");
+            attached = true;
+            const res = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
+              format: params.format === "jpeg" ? "jpeg" : "png",
+              quality: params.quality,
+            });
+            if (res?.data) {
+              dataUrl = `data:image/${params.format === "jpeg" ? "jpeg" : "png"};base64,${res.data}`;
+            }
+          } catch {} finally {
+            if (attached) {
+              try { await chrome.debugger.detach(target); } catch {}
+            }
+          }
+        }
+        if (!dataUrl) throw capErr;
+      }
       return {
         status: "ok",
         tabId: targetTabId,
@@ -4329,10 +4395,8 @@ async function connectBridge() {
         "takeover",
       ]);
       if (!current()) return;
+      let wsUrl = stored.gatewayUrl || "ws://127.0.0.1:8766/browser/v1/ws";
       if (stored.connectionEnabled === false) {
-        connectionEnabled = false;
-        closeBridgeSocket({ rejectPending: true });
-        return;
         let shouldAutoRecover = false;
         if (stored.connectionConflict) {
           try {
@@ -4363,7 +4427,7 @@ async function connectBridge() {
         });
       }
       let token = stored.pairingToken;
-      let wsUrl = stored.gatewayUrl || "ws://127.0.0.1:8766/browser/v1/ws";
+      wsUrl = stored.gatewayUrl || wsUrl;
       const clientId = stored.clientId || crypto.randomUUID();
       const takeover = stored.takeover === true;
       const target = new URL(wsUrl);
