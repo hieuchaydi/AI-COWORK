@@ -2512,8 +2512,9 @@ class _HelperHandler(BaseHTTPRequestHandler):
 
     def _cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Bridge-Client, X-Bridge-Token, Authorization")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS,HEAD")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Bridge-Client, X-Bridge-Token, Authorization, Range")
+        self.send_header("Access-Control-Expose-Headers", "Content-Range, Accept-Ranges, Content-Length, Content-Disposition")
         # Private Network Access: a page on a public origin (shopee.vn) POSTing to
         # http://127.0.0.1 gets a preflight that Chrome fails WITHOUT this header —
         # the /ingest bookmarklet dies silently otherwise.
@@ -2566,6 +2567,130 @@ class _HelperHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_file(self, file_path: Path, is_head: bool = False, as_attachment: bool = False) -> None:
+        if not file_path.is_file():
+            self.send_response(404)
+            self._cors()
+            self.end_headers()
+            if not is_head:
+                self.wfile.write(b"not found")
+            return
+
+        ext = file_path.suffix.lower()
+        ctype = {
+            ".zip": "application/zip",
+            ".mp4": "video/mp4",
+            ".webm": "video/webm",
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
+            ".pdf": "application/pdf",
+            ".csv": "text/csv; charset=utf-8",
+            ".json": "application/json; charset=utf-8",
+            ".html": "text/html; charset=utf-8",
+            ".md": "text/markdown; charset=utf-8",
+            ".txt": "text/plain; charset=utf-8",
+            ".svg": "image/svg+xml",
+        }.get(ext, "application/octet-stream")
+
+        try:
+            file_size = file_path.stat().st_size
+        except OSError:
+            self.send_response(404)
+            self._cors()
+            self.end_headers()
+            return
+
+        range_header = self.headers.get("Range")
+        start = 0
+        end = file_size - 1
+        status_code = 200
+
+        if range_header and range_header.strip().startswith("bytes=") and file_size > 0:
+            try:
+                ranges = range_header.strip()[6:].split("-")
+                r_start = ranges[0].strip()
+                r_end = ranges[1].strip() if len(ranges) > 1 else ""
+                if r_start:
+                    start = int(r_start)
+                    if r_end:
+                        end = min(int(r_end), file_size - 1)
+                elif r_end:
+                    start = max(0, file_size - int(r_end))
+                if 0 <= start <= end < file_size:
+                    status_code = 206
+                else:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{file_size}")
+                    self._cors()
+                    self.end_headers()
+                    return
+            except (ValueError, IndexError):
+                start = 0
+                end = file_size - 1
+                status_code = 200
+
+        content_length = max(0, end - start + 1) if file_size > 0 else 0
+        self.send_response(status_code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(content_length))
+        self.send_header("Accept-Ranges", "bytes")
+        if status_code == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+        if as_attachment or ext == ".zip":
+            self.send_header("Content-Disposition", f'attachment; filename="{file_path.name}"')
+        self._cors()
+        self.end_headers()
+
+        if is_head or file_size == 0:
+            return
+
+        try:
+            with open(file_path, "rb") as f:
+                if start > 0:
+                    f.seek(start)
+                remaining = content_length
+                bufsize = 64 * 1024
+                while remaining > 0:
+                    chunk = f.read(min(remaining, bufsize))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        if self.path.startswith("/outputs/"):
+            rel = urllib.parse.unquote(self.path[len("/outputs/"):].split("?")[0])
+            if ".." in rel:
+                self.send_response(400)
+                self.end_headers()
+                return
+            out_file = (_outputs_root() / rel).resolve()
+            try:
+                out_file.relative_to(_outputs_root())
+            except ValueError:
+                self.send_response(403)
+                self.end_headers()
+                return
+            self._send_file(out_file, is_head=True, as_attachment=out_file.suffix.lower() == ".zip")
+            return
+        if self.path.startswith("/artifacts/"):
+            fname = self.path[len("/artifacts/"):].split("?")[0]
+            art_path = ROOT / "artifacts" / fname
+            if ".." in fname:
+                self.send_response(400)
+                self.end_headers()
+                return
+            self._send_file(art_path, is_head=True)
+            return
+        self.send_response(200)
+        self._cors()
+        self.end_headers()
+
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(204)
         self._cors()
@@ -2592,28 +2717,12 @@ class _HelperHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/artifacts/"):
             fname = self.path[len("/artifacts/"):].split("?")[0]
             art_path = ROOT / "artifacts" / fname
-            if ".." in fname or not art_path.is_file():
-                self.send_response(404)
-                self._cors()
+            if ".." in fname:
+                self.send_response(400)
                 self.end_headers()
-                self.wfile.write(b"not found")
+                self.wfile.write(b"invalid path")
                 return
-            ext = art_path.suffix.lower()
-            ctype = {
-                ".html": "text/html; charset=utf-8",
-                ".md": "text/markdown; charset=utf-8",
-                ".txt": "text/plain; charset=utf-8",
-                ".json": "application/json; charset=utf-8",
-                ".csv": "text/csv; charset=utf-8",
-                ".svg": "image/svg+xml",
-            }.get(ext, "application/octet-stream")
-            data = art_path.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(data)))
-            self._cors()
-            self.end_headers()
-            self.wfile.write(data)
+            self._send_file(art_path, is_head=False)
             return
 
         # /outputs/<kind>/<file> — serve files from outputs/ (zips, csv, media, etc.)
@@ -2634,40 +2743,7 @@ class _HelperHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b"forbidden")
                 return
 
-            if not out_file.is_file():
-                self.send_response(404)
-                self._cors()
-                self.end_headers()
-                self.wfile.write(b"not found")
-                return
-
-            ext = out_file.suffix.lower()
-            ctype = {
-                ".zip": "application/zip",
-                ".mp4": "video/mp4",
-                ".webm": "video/webm",
-                ".png": "image/png",
-                ".jpg": "image/jpeg",
-                ".jpeg": "image/jpeg",
-                ".webp": "image/webp",
-                ".gif": "image/gif",
-                ".pdf": "application/pdf",
-                ".csv": "text/csv; charset=utf-8",
-                ".json": "application/json; charset=utf-8",
-                ".html": "text/html; charset=utf-8",
-                ".md": "text/markdown; charset=utf-8",
-                ".txt": "text/plain; charset=utf-8",
-            }.get(ext, "application/octet-stream")
-
-            data = out_file.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(data)))
-            if ext == ".zip":
-                self.send_header("Content-Disposition", f'attachment; filename="{out_file.name}"')
-            self._cors()
-            self.end_headers()
-            self.wfile.write(data)
+            self._send_file(out_file, is_head=False, as_attachment=out_file.suffix.lower() == ".zip")
             return
         if self.path == "/artifacts":
             # Simple JSON index of all artifacts.
