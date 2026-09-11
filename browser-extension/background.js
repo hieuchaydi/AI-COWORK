@@ -4398,22 +4398,20 @@ async function connectBridge() {
       let wsUrl = stored.gatewayUrl || "ws://127.0.0.1:8766/browser/v1/ws";
       if (stored.connectionEnabled === false) {
         let shouldAutoRecover = false;
-        if (stored.connectionConflict) {
-          try {
-            const statusUrl = new URL(wsUrl || "ws://127.0.0.1:8766/browser/v1/ws");
-            statusUrl.protocol = statusUrl.protocol === "wss:" ? "https:" : "http:";
-            if (statusUrl.port === "8767") statusUrl.port = "8766";
-            statusUrl.pathname = "/browser/status";
-            statusUrl.search = statusUrl.hash = "";
-            const statusRes = await fetch(statusUrl.toString(), { cache: "no-store" });
-            if (statusRes.ok) {
-              const statusData = await statusRes.json();
-              if (statusData && statusData.connected === false) {
-                shouldAutoRecover = true;
-              }
+        try {
+          const statusUrl = new URL(wsUrl || "ws://127.0.0.1:8766/browser/v1/ws");
+          statusUrl.protocol = statusUrl.protocol === "wss:" ? "https:" : "http:";
+          if (statusUrl.port === "8767") statusUrl.port = "8766";
+          statusUrl.pathname = "/browser/status";
+          statusUrl.search = statusUrl.hash = "";
+          const statusRes = await fetch(statusUrl.toString(), { cache: "no-store" });
+          if (statusRes.ok) {
+            const statusData = await statusRes.json();
+            if (statusData && statusData.connected === false) {
+              shouldAutoRecover = true;
             }
-          } catch {}
-        }
+          }
+        } catch {}
         if (!shouldAutoRecover) {
           connectionEnabled = false;
           closeBridgeSocket({ rejectPending: true });
@@ -4680,7 +4678,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === "autoPair") {
     connectionGeneration++;
     connectionEnabled = true;
-    chrome.storage.local.set({ connectionEnabled: true, connectionConflict: null, lastConnectionError: "" }, () => {
+    const updates = { connectionEnabled: true, connectionConflict: null, lastConnectionError: "" };
+    if (typeof msg.url === "string" && msg.url.trim()) {
+      updates.gatewayUrl = msg.url.trim();
+    }
+    chrome.storage.local.set(updates, () => {
       connectBridge();
     });
     sendResponse({ ok: true });
