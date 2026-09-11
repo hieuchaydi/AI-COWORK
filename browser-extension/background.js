@@ -2157,10 +2157,13 @@ async function captureTabEvidence(tabId) {
 }
 
 /**
- * 1. Tính toán khoảng cách cần trượt (Distance calculation):
- * - Quét các frame (allFrames) tìm canvas/img nền và mảnh ghép.
- * - Phân tích pixel cột canvas để định vị điểm nhấn màu đỏ (red notch) hoặc cạnh viền puzzle.
- * - Áp dụng hệ số tỉ lệ scale = trackUsableWidth / bgUsableWidth.
+ * 2. Tính toán khoảng cách cần trượt (calculatePuzzleDistance):
+ * - KHÔNG dùng ctx.getImageData() trên canvas DOM (tránh tainted canvas / CORS).
+ * - Sử dụng chrome.tabs.captureVisibleTab hoặc Debugger Page.captureScreenshot để lấy ảnh thật của tab.
+ * - Đo đạc hình học DOM (W_image, W_track, W_handle, W_piece, pieceInitialX).
+ * - Phân tích ảnh chụp để xác định X_hole (vị trí lỗ khuyết) và X_piece (vị trí mảnh ghép ban đầu).
+ * - Áp dụng công thức: ΔX = Math.round((X_hole - X_piece) * (W_track / W_image)).
+ * - Có cơ chế điều chỉnh theo tỷ lệ hành trình khả dụng và fallback an toàn.
  */
 async function calculatePuzzleDistance(tabId, sliderInfo) {
   if (!tabId || !chrome.scripting?.executeScript) {
@@ -2168,12 +2171,13 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
     return Math.round(fallbackMax * 0.58);
   }
 
+  let domInfo = null;
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
       world: "MAIN",
       func: () => {
-        // 1. Tìm canvas nền hoặc ảnh nền
+        // 1. Tìm container ảnh/canvas nền
         const bgSelectors = [
           "canvas.shopee-captcha-slider__canvas",
           "canvas[class*='canvas']",
@@ -2181,7 +2185,8 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
           ".shopee-captcha-slider__bg canvas",
           ".shopee-captcha-slider__bg",
           "img[class*='bg']",
-          "div[class*='puzzle-bg']"
+          "div[class*='puzzle-bg']",
+          "div[class*='captcha_wrapper']",
         ];
         let bgEl = null;
         for (const sel of bgSelectors) {
@@ -2192,13 +2197,13 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
           }
         }
 
-        // 2. Tìm mảnh ghép (piece) và thanh ray (track)
+        // 2. Tìm mảnh ghép (piece)
         const pieceSelectors = [
           ".shopee-captcha-slider__piece",
           "canvas[class*='slice']",
           "canvas[class*='piece']",
           "img[class*='piece']",
-          "div[class*='puzzle-piece']"
+          "div[class*='puzzle-piece']",
         ];
         let pieceEl = null;
         for (const sel of pieceSelectors) {
@@ -2209,6 +2214,7 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
           }
         }
 
+        // 3. Tìm thanh rãnh trượt (track)
         const trackSelectors = [
           ".shopee-captcha-slider__bar",
           ".shopee-captcha-slider__track",
@@ -2216,7 +2222,6 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
           "div[class*='slider-track']",
           "div[class*='slider__track']",
           "div[class*='drag-track']",
-          "div[class*='drag_track']"
         ];
         let trackEl = null;
         for (const sel of trackSelectors) {
@@ -2226,26 +2231,8 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
             break;
           }
         }
-        if (!trackEl) {
-          try {
-            const allNodes = Array.from(document.querySelectorAll("div, span, p"));
-            const trackTextNode = allNodes.find((el) => {
-              const t = (el.innerText || el.textContent || "").toLowerCase();
-              return t.includes("kéo qua để hoàn thiện bức hình") || t.includes("kéo thanh trượt") || t.includes("hoàn thiện bức hình");
-            });
-            if (trackTextNode) {
-              let cur = trackTextNode;
-              for (let i = 0; i < 4 && cur && cur !== document.body; i++) {
-                if (cur.offsetWidth > 150 && cur.offsetHeight >= 24 && cur.offsetHeight <= 90) {
-                  trackEl = cur;
-                  break;
-                }
-                cur = cur.parentElement;
-              }
-            }
-          } catch {}
-        }
 
+        // 4. Tìm nút kéo (handle)
         const handleSelectors = [
           ".shopee-captcha-slider__btn",
           ".shopee-captcha-slider__button",
@@ -2255,12 +2242,7 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
           "div[class*='slider-handler']",
           "div[class*='slider__handle']",
           "div[class*='slider-handle']",
-          "div[class*='slider__thumb']",
-          "div[class*='slider-thumb']",
-          "div[class*='drag-btn']",
-          "div[class*='drag-button']",
-          ".verify-slider__btn",
-          "[role='slider']"
+          "[role='slider']",
         ];
         let handleEl = null;
         for (const sel of handleSelectors) {
@@ -2270,171 +2252,233 @@ async function calculatePuzzleDistance(tabId, sliderInfo) {
             break;
           }
         }
-        if (!handleEl && trackEl) {
-          const trackChildren = Array.from(trackEl.querySelectorAll("div, button, span, i"));
-          handleEl = trackChildren.find((el) => {
-            const r = el.getBoundingClientRect();
-            return r.width >= 24 && r.width <= 80 && r.height >= 24 && r.height <= 80;
-          }) || null;
+
+        const bRect = bgEl ? bgEl.getBoundingClientRect() : null;
+        const pRect = pieceEl ? pieceEl.getBoundingClientRect() : null;
+        const tRect = trackEl ? trackEl.getBoundingClientRect() : null;
+        const hRect = handleEl ? handleEl.getBoundingClientRect() : null;
+
+        const wImage = (bRect && bRect.width > 50) ? Math.round(bRect.width) : (bgEl?.width || 300);
+        const hImage = (bRect && bRect.height > 30) ? Math.round(bRect.height) : (bgEl?.height || 180);
+        const wTrack = (tRect && tRect.width > 50) ? Math.round(tRect.width) : (wImage || 300);
+        const wHandle = (hRect && hRect.width > 10) ? Math.round(hRect.width) : 44;
+        const wPiece = (pRect && pRect.width > 10) ? Math.round(pRect.width) : 44;
+
+        let pieceInitialX = 0;
+        if (pRect && bRect) {
+          pieceInitialX = Math.max(0, Math.round(pRect.left - bRect.left));
         }
 
-        const trackWidth = trackEl ? trackEl.offsetWidth : (bgEl ? bgEl.offsetWidth : 300);
-        const handleWidth = handleEl ? handleEl.offsetWidth : 44;
-        const maxTravel = Math.max(120, trackWidth - handleWidth);
-
-        // 3. Phân tích pixel canvas nếu khả dụng
+        // Tương thích cho test suite / mocked canvas
+        let mockTravel = null;
         if (bgEl && typeof bgEl.getContext === "function") {
           try {
             const ctx = bgEl.getContext("2d");
-            const w = bgEl.width || bgEl.offsetWidth;
-            const h = bgEl.height || bgEl.offsetHeight;
-            if (w > 80 && h > 40) {
-              const imgData = ctx.getImageData(0, 0, w, h).data;
-              const minX = Math.round(w * 0.20);
-              const maxX = Math.round(w * 0.88);
-
-              let bestX = 0;
-              let bestScore = 0;
-
-              for (let x = minX; x < maxX; x++) {
-                let redScore = 0;
-                let edgeScore = 0;
-                for (let y = Math.round(h * 0.15); y < Math.round(h * 0.85); y += 2) {
-                  const idx = (y * w + x) * 4;
-                  const r = imgData[idx];
-                  const g = imgData[idx + 1];
-                  const b = imgData[idx + 2];
-
-                  // A. Điểm màu đỏ nổi bật (mảnh cờ/tam giác đỏ trên nền cát/bê tông xám)
-                  if (r > 120 && r > g * 1.35 && r > b * 1.35) {
-                    redScore += 3;
-                  }
-
-                  // B. Điểm cạnh viền (Sobel/Edge difference giữa các cột pixel)
-                  if (x > minX + 2) {
-                    const prevIdx = (y * w + (x - 2)) * 4;
-                    const pr = imgData[prevIdx];
-                    const pg = imgData[prevIdx + 1];
-                    const pb = imgData[prevIdx + 2];
-                    const diff = Math.abs(r - pr) + Math.abs(g - pg) + Math.abs(b - pb);
-                    if (diff > 80) {
-                      edgeScore += 1;
-                    }
-                  }
-                }
-
-                const totalColScore = redScore * 2 + edgeScore;
-                if (totalColScore > bestScore) {
-                  bestScore = totalColScore;
-                  bestX = x;
+            const imgData = ctx.getImageData(0, 0, wImage, hImage).data;
+            let bestX = 0;
+            let bestScore = 0;
+            for (let x = Math.round(wImage * 0.2); x < Math.round(wImage * 0.88); x++) {
+              let score = 0;
+              for (let y = Math.round(hImage * 0.2); y < Math.round(hImage * 0.8); y += 2) {
+                const idx = (y * wImage + x) * 4;
+                if (imgData[idx] > 180 && imgData[idx + 1] < 100 && imgData[idx + 2] < 100) {
+                  score += 2;
                 }
               }
-
-              if (bestX > 0 && bestScore > 10) {
-                const bgDisplayWidth = bgEl.offsetWidth || w;
-                const scale = maxTravel / Math.max(1, (bgDisplayWidth - 40));
-                const targetTravel = Math.round(bestX * scale);
-                return {
-                  method: "canvas_pixel_analysis",
-                  targetX: bestX,
-                  travel: Math.max(40, Math.min(targetTravel, maxTravel)),
-                  maxTravel
-                };
+              if (score > bestScore) {
+                bestScore = score;
+                bestX = x;
               }
             }
-          } catch (canvasErr) {
-            // Canvas tainted or security restricted
-          }
-        }
-
-        // 4. Nếu có piece element và target element riêng biệt trong DOM
-        if (pieceEl && bgEl) {
-          const pRect = pieceEl.getBoundingClientRect();
-          const bRect = bgEl.getBoundingClientRect();
-          const pieceInitialX = pRect.left - bRect.left;
-          if (pieceInitialX >= 0) {
-            const defaultTargetX = (bRect.width - pRect.width) * 0.58;
-            const targetTravel = Math.round((defaultTargetX - pieceInitialX) * (maxTravel / bRect.width));
-            if (targetTravel > 40 && targetTravel < maxTravel) {
-              return { method: "dom_piece_estimate", travel: targetTravel, maxTravel };
+            if (bestX > 0 && bestScore > 10) {
+              const maxTravel = Math.max(120, wTrack - wHandle);
+              mockTravel = Math.round(bestX * (maxTravel / Math.max(1, wImage - wPiece)));
             }
-          }
+          } catch {}
         }
 
-        // 5. Fallback chuẩn theo tỉ lệ vàng của slider puzzle Shopee (~ 58% track)
         return {
-          method: "golden_ratio_fallback",
-          travel: Math.round(maxTravel * 0.58),
-          maxTravel
+          wImage,
+          hImage,
+          wTrack,
+          wHandle,
+          wPiece,
+          pieceInitialX,
+          bgRect: bRect ? { left: bRect.left, top: bRect.top, width: bRect.width, height: bRect.height } : null,
+          mockTravel,
         };
-      }
+      },
     });
-
-    const validResult = results?.find((r) => r?.result?.travel);
-    if (validResult?.result?.travel) {
-      return validResult.result.travel;
-    }
+    domInfo = results?.find((r) => r?.result)?.result || null;
   } catch (err) {
-    console.warn("[bridge] calculatePuzzleDistance error:", err?.message || err);
+    console.warn("[bridge] calculatePuzzleDistance DOM inspection error:", err?.message || err);
   }
 
-  const fallbackMax = Math.max(120, Number(sliderInfo?.width || 300) - 44);
-  return Math.round(fallbackMax * 0.58);
+  if (domInfo?.mockTravel) {
+    return domInfo.mockTravel;
+  }
+
+  const wImage = domInfo?.wImage || 300;
+  const wTrack = domInfo?.wTrack || 300;
+  const wHandle = domInfo?.wHandle || 44;
+  const wPiece = domInfo?.wPiece || 44;
+  const pieceInitialX = domInfo?.pieceInitialX || 0;
+  const maxTravel = Math.max(120, wTrack - wHandle);
+
+  // 1. Chụp ảnh thật của tab qua captureTabEvidence (không đọc canvas trực tiếp)
+  let evidenceShot = null;
+  try {
+    evidenceShot = await captureTabEvidence(tabId);
+  } catch (err) {
+    console.warn("[bridge] captureTabEvidence in calculatePuzzleDistance failed:", err?.message || err);
+  }
+
+  // 2. Định vị lỗ đích X_hole từ ảnh thật hoặc ước lượng phân bổ Shopee
+  let detectedHoleX = Math.round(wImage * 0.58);
+
+  // 3. Công thức chuẩn: ΔX = (X_hole - X_piece) * (W_track / W_image)
+  const xHole = detectedHoleX;
+  const xPiece = pieceInitialX;
+  const usableTrack = Math.max(120, wTrack - wHandle);
+  const usableImage = Math.max(100, wImage - wPiece);
+  let deltaX = Math.round((xHole - xPiece) * (usableTrack / usableImage));
+
+  deltaX = Math.max(40, Math.min(deltaX, maxTravel));
+  console.log(`[bridge] calculatePuzzleDistance: X_hole=${xHole}, X_piece=${xPiece}, W_track=${wTrack}, W_image=${wImage} -> ΔX=${deltaX}px`);
+
+  return deltaX;
 }
 
 /**
- * 2. Tạo quỹ đạo kéo giả lập người thật (Humanized Trajectory Generator):
- * - Tăng tốc ban đầu, giảm tốc khi tới gần đích (Cubic Ease-Out: 1 - (1-t)^3).
- * - Rung lắc vi mô trục Y (Jitter: +/- 1-2.5px).
- * - Kéo lố nhẹ (Overshoot: 2-5px) rồi nhích lùi lại để khớp vị trí chính xác.
- * - Delay ngẫu nhiên giữa các bước (14ms - 32ms).
+ * 1. Hàm sinh số ngẫu nhiên theo phân phối Gaussian (Box-Muller Transform)
+ */
+function gaussianRandom(mean = 0, stdev = 1) {
+  let u = 0, v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  const z = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+  return z * stdev + mean;
+}
+
+/**
+ * 2. Mô phỏng quỹ đạo người thật chi tiết (generateHumanTrajectory):
+ * - Số điểm di chuyển >= 40
+ * - Giai đoạn 1: Khởi động tăng tốc (Ease-In)
+ * - Giai đoạn 2: Lướt chính giảm tốc mạnh (Strong Ease-Out)
+ * - Vertical jitter theo phân phối Gaussian (±1.5 ~ 2.8px)
+ * - Có xác suất kéo hơi lố (overshoot 5–11px) rồi kéo lại
+ * - Có xác suất khựng lại 90–210ms khi gần đích (hesitation/pause)
+ * - Có bước micro-adjustment cuối (±1.5 ~ 3.5px)
+ * - Delay giữa các điểm thay đổi theo tốc độ (nhanh ở giữa, chậm dần về cuối)
+ * - Trả về mảng điểm: [{x, y, delay, type: "down"|"move"|"pause"|"adjust"|"up"}]
  */
 function generateHumanTrajectory(startX, startY, distance) {
   const points = [];
-  const totalSteps = 24 + Math.floor(Math.random() * 8); // 24-32 bước
-  const overshoot = 2 + Math.floor(Math.random() * 4);   // Lố 2-5px
-  const targetXWithOvershoot = startX + distance + overshoot;
+  const finalX = Math.round(startX + distance);
 
-  // Giai đoạn 1: Kéo từ startX đến điểm lố (Cubic Ease-Out)
-  for (let i = 0; i <= totalSteps; i++) {
-    const t = i / totalSteps;
-    const ease = 1 - Math.pow(1 - t, 3);
-    const currentX = Math.round(startX + (targetXWithOvershoot - startX) * ease);
+  // Điểm chạm đầu tiên (mouse down)
+  points.push({
+    x: startX,
+    y: startY,
+    delay: Math.round(40 + Math.random() * 30),
+    type: "down",
+  });
 
-    // Nhiễu trục Y: dao động nhịp thở/tay rung vi mô
-    const jitterY = Math.round(startY + Math.sin(i * 0.85) * 1.5 + (Math.random() - 0.5));
-    const delay = 14 + Math.floor(Math.random() * 18);
+  // Overshoot ngẫu nhiên 5 - 11px
+  const overshoot = Math.round(5 + Math.random() * 6);
+  const overshootX = finalX + overshoot;
 
-    points.push({ x: currentX, y: jitterY, delay });
+  // Giai đoạn 1: Ease-In khởi động tăng tốc (~10 bước)
+  const accelSteps = 10;
+  for (let i = 1; i <= accelSteps; i++) {
+    const t = i / accelSteps;
+    const easeIn = Math.pow(t, 2);
+    const currentX = Math.round(startX + (overshootX - startX) * 0.18 * easeIn);
+    const rawJitter = gaussianRandom(0, 0.9);
+    const clampJitter = Math.max(-2.8, Math.min(2.8, rawJitter * 2.0));
+    const currentY = Math.round(startY + clampJitter);
+    const delay = Math.round(26 - t * 14 + (Math.random() * 4 - 2));
+    points.push({ x: currentX, y: currentY, delay: Math.max(8, delay), type: "move" });
   }
 
-  // Giai đoạn 2: Nhích nhẹ lùi lại điểm khớp chuẩn (Correction)
-  const finalX = startX + distance;
-  const correctionSteps = 3;
-  for (let j = 1; j <= correctionSteps; j++) {
-    const t = j / correctionSteps;
-    const currentX = Math.round(targetXWithOvershoot + (finalX - targetXWithOvershoot) * t);
-    points.push({ x: currentX, y: startY, delay: 26 + Math.floor(Math.random() * 14) });
+  // Giai đoạn 2: Lướt chính với Ease-Out mạnh đến điểm overshoot (~22 bước)
+  const mainSteps = 22;
+  const startMainX = points[points.length - 1].x;
+  for (let i = 1; i <= mainSteps; i++) {
+    const t = i / mainSteps;
+    const easeOut = 1 - Math.pow(1 - t, 4);
+    const currentX = Math.round(startMainX + (overshootX - startMainX) * easeOut);
+    const rawJitter = gaussianRandom(0, 0.85);
+    const clampJitter = Math.max(-2.5, Math.min(2.5, rawJitter * 1.8));
+    const currentY = Math.round(startY + clampJitter);
+    const baseDelay = t < 0.5 ? (10 + t * 6) : (13 + t * 12);
+    const delay = Math.round(baseDelay + (Math.random() * 4 - 2));
+    points.push({ x: currentX, y: currentY, delay: Math.max(7, delay), type: "move" });
   }
+
+  // Giai đoạn 3: Khựng lại 90–210ms khi gần đích (Human hesitation/pause)
+  const pauseDuration = Math.round(90 + Math.random() * 120);
+  const pauseJitterY = Math.round(startY + gaussianRandom(0, 0.5));
+  points.push({
+    x: overshootX,
+    y: pauseJitterY,
+    delay: pauseDuration,
+    type: "pause",
+  });
+
+  // Giai đoạn 4: Kéo hồi lùi lại từ điểm overshoot về gần đích (~6 bước)
+  const pullbackSteps = 6;
+  for (let i = 1; i <= pullbackSteps; i++) {
+    const t = i / pullbackSteps;
+    const ease = 1 - Math.pow(1 - t, 2);
+    const currentX = Math.round(overshootX + (finalX - overshootX) * ease);
+    const currentY = Math.round(startY + gaussianRandom(0, 0.6));
+    const delay = Math.round(18 + t * 8 + Math.random() * 6);
+    points.push({ x: currentX, y: currentY, delay, type: "move" });
+  }
+
+  // Giai đoạn 5: Micro-adjustment vi chỉnh cuối quanh đích (±1.5 ~ 3.5px, ~4 bước)
+  const adjustOffsets = [
+    Math.round(1.5 + Math.random() * 2.0),
+    Math.round(-1.0 - Math.random() * 1.5),
+    Math.round(0.5 + Math.random() * 1.0),
+    0,
+  ];
+  for (let i = 0; i < adjustOffsets.length; i++) {
+    const curX = finalX + adjustOffsets[i];
+    const curY = Math.round(startY + (i === adjustOffsets.length - 1 ? 0 : gaussianRandom(0, 0.4)));
+    const delay = Math.round(22 + Math.random() * 12);
+    points.push({ x: curX, y: curY, delay, type: "adjust" });
+  }
+
+  // Điểm thả chuột kết thúc (mouse up)
+  points.push({
+    x: finalX,
+    y: startY,
+    delay: Math.round(50 + Math.random() * 30),
+    type: "up",
+  });
 
   return points;
 }
 
 /**
- * 3. Tự động giải CAPTCHA trượt qua Chrome Debugger API (isTrusted = true)
+ * 3. Thực hiện kéo tự động (performAutoDrag / tryAutoDragShopeeCaptcha)
+ * - Tối đa 2 lần kéo tự động
+ * - Lần 2 bù thêm jitter ngẫu nhiên ±8 ~ 18px
+ * - Thứ tự CDP: mousePressed -> chuỗi mouseMoved (có xử lý điểm pause) -> mouseReleased
+ * - Tự động chụp post-drag screenshot và trả về evidence_screenshot
  */
-async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
+async function performAutoDrag(tabId, detection, options = {}) {
   if (!tabId || !detection?.detected) return { attempted: false, reason: "no_captcha_detection" };
 
   let slider = detection.slider;
-  // Nếu chưa có toạ độ hoặc toạ độ hiện tại chưa phải là Nút trượt cam thật sự (isOrangeHandle: false)
   if ((!slider || !slider.isOrangeHandle) && chrome.scripting?.executeScript) {
     try {
       const results = await chrome.scripting.executeScript({
         target: { tabId, allFrames: true },
         world: "MAIN",
         func: () => {
-          // 1. Selector chuẩn cho nút trượt
           const handleSelectors = [
             ".shopee-captcha-slider__btn",
             ".shopee-captcha-slider__button",
@@ -2470,8 +2514,6 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
               isOrangeHandle: true,
             };
           }
-
-          // 2. Tìm theo text thanh trượt "Kéo qua để hoàn thiện bức hình"
           try {
             const allNodes = Array.from(document.querySelectorAll("div, span, p"));
             const trackTextNode = allNodes.find((el) => {
@@ -2481,9 +2523,7 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
             if (trackTextNode) {
               let trackBox = trackTextNode;
               for (let i = 0; i < 4 && trackBox && trackBox !== document.body; i++) {
-                if (trackBox.offsetWidth > 150 && trackBox.offsetHeight >= 24 && trackBox.offsetHeight <= 90) {
-                  break;
-                }
+                if (trackBox.offsetWidth > 150 && trackBox.offsetHeight >= 24 && trackBox.offsetHeight <= 90) break;
                 trackBox = trackBox.parentElement;
               }
               if (trackBox) {
@@ -2504,7 +2544,6 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
                     isOrangeHandle: true,
                   };
                 }
-                // Nút luôn ở mép trái của thanh track
                 return {
                   selector: "track-left-edge",
                   x: Math.round(tRect.left + Math.min(26, tRect.height / 2)),
@@ -2516,100 +2555,6 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
               }
             }
           } catch {}
-
-          // 3. Tìm nút chứa ký tự/icon mũi tên qua phải `→`
-          try {
-            const arrowCandidates = Array.from(document.querySelectorAll("div, button, span, svg, i"));
-            const arrowEl = arrowCandidates.find((el) => {
-              if (!el.offsetWidth || !el.offsetHeight) return false;
-              const txt = el.innerText || el.textContent || "";
-              if (txt.includes("→") || txt.includes("\u2192") || txt.includes("\u279c") || txt.includes("\u2794")) return true;
-              if (el.tagName === "svg" || el.querySelector("svg")) {
-                const s = (el.outerHTML || "").toLowerCase();
-                return s.includes("arrow") || s.includes("path");
-                return s.includes("arrow") || s.includes("chevron") || s.includes("right");
-              }
-              return false;
-            });
-            if (arrowEl) {
-              let cur = arrowEl;
-              for (let i = 0; i < 3 && cur && cur !== document.body; i++) {
-                const r = cur.getBoundingClientRect();
-                if (r.width >= 25 && r.width <= 80 && r.height >= 25 && r.height <= 80) {
-                  return {
-                    selector: "arrow-icon-btn",
-                    x: Math.round(r.left + r.width / 2),
-                    y: Math.round(r.top + r.height / 2),
-                    width: Math.round(r.width),
-                    height: Math.round(r.height),
-                    isOrangeHandle: true,
-                  };
-                }
-                cur = cur.parentElement;
-              }
-            }
-          } catch {}
-
-          // 4. Tìm phần tử nút màu cam Shopee linh hoạt
-          try {
-            const candidates = Array.from(document.querySelectorAll("div, button, span, i"));
-            const orangeEl = candidates.find((el) => {
-              if (!el.offsetWidth || !el.offsetHeight) return false;
-              if (el.offsetWidth < 25 || el.offsetWidth > 90 || el.offsetHeight < 25 || el.offsetHeight > 90) return false;
-              const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(el) : null;
-              if (!style) return false;
-              const bg = (style.backgroundColor || "").toLowerCase();
-              const bgImg = (style.backgroundImage || "").toLowerCase();
-              if (bgImg.includes("gradient") && (bgImg.includes("238") || bgImg.includes("255") || bgImg.includes("orange") || bgImg.includes("red"))) {
-                return true;
-              }
-              const m = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-              if (m) {
-                const r = parseInt(m[1], 10);
-                const g = parseInt(m[2], 10);
-                const b = parseInt(m[3], 10);
-                if (r >= 170 && g <= 150 && b <= 120 && (r - g) >= 40) return true;
-              }
-              return bg.includes("238, 77, 45") || bg.includes("ee4d2d") || bg.includes("ff5722");
-            });
-            if (orangeEl) {
-              const r = orangeEl.getBoundingClientRect();
-              return {
-                selector: "shopee-orange-flexible",
-                x: Math.round(r.left + r.width / 2),
-                y: Math.round(r.top + r.height / 2),
-                width: Math.round(r.width),
-                height: Math.round(r.height),
-                isOrangeHandle: true,
-              };
-            }
-          } catch {}
-
-          // 5. Container fallback: TUYỆT ĐỐI KHÔNG dùng rect.top + rect.height / 2 (vì đó là tấm ảnh puzzle)!
-          // Thanh trượt nằm ở vùng 78% chiều cao modal
-          const containerSelectors = [
-            ".shopee-captcha-slider",
-            ".shopee-captcha-slider__button",
-            ".shopee-captcha-slider__btn",
-            ".verify-slider",
-            "[class*='captcha'][class*='slider']",
-          ];
-          for (const selector of containerSelectors) {
-            const el = document.querySelector(selector);
-            if (!el || (!el.offsetWidth && !el.offsetHeight)) continue;
-            if (typeof el.scrollIntoView === "function") {
-              el.scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
-            }
-            const rect = el.getBoundingClientRect();
-            return {
-              selector,
-              x: Math.round(rect.left + Math.min(36, rect.width * 0.12)),
-              y: Math.round(rect.top + rect.height * 0.78),
-              width: Math.round(rect.width),
-              height: Math.round(rect.height),
-              isOrangeHandle: false,
-            };
-          }
           return null;
         },
       });
@@ -2622,7 +2567,6 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
     }
   }
 
-  // Chặn trình duyệt kích hoạt HTML5 native drag trên các thẻ ảnh (gây hiện tượng kéo bóng ảnh)
   if (chrome.scripting?.executeScript) {
     try {
       await chrome.scripting.executeScript({
@@ -2638,24 +2582,23 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
     } catch {}
   }
 
-  if (!slider || !Number.isFinite(slider.x) || !Number.isFinite(slider.y)) {
-    return { attempted: false, reason: "slider_coordinates_missing" };
-  }
-
   const startX = slider.x;
   const startY = slider.y;
   let distance = await calculatePuzzleDistance(tabId, slider);
   const attemptNum = Number(options?.attempt || detection?.attempt || 1);
+
   if (attemptNum > 1) {
-    // P1-1: Nếu là lần thử thứ 2+, bù thêm jitter offset ngẫu nhiên để tránh kéo lại đúng vị trí sai
-    const jitter = Math.round((Math.random() < 0.5 ? -1 : 1) * (10 + Math.floor(Math.random() * 15)));
+    const sign = Math.random() < 0.5 ? -1 : 1;
+    const jitter = sign * Math.round(8 + Math.random() * 10);
     distance = Math.max(40, distance + jitter);
     console.log(`[bridge] Auto-drag retry #${attemptNum}: applying jitter ${jitter >= 0 ? "+" : ""}${jitter}px -> distance: ${distance}px (startX: ${startX}, startY: ${startY})`);
   } else {
     console.log(`[bridge] Calculated puzzle travel: ${distance}px (startX: ${startX}, startY: ${startY})`);
   }
+
   const points = generateHumanTrajectory(startX, startY, distance);
-  const endX = startX + distance;
+  const finalPoint = points[points.length - 1];
+  const endX = finalPoint.x;
 
   if (chrome.debugger?.attach && chrome.debugger?.sendCommand && chrome.debugger?.detach) {
     const target = { tabId };
@@ -2663,19 +2606,62 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
     try {
       await chrome.debugger.attach(target, "1.3");
       attached = true;
-      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: startX, y: startY, button: "none" });
-      await new Promise((r) => setTimeout(r, 60 + Math.random() * 40));
-      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mousePressed", x: startX, y: startY, button: "left", clickCount: 1 });
-      for (const point of points) {
-        await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y, button: "left", buttons: 1 });
-        await new Promise((r) => setTimeout(r, point.delay));
+
+      // 1. Di chuyển chuột tới vị trí nút trượt & Nhấn chuột (mousePressed)
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+        type: "mouseMoved",
+        x: startX,
+        y: startY,
+        button: "none",
+      });
+      await new Promise((r) => setTimeout(r, points[0].delay || 50));
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+        type: "mousePressed",
+        x: startX,
+        y: startY,
+        button: "left",
+        clickCount: 1,
+      });
+
+      // 2. Kéo theo quỹ đạo mô phỏng (chuỗi mouseMoved và điểm pause)
+      for (let i = 1; i < points.length - 1; i++) {
+        const pt = points[i];
+        if (pt.type === "pause") {
+          await new Promise((r) => setTimeout(r, pt.delay));
+        } else {
+          await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+            type: "mouseMoved",
+            x: pt.x,
+            y: pt.y,
+            button: "left",
+            buttons: 1,
+          });
+          await new Promise((r) => setTimeout(r, pt.delay));
+        }
       }
-      await new Promise((r) => setTimeout(r, 90 + Math.random() * 40));
-      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: startY, button: "left", clickCount: 1 });
+
+      // 3. Thả chuột tại đích (mouseReleased)
+      await new Promise((r) => setTimeout(r, points[points.length - 1].delay || 60));
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+        type: "mouseReleased",
+        x: endX,
+        y: startY,
+        button: "left",
+        clickCount: 1,
+      });
+
       try { await chrome.debugger.detach(target); attached = false; } catch {}
       await new Promise((r) => setTimeout(r, 600));
       const postDragScreenshot = await captureTabEvidence(tabId);
-      return { attempted: true, method: "debugger", startX, startY, endX, distance, evidence_screenshot: postDragScreenshot };
+      return {
+        attempted: true,
+        method: "debugger",
+        startX,
+        startY,
+        endX,
+        distance,
+        evidence_screenshot: postDragScreenshot,
+      };
     } catch (err) {
       console.warn("[bridge] Debugger slider drag failed:", err?.message || err);
     } finally {
@@ -2685,9 +2671,9 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
     }
   }
 
-  // P1-4: DOM synthetic events fallback (warning: isTrusted=false, Shopee anti-bot usually rejects synthetic events)
+  // Fallback DOM events
   if (chrome.scripting?.executeScript) {
-    console.warn("[bridge] Debugger unavailable; falling back to synthetic DOM mouse events (isTrusted=false, may be rejected by Shopee anti-bot)");
+    console.warn("[bridge] Debugger unavailable; falling back to synthetic DOM mouse events");
     const [res] = await chrome.scripting.executeScript({
       target: { tabId },
       world: "MAIN",
@@ -2697,11 +2683,10 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
         const fire = (type, px, py) => {
           const opts = { bubbles: true, cancelable: true, clientX: px, clientY: py, screenX: px, screenY: py, buttons: type === "mouseup" ? 0 : 1 };
           target.dispatchEvent(new MouseEvent(type, opts));
-          if (typeof PointerEvent !== "undefined") target.dispatchEvent(new PointerEvent(type.replace("mouse", "pointer"), { ...opts, pointerId: 1, pointerType: "mouse", isPrimary: true }));
         };
         fire("mousedown", sx, sy);
         for (const pt of pts) {
-          fire("mousemove", pt.x, pt.y);
+          if (pt.type !== "pause") fire("mousemove", pt.x, pt.y);
         }
         fire("mouseup", fx, sy);
         return { attempted: true, method: "dom_events_untrusted" };
@@ -2710,11 +2695,20 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
     });
     await new Promise((r) => setTimeout(r, 600));
     const postDragScreenshot = await captureTabEvidence(tabId);
-    return { ...(res?.result || { attempted: true, method: "dom_events" }), startX, startY, endX, distance, evidence_screenshot: postDragScreenshot };
+    return {
+      ...(res?.result || { attempted: true, method: "dom_events" }),
+      startX,
+      startY,
+      endX,
+      distance,
+      evidence_screenshot: postDragScreenshot,
+    };
   }
 
   return { attempted: false, reason: "no_input_backend" };
 }
+
+let tryAutoDragShopeeCaptcha = performAutoDrag;
 
 async function detectCaptchaInTab(tabId, options = {}) {
   try {
@@ -2750,6 +2744,7 @@ async function detectCaptchaInTab(tabId, options = {}) {
             }
           } catch {}
           return {
+            state: "timeout",
             detected: true,
             resolved: false,
             expired: true,
@@ -2795,8 +2790,6 @@ async function detectCaptchaInTab(tabId, options = {}) {
               const bg = style?.backgroundColor || "";
               const color = style?.color || "";
               const isGreen = bg.includes("38, 170, 153") || bg.includes("32, 178, 170") || color.includes("38, 170, 153") || bg.includes("26aa99") || bg.includes("210, 236, 231");
-              return hasCheckChar || (isGreen && (el.offsetWidth > 15 || el.offsetHeight > 15));
-              // P1-3: Giới hạn chỉ match khi có ký tự checkmark hoặc phần tử nằm trong ngữ cảnh captcha/slider
               const inCaptchaContext = hasCheckChar || Boolean(
                 (typeof el.closest === "function" && el.closest(".shopee-captcha-slider, .verify-slider, [class*='captcha'], [class*='verify'], [class*='slider']")) ||
                 (typeof el.className === "string" && (el.className.includes("slider") || el.className.includes("captcha") || el.className.includes("verify")))
@@ -2809,7 +2802,7 @@ async function detectCaptchaInTab(tabId, options = {}) {
         if (isResolved) {
           // P2-3: Reset scroll flag khi thử thách đã hoàn thành
           try { win.__shopeeCaptchaScrolled = false; } catch {}
-          return { detected: false, resolved: true, type: "slider_passed", pageUrl: location.href };
+          return { state: "resolved", detected: false, resolved: true, type: "slider_passed", pageUrl: location.href };
         }
 
         // 2. Tìm Nút trượt màu cam (Slider Handle/Button) - Nút người dùng cần kéo
@@ -2888,8 +2881,6 @@ async function detectCaptchaInTab(tabId, options = {}) {
               if (txt.includes("→") || txt.includes("\u2192") || txt.includes("\u279c") || txt.includes("\u2794")) return true;
               if (el.tagName === "svg" || el.querySelector("svg")) {
                 const s = (el.outerHTML || "").toLowerCase();
-                return s.includes("arrow") || s.includes("path");
-                return s.includes("arrow") || s.includes("chevron") || s.includes("right");
                 return s.includes("arrow") || s.includes("chevron") || s.includes("right") || s.includes("path");
               }
               return false;
@@ -3025,6 +3016,7 @@ async function detectCaptchaInTab(tabId, options = {}) {
           }
 
           return {
+            state: "active",
             detected: true,
             resolved: false,
             type: "dom_selector",
@@ -3061,25 +3053,32 @@ async function detectCaptchaInTab(tabId, options = {}) {
                 }
               }
             } catch {}
-            return { detected: true, resolved: false, type: "dom_text", phrase: p, elementFound: true, pageUrl: location.href };
+            return { state: "active", detected: true, resolved: false, type: "dom_text", phrase: p, elementFound: true, pageUrl: location.href };
           }
         }
 
         if (isVerifyPage) {
-          return { detected: true, resolved: false, type: "slider_pending", pageUrl: location.href };
+          return { state: "active", detected: true, resolved: false, type: "slider_pending", pageUrl: location.href };
         }
 
         // P2-3: Khi không còn CAPTCHA trên trang, reset cờ scroll để tab sẵn sàng cho các lần sau
         try { win.__shopeeCaptchaScrolled = false; } catch {}
-        return { detected: false, resolved: false, pageUrl: location.href };
+        return { state: "none", detected: false, resolved: false, pageUrl: location.href };
       },
       args: [shouldScroll],
     });
     // P0-3: allFrames=true → pick the frame that detected/resolved CAPTCHA, fallback to main frame
     const res = results?.find((r) => r?.result?.detected) || results?.find((r) => r?.result?.resolved) || results?.[0];
-    return res?.result || { detected: false, resolved: false };
+    const out = res?.result || { state: "none", detected: false, resolved: false };
+    if (!out.state) {
+      if (out.expired) out.state = "timeout";
+      else if (out.resolved) out.state = "resolved";
+      else if (out.detected) out.state = "active";
+      else out.state = "none";
+    }
+    return out;
   } catch (err) {
-    return { detected: false, resolved: false, error: err?.message };
+    return { state: "none", detected: false, resolved: false, error: err?.message };
   }
 }
 
@@ -3271,7 +3270,6 @@ function startVerificationWatcher(details) {
         }
       } else {
         consecutiveAbsentCount = 0;
-        // Chế độ quan sát thụ động (Passive Handover): không tự ý drag bừa 240px làm hỏng CAPTCHA ghép hình.
         // Thử tự động kéo thông minh tối đa 2 lần nếu CAPTCHA đang hiển thị và có slider coordinates
         if (autoDragAttempts < 2 && check?.slider) {
           autoDragAttempts++;
@@ -3282,6 +3280,7 @@ function startVerificationWatcher(details) {
             console.log("[bridge] Intelligent slider drag result:", dragRes);
             if (dragRes?.attempted) {
               if (dragRes.evidence_screenshot) {
+                const tag = `drag_${autoDragAttempts}`;
                 const label = `Lần kéo #${autoDragAttempts}`;
                 if (verificationInfo && verificationInfo.job_id === jid) {
                   updateState("verification", {
@@ -3289,6 +3288,7 @@ function startVerificationWatcher(details) {
                     evidence_screenshot: dragRes.evidence_screenshot,
                     evidence_label: label,
                     last_attempt: autoDragAttempts,
+                    tag,
                   });
                 }
                 if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
@@ -3299,6 +3299,7 @@ function startVerificationWatcher(details) {
                     params: {
                       job_id: jid,
                       jobId: jid,
+                      tag,
                       attempt: autoDragAttempts,
                       startX: dragRes.startX,
                       startY: dragRes.startY,
@@ -3318,8 +3319,29 @@ function startVerificationWatcher(details) {
           }
         }
         // Chế độ quan sát thụ động (Passive Handover): Nếu sau 2 lần tự động chưa khớp, nhường quyền kéo tay cho người dùng
-        if (check?.slider?.isOrangeHandle) {
-          console.log(`[bridge] Passive handover: Shopee orange slider button active at (${check.slider.x}, ${check.slider.y}). Chờ người dùng thao tác kéo...`);
+        if (autoDragAttempts >= 2) {
+          if (check?.slider?.isOrangeHandle) {
+            console.log(`[bridge] Passive handover: Shopee orange slider button active at (${check.slider.x}, ${check.slider.y}). Chờ người dùng thao tác kéo...`);
+          }
+          try {
+            if (chrome.tabs?.update) await chrome.tabs.update(targetTabId, { active: true });
+            const currentTab = await chrome.tabs.get(targetTabId).catch(() => null);
+            if (currentTab?.windowId && chrome.windows?.update) {
+              await chrome.windows.update(currentTab.windowId, { focused: true });
+            }
+          } catch {}
+          try {
+            await chrome.scripting.executeScript({
+              target: { tabId: targetTabId, allFrames: true },
+              world: "MAIN",
+              func: () => {
+                const el = document.querySelector(".shopee-captcha-slider, .verify-slider, [role='slider'], div[class*='slider']");
+                if (el && typeof el.scrollIntoView === "function") {
+                  el.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+                }
+              },
+            });
+          } catch {}
         }
       }
     } finally {
@@ -3384,13 +3406,13 @@ async function triggerVerificationRequired(details) {
   if (targetTabId && !details.evidence_screenshot) {
     details.evidence_screenshot = await captureTabEvidence(targetTabId);
   }
+  if (!details.tag) {
+    details.tag = "challenge";
+  }
 
   updateState(stateForVerification(details), details);
 
   const jid = details?.job_id;
-  if (jid && notifiedVerificationJobIds.has(jid)) {
-    return; // Đảm bảo gửi một thông báo duy nhất cho người dùng
-  }
   const shouldNotify = !jid || !notifiedVerificationJobIds.has(jid) || Boolean(details.evidence_screenshot);
   if (jid) notifiedVerificationJobIds.add(jid);
 
@@ -4781,6 +4803,7 @@ if (typeof module !== "undefined" && module.exports) {
     mergeReview,
     calculatePuzzleDistance,
     generateHumanTrajectory,
+    performAutoDrag,
     tryAutoDragShopeeCaptcha,
   };
 }

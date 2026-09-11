@@ -2478,7 +2478,6 @@ test('startVerificationWatcher dispatches captcha.drag_evidence after auto-drag 
   context.chrome.windows = { update: async () => {} };
   context.bridgeFrames = frames;
   vm.runInContext(`
-    bridgeSocket = { readyState: 1 };
     bridgeSocket = {
       readyState: 1,
       send: (raw) => {
@@ -2502,7 +2501,7 @@ test('startVerificationWatcher dispatches captcha.drag_evidence after auto-drag 
     });
   `, context);
 
-  // Wait for auto-drag and dispatch
+  // Trigger listener
   const listener = vm.runInContext('activeTabUpdateListener', context);
   await listener(904, { status: 'complete' }, { url: 'https://shopee.vn/verify/traffic' });
 
@@ -2527,7 +2526,6 @@ test('startVerificationWatcher dispatches captcha.resolved_evidence on successfu
   context.chrome.windows = { update: async () => {} };
   context.bridgeFrames = frames;
   vm.runInContext(`
-    bridgeSocket = { readyState: 1 };
     bridgeSocket = {
       readyState: 1,
       send: (raw) => {

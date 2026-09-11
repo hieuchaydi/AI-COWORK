@@ -1000,8 +1000,8 @@ def _on_browser_ws_message(message: dict) -> None:
         attempt = params.get("attempt") or 1
         evidence_data = params.get("evidence_screenshot") or params.get("screenshot")
         if evidence_data and job_id:
-            tag = f"attempt_{attempt}"
-            label = f"Lần kéo #{attempt}"
+            tag = params.get("tag") or (f"drag_{attempt}" if attempt in (1, 2) else f"attempt_{attempt}")
+            label = params.get("label") or f"Lần kéo #{attempt}"
             try:
                 from browser_bridge.captcha_detector import save_evidence_screenshot
                 evidence = save_evidence_screenshot(job_id, evidence_data, _outputs_root(), HELPER_PORT, tag=tag)
@@ -1251,6 +1251,7 @@ def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
                 body.get("verification_required") is not False
                 and (
                     "verification required" in lowered
+                    or "/verify/traffic" in lowered
                     or "/verify/" in lowered
                     or "anti_bot_tracking_id" in lowered
                     or "challenge" in lowered
