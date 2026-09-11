@@ -301,6 +301,8 @@ class WebSocketTransport(BrowserTransport):
                 "dom.queryAll",
                 "dom.getText",
                 "dom.getAttribute",
+                "captcha.solve",
+                "captcha.autoSolve",
             )
             if action not in allowed_during_verification:
                 return False, None, BridgeError.create(

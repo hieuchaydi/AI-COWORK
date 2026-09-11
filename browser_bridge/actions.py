@@ -35,6 +35,8 @@ class ActionName(str, Enum):
     JOB_CLEAR_STALE = "job.clearStale"
     PAGE_SCROLL = "page.scroll"
     EXTENSION_RELOAD = "extension.reload"
+    CAPTCHA_SOLVE = "captcha.solve"
+    CAPTCHA_AUTOSOLVE = "captcha.autoSolve"
 
 
 ALL_ACTIONS: Set[str] = {a.value for a in ActionName}
@@ -207,6 +209,11 @@ class PageScrollParams(BaseActionParams):
     behavior: str = Field(default="smooth", description="smooth | instant | auto")
 
 
+class CaptchaSolveParams(BaseActionParams):
+    tabId: Optional[int] = Field(default=None, description="Target tab ID")
+    attempt: int = Field(default=1, description="Attempt number for retry jitter offset")
+
+
 class EmptyParams(BaseActionParams):
     pass
 
@@ -248,6 +255,8 @@ def validate_action_params(action: str, params: Dict[str, Any]) -> BaseModel:
         return JobCancelParams(**params)
     elif action == ActionName.PAGE_SCROLL:
         return PageScrollParams(**params)
+    elif action in (ActionName.CAPTCHA_SOLVE, ActionName.CAPTCHA_AUTOSOLVE):
+        return CaptchaSolveParams(**params)
     elif action in (
         ActionName.BROWSER_HEALTH,
         ActionName.TAB_LIST,

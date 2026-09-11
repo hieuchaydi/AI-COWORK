@@ -2453,3 +2453,97 @@ test('calculatePuzzleDistance calls local Python CV solver endpoint when availab
   assert.equal(cvRequestSent.body.track_rect.width, 282);
 });
 
+test('captcha.solve action triggers tryAutoDragShopeeCaptcha on target tab', async () => {
+  const { context } = await worker();
+  context.chrome.debugger = {
+    attach: async () => {},
+    detach: async () => {},
+    sendCommand: async () => {},
+  };
+  context.chrome.tabs = {
+    get: async (id) => ({ id, url: 'https://shopee.vn/verify/captcha', windowId: 1 }),
+    update: async () => {},
+  };
+  vm.runInContext(`
+    chrome.scripting = {
+      executeScript: async ({ func }) => {
+        globalThis.document = {
+          querySelector: (sel) => {
+            if (sel.includes("MqzVM5") || sel.includes("slider") || sel.includes("btn")) {
+              return { offsetWidth: 43, offsetHeight: 42, getBoundingClientRect: () => ({ left: 88, top: 269, width: 43, height: 42 }) };
+            }
+            if (sel.includes("canvas")) return { offsetWidth: 280, offsetHeight: 150 };
+            return null;
+          },
+          querySelectorAll: () => [],
+        };
+        globalThis.location = { href: 'https://shopee.vn/verify/captcha' };
+        return [{ result: func ? func() : null }];
+      },
+    };
+  `, context);
+
+  const res = await vm.runInContext('handleAction("captcha.solve", { tabId: 905, attempt: 1 })', context);
+  assert.ok(res !== null, 'captcha.solve must return result');
+});
+
+
+test('calculatePuzzleDistance keeps a negative (leftward) travel from the CV solver', async () => {
+  const { context } = await worker();
+  context.setTimeout = (fn) => { queueMicrotask(fn); return 1; };
+
+  context.fetch = async (url) => {
+    if (url.includes('/browser/solve_puzzle_cv')) {
+      return {
+        ok: true,
+        json: async () => ({
+          ok: true,
+          travel: -118,
+          travel_distance: -118.4,
+          direction: 'left',
+          piece_kind: 'warm',
+          max_travel: 240,
+          method: 'compartment_receptacle',
+          confidence: 0.96,
+          debug_info: { piece_center: [269.6, 66.2], slot_center: [131.2, 77.9] },
+        }),
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+
+  context.chrome.tabs = {
+    captureVisibleTab: async () => 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+    get: async () => ({ windowId: 10 }),
+    update: async () => {},
+  };
+  vm.runInContext(`
+    chrome.scripting = {
+      executeScript: async ({ func }) => {
+        globalThis.document = {
+          querySelector: (sel) => {
+            if (sel.includes("canvas")) return { offsetWidth: 280, getBoundingClientRect: () => ({ left: 107, top: 136, width: 280, height: 150 }) };
+            return null;
+          },
+          querySelectorAll: () => [],
+        };
+        globalThis.window = { devicePixelRatio: 1.0 };
+        return [{ result: func() }];
+      },
+    };
+  `, context);
+
+  const travel = await vm.runInContext('calculatePuzzleDistance(906, { width: 280 })', context);
+  assert.equal(travel, -118, 'leftward CV travel must survive, not be dropped by a >0 gate');
+});
+
+test('generateHumanTrajectory drags left when the distance is negative', async () => {
+  const { context } = await worker();
+  const points = vm.runInContext('generateHumanTrajectory(300, 200, -120)', context);
+
+  assert.equal(points[0].x, 300, 'must start at startX');
+  const lastPoint = points[points.length - 1];
+  assert.equal(lastPoint.x, 180, 'must end at startX + distance (leftward)');
+  const minPointX = Math.min(...points.map((p) => p.x));
+  assert.ok(minPointX < 180, 'overshoot must follow the drag direction (further left)');
+});

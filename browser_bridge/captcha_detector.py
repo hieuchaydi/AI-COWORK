@@ -228,6 +228,114 @@ def match_template_grayscale(
         return False, 0.0
 
 
+def detect_sprite_piece(canvas_bgr: Any, gray: Any = None) -> Optional[Dict[str, Any]]:
+    """Locate the CAPTCHA's movable sprite on the canvas — **anywhere**, not just on the left.
+
+    Shopee parks the piece on either side of the frame and clips it against the canvas edge
+    (`overflow: hidden`), so a left-band search misses the whole right-parked half of the
+    variants (mortar & pestle, tray & lid, …). Three colour families cover the catalog:
+
+    * warm/saturated — wooden pestle, red/orange prop, terracotta pieces;
+    * near-white — dishwasher tablet, soap bar, ceramic chip;
+    * blue/cyan — tinted tablet or plastic part.
+
+    Returns ``{center, bbox, w, h, angle, box, kind, area}`` (canvas pixel coords) or ``None``.
+    """
+    try:
+        import numpy as np
+        import cv2
+    except ImportError:  # pragma: no cover - the callers already guard this
+        return None
+
+    if canvas_bgr is None or getattr(canvas_bgr, "size", 0) == 0:
+        return None
+    if gray is None:
+        gray = cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2GRAY)
+    ch, cw = gray.shape[:2]
+
+    b = canvas_bgr[:, :, 0].astype(int)
+    g = canvas_bgr[:, :, 1].astype(int)
+    r = canvas_bgr[:, :, 2].astype(int)
+    hsv_s = cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2HSV)[:, :, 1]
+
+    masks = {
+        # Wood/red props: strongly warm and clearly saturated.
+        "warm": ((r - b > 30) & (r - g > 12) & (r > 110) & (hsv_s > 60)),
+        # Tablets/ceramics: near-white but still distinguishable from grey backdrops.
+        "bright": (gray > 238),
+        # Tinted plastic pieces.
+        "blue": ((b - r > 25) & (b > 120)),
+    }
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    best: Optional[Dict[str, Any]] = None
+    best_score = 0.0
+    for kind, mask in masks.items():
+        m = cv2.morphologyEx(mask.astype(np.uint8) * 255, cv2.MORPH_CLOSE, kernel)
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel)
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            area = float(cv2.contourArea(c))
+            if area < 140:
+                continue
+            bx, by, bw, bh = cv2.boundingRect(c)
+            if bw < 10 or bh < 10:
+                continue
+            # A sprite fills a small slice of the frame; anything huge is background.
+            if bw * bh > 0.55 * cw * ch:
+                continue
+            fill = area / float(max(1, bw * bh))
+            if fill < 0.18:
+                continue  # sparse speckle, not a solid sprite
+            mrect = cv2.minAreaRect(c)
+            (mcx, mcy), (rw, rh), angle = mrect
+            long_side, short_side = max(rw, rh), max(1.0, min(rw, rh))
+            if long_side / short_side > 6.0:
+                continue  # a long rail/edge, not a sprite
+            # Larger area wins; saturated pieces get a small bonus over grey-ish bright ones.
+            score = area * (1.15 if kind == "warm" else 1.0) * min(1.0, fill + 0.35)
+            if score > best_score:
+                best_score = score
+                best = {
+                    "center": (float(mcx), float(mcy)),
+                    "bbox": (int(bx), int(by), int(bw), int(bh)),
+                    "w": float(short_side),
+                    "h": float(long_side),
+                    "angle": float(angle),
+                    "box": np.intp(cv2.boxPoints(mrect)),
+                    "kind": kind,
+                    "area": int(area),
+                }
+    return best
+
+
+def detect_sprite_piece_safe(canvas_bgr: Any, gray: Any = None) -> Optional[Dict[str, Any]]:
+    """`detect_sprite_piece` that never raises (CV solvers are best-effort by contract)."""
+    try:
+        return detect_sprite_piece(canvas_bgr, gray)
+    except Exception as exc:  # noqa: BLE001 - defensive: solver must degrade, not crash
+        logger.warning("Sprite detection failed: %s", exc)
+        return None
+
+
+def distinct_colour_count(canvas_bgr: Any, step: int = 2) -> int:
+    """Distinct colours in a subsample of the frame — a cheap 'photo vs drawn canvas' probe.
+
+    Real Shopee scenes (photo backdrops) carry thousands of distinct colours; the synthetic
+    flat canvases the unit tests build have a handful. Callers use this to decide whether a
+    colour-based detector may outrank the older geometric heuristics.
+    """
+    try:
+        import numpy as np
+
+        if canvas_bgr is None or getattr(canvas_bgr, "size", 0) == 0:
+            return 0
+        small = canvas_bgr[:: max(1, step), :: max(1, step)]
+        return int(np.unique(small.reshape(-1, small.shape[2]), axis=0).shape[0])
+    except Exception:  # noqa: BLE001 - probe must never break a solve
+        return 0
+
+
 
 def solve_compartment_receptacle(
     image: Any,
@@ -339,7 +447,11 @@ def solve_compartment_receptacle(
     clean_bgr[is_red] = [235, 235, 235]
     gray = cv2.cvtColor(clean_bgr, cv2.COLOR_BGR2GRAY)
 
-    # 4. Extract Piece in left region (X <= 0.38 * cw)
+    # 4. Extract the movable piece.
+    #    First pass: the sprite detector scans the WHOLE canvas — Shopee parks the piece on
+    #    either side (and clips it against the canvas edge), so a left-band-only search misses
+    #    every right-parked variant (mortar & pestle, tray & lid, …).
+    #    Second pass: the legacy left-band methods stay for the tablet layouts they were tuned on.
     left_w = int(cw * 0.38)
     left_gray = gray[:, :left_w]
     left_bgr = clean_bgr[:, :left_w]
@@ -348,10 +460,20 @@ def solve_compartment_receptacle(
     piece_box = None
     piece_w, piece_h = 30.0, 30.0
     piece_angle = 0.0
+    piece_kind = ""
+
+    sprite = detect_sprite_piece_safe(clean_bgr, gray)
+    if sprite is not None:
+        piece_center = sprite["center"]
+        piece_box = sprite["box"]
+        piece_w = float(sprite["w"])
+        piece_h = float(sprite["h"])
+        piece_angle = float(sprite["angle"])
+        piece_kind = str(sprite["kind"])
 
     # Piece Method A: White/bright tilted tablet (gray > 238)
     white_mask = (left_gray > 238) & (np.arange(left_w)[None, :] > 4) & (np.arange(ch)[:, None] > int(ch * 0.20))
-    if np.sum(white_mask) > 100:
+    if piece_center is None and np.sum(white_mask) > 100:
         cnts_w, _ = cv2.findContours(white_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if cnts_w:
             best_cw = max(cnts_w, key=cv2.contourArea)
@@ -419,10 +541,21 @@ def solve_compartment_receptacle(
         piece_center = (float(left_w * 0.35), float(ch * 0.5))
         piece_box = np.array([[10, 30], [45, 30], [45, 75], [10, 75]], dtype=np.int32)
 
-    # 5. Extract Slot / Receptacle in right region (X >= 0.35 * cw)
-    right_x0 = int(cw * 0.35)
+    # 5. Extract Slot / Receptacle. The search spans the frame (not a fixed right band) so the
+    #    cavity can sit on either side of the piece — the pairing below is direction-agnostic —
+    #    while candidates that ARE the piece (heavy overlap) are dropped.
+    right_x0 = int(cw * 0.12)
     right_gray = gray[:, right_x0:]
     right_bgr = clean_bgr[:, right_x0:]
+
+    piece_bbox = None
+    if piece_box is not None:
+        piece_bbox = (
+            float(np.min(piece_box[:, 0])),
+            float(np.min(piece_box[:, 1])),
+            float(np.max(piece_box[:, 0])),
+            float(np.max(piece_box[:, 1])),
+        )
 
     blur_r = cv2.bilateralFilter(right_gray, 5, 45, 45)
     edges_r = cv2.Canny(blur_r, 25, 85)
@@ -435,6 +568,12 @@ def solve_compartment_receptacle(
         bx, by, bw, bh = cv2.boundingRect(c)
         area = cv2.contourArea(c)
         if 40 <= bw <= int(cw * 0.52) and 18 <= bh <= int(ch * 0.55) and area > 250:
+            if piece_bbox is not None:
+                # Overlap between the candidate box and the piece's box, as a share of the box.
+                ox = max(0.0, min(bx + bw, piece_bbox[2]) - max(bx, piece_bbox[0]))
+                oy = max(0.0, min(by + bh, piece_bbox[3]) - max(by, piece_bbox[1]))
+                if (ox * oy) > 0.35 * (bw * bh):
+                    continue  # that contour is the piece itself, not a receptacle
             mrect = cv2.minAreaRect(c)
             (rcx, rcy), (rw, rh), angle = mrect
             abs_cx = right_x0 + rcx
@@ -552,7 +691,12 @@ def solve_compartment_receptacle(
     jitter_pattern = [0, 0, 4, -4, 8, -8, 6, -6]
     retry_jitter = jitter_pattern[min(max(0, attempt), len(jitter_pattern) - 1)]
     final_travel_css = handle_travel_css + retry_jitter
-    bounded_travel = int(round(max(20.0, min(final_travel_css, max_handle_travel - 3.0))))
+    # Signed travel: the piece moves the way the delta points, and some variants park it to the
+    # RIGHT of its cavity (drag left). Only the magnitude is bounded by the handle's range — a
+    # `max(20, …)` floor here used to clamp every leftward answer into a wrong rightward one.
+    travel_limit = max(8.0, max_handle_travel - 3.0)
+    bounded_travel = int(round(max(-travel_limit, min(final_travel_css, travel_limit))))
+    direction = "left" if bounded_travel < 0 else "right"
 
     return {
         "ok": True,
@@ -561,6 +705,8 @@ def solve_compartment_receptacle(
         "puzzle_travel": int(round(puzzle_travel_css)),
         "max_travel": int(round(max_handle_travel)),
         "scale_ratio": round(float(scale_ratio), 3),
+        "direction": direction,
+        "piece_kind": piece_kind,
         "method": "compartment_receptacle",
         "confidence": round(float(slot_info["confidence"]), 2),
         "debug_info": {
@@ -576,6 +722,8 @@ def solve_compartment_receptacle(
             "delta_center": round(float(delta_center), 2),
             "delta_edge": round(float(delta_edge), 2),
             "delta_optimal": round(float(delta_optimal), 2),
+            "direction": direction,
+            "piece_kind": piece_kind,
             "attempt": attempt,
             "retry_jitter": retry_jitter,
             "scale_ratio": round(float(scale_ratio), 3),
@@ -824,11 +972,44 @@ def solve_puzzle_cv(
         detected_piece_w = max(30, best_x2 - best_x1)
         detected_piece_h = 44
 
+    # Colour-explicit sprite (wooden pestle, red/orange prop) — beats the vertical-edge-pair
+    # heuristic above, which latches onto the backdrop's strongest edges on photo scenes.
+    sprite_piece = detect_sprite_piece_safe(canvas_crop, gray)
+    if sprite_piece is not None and not (
+        piece_rect and isinstance(piece_rect, dict) and detected_piece_x is not None
+    ):
+        sx, sy, sw, sh = sprite_piece["bbox"]
+        detected_piece_x = int(sx)
+        detected_piece_y = int(sy)
+        detected_piece_w = int(sw)
+        detected_piece_h = int(sh)
+
     # 4. Multi-stage feature extraction
     # Inspect overall color saturation to differentiate natural photo puzzles (salads, goods) vs synthetic gray canvases
     hsv = cv2.cvtColor(canvas_crop, cv2.COLOR_BGR2HSV)
     mean_sat = float(np.mean(hsv[:, :, 1]))
     is_natural_scene = mean_sat > 55.0
+
+    # Method 0: colour-explicit sprite + flat cavity on a PHOTOGRAPHIC scene. The jigsaw/
+    # gradient/edge heuristics below latch onto the backdrop's strongest edges on photo scenes
+    # and cannot beat real piece evidence; on the synthetic flat canvases (a handful of
+    # colours) the classic methods stay authoritative so their contracts are unchanged.
+    is_photographic = distinct_colour_count(canvas_crop) > 400
+    if (
+        is_photographic
+        and sprite_piece is not None
+        and sprite_piece.get("kind") == "warm"
+    ):
+        comp_first = solve_compartment_receptacle(
+            canvas_crop,
+            canvas_rect=canvas_rect,
+            track_rect=track_rect,
+            handle_rect=handle_rect,
+            device_pixel_ratio=scale,
+            attempt=attempt,
+        )
+        if comp_first.get("ok") and comp_first.get("confidence", 0) >= 0.90:
+            return comp_first
 
     # Branch A: If natural colorful scene (e.g. salad, merchandise), prioritize Jigsaw Notch & Cutout Slot
     if is_natural_scene:
@@ -841,7 +1022,7 @@ def solve_puzzle_cv(
         best_cand_x = None
         best_cand_score = -1.0
 
-        for tx in range(int(cw * 0.35), cw - piece_w - 5):
+        for tx in range(5, cw - piece_w - 5):
             edge_score = float(band_prof[tx] + band_prof[tx + piece_w])
             window_darkness = float(255.0 - gray_band[:, tx:tx+piece_w].mean())
             combined = edge_score * 1.0 + window_darkness * 1.2
@@ -849,7 +1030,7 @@ def solve_puzzle_cv(
                 best_cand_score = combined
                 best_cand_x = tx
 
-        if best_cand_x is not None and best_cand_x > detected_piece_x + 30:
+        if best_cand_x is not None and abs(best_cand_x - detected_piece_x) > 30:
             target_x = float(best_cand_x)
             piece_x = float(detected_piece_x)
             delta_x_phys = target_x - piece_x
@@ -889,7 +1070,53 @@ def solve_puzzle_cv(
                 confidence = 0.94
 
     # Method 2: Circular Receptacle / Pit Insertion (e.g. Mortar & Pestle)
-    # Method 2: Compartment Receptacle / Dispenser Slot Fitting (e.g. Dishwasher tablet into dispenser, tray into slot)
+    if method == "fallback":
+        blur = cv2.GaussianBlur(gray, (9, 9), 2)
+        circles = cv2.HoughCircles(
+            blur, cv2.HOUGH_GRADIENT,
+            dp=1.2, minDist=30,
+            param1=80, param2=35,
+            minRadius=int(ch * 0.15), maxRadius=int(ch * 0.55)
+        )
+        if circles is not None:
+            valid_circles = [c for c in circles[0] if c[0] > cw * 0.35]
+            if valid_circles:
+                best_circle = max(valid_circles, key=lambda c: c[2])
+                cx, cy, cr = float(best_circle[0]), float(best_circle[1]), float(best_circle[2])
+                search_r = int(cr * 0.45)
+                x1 = max(0, int(cx - search_r))
+                x2 = min(cw, int(cx + search_r))
+                y1 = max(0, int(cy - search_r))
+                y2 = min(ch, int(cy + search_r))
+                roi = gray[y1:y2, x1:x2]
+                if roi.size > 0:
+                    min_val, _, min_loc, _ = cv2.minMaxLoc(cv2.GaussianBlur(roi, (5, 5), 0))
+                    # Check for movable pestle on left
+                    left_roi = gray[:, :int(cw * 0.32)]
+                    edges_left = cv2.Canny(left_roi, 30, 100)
+                    cnts_left, _ = cv2.findContours(edges_left, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if cnts_left:
+                        best_cnt = max(cnts_left, key=cv2.contourArea)
+                        lx, ly, lw, lh = cv2.boundingRect(best_cnt)
+                        cand_target_x = float(x1 + min_loc[0]) if min_val < 90 else cx
+                        # Prefer the sprite detector's piece; the left-ROI contour is only a
+                        # stand-in and latches onto the mortar's rim on photo scenes. The
+                        # convention here stays "piece's leading edge → cavity centre", which is
+                        # what this method has always reported (tip into the pit).
+                        if sprite_piece is not None:
+                            sbx, _, sbw, _ = sprite_piece["bbox"]
+                            cand_piece_x = float(sbx + sbw)
+                        else:
+                            cand_piece_x = float(lx + lw)
+                        cand_delta = cand_target_x - cand_piece_x
+                        if abs(cand_delta) > 24 and min_val < 90:
+                            target_x = cand_target_x
+                            piece_x = cand_piece_x
+                            delta_x_phys = cand_delta
+                            method = "circular_receptacle"
+                            confidence = 0.95
+
+    # Method 3: Compartment Receptacle / Dispenser Slot Fitting (e.g. Dishwasher tablet into dispenser, tray into slot)
     if method == "fallback":
         left_quarter = int(cw * 0.32)
         left_gray = gray[:, :left_quarter]
@@ -922,10 +1149,16 @@ def solve_puzzle_cv(
             p_w_ref = detected_piece_w if detected_piece_w else 34
             p_x_ref = detected_piece_x if detected_piece_x is not None else 10
 
-        piece_center_x = float(p_x_ref + p_w_ref / 2.0)
+        piece_center_x = (
+            float(sprite_piece["center"][0])
+            if sprite_piece is not None
+            else float(p_x_ref + p_w_ref / 2.0)
+        )
 
-        min_rx = int(cw * 0.35)
-        max_rx = int(cw * 0.88)
+        # Cavity search spans the frame (minus a thin margin) so the receptacle may sit on
+        # either side of the piece; the pairing below keeps the delta's sign.
+        min_rx = int(cw * 0.10)
+        max_rx = int(cw * 0.95)
         right_roi = gray[:, min_rx:max_rx]
 
         edges_right = cv2.Canny(right_roi, 30, 95)
@@ -947,7 +1180,7 @@ def solve_puzzle_cv(
                         abs_x = min_rx + x
                         cavity_center_x = abs_x + w / 2.0
                         delta = cavity_center_x - piece_center_x
-                        if delta > 30:
+                        if abs(delta) > 24:
                             score = area / (std_dev + 5.0)
                             cavity_cands.append((score, cavity_center_x, piece_center_x, delta))
 
@@ -959,46 +1192,6 @@ def solve_puzzle_cv(
             delta_x_phys = float(best_delta)
             method = "compartment_receptacle"
             confidence = 0.96
-
-    # Method 3: Circular Receptacle / Pit Insertion (e.g. Mortar & Pestle)
-    if method == "fallback":
-        blur = cv2.GaussianBlur(gray, (9, 9), 2)
-        circles = cv2.HoughCircles(
-            blur, cv2.HOUGH_GRADIENT,
-            dp=1.2, minDist=30,
-            param1=80, param2=35,
-            minRadius=int(ch * 0.15), maxRadius=int(ch * 0.55)
-        )
-        if circles is not None:
-            valid_circles = [c for c in circles[0] if c[0] > cw * 0.35]
-            if valid_circles:
-                best_circle = max(valid_circles, key=lambda c: c[2])
-                cx, cy, cr = float(best_circle[0]), float(best_circle[1]), float(best_circle[2])
-                search_r = int(cr * 0.45)
-                x1 = max(0, int(cx - search_r))
-                x2 = min(cw, int(cx + search_r))
-                y1 = max(0, int(cy - search_r))
-                y2 = min(ch, int(cy + search_r))
-                roi = gray[y1:y2, x1:x2]
-                if roi.size > 0:
-                    min_val, _, min_loc, _ = cv2.minMaxLoc(cv2.GaussianBlur(roi, (5, 5), 0))
-                    # Check for movable pestle on left
-                    left_roi = gray[:, :int(cw * 0.45)]
-                    left_roi = gray[:, :int(cw * 0.32)]
-                    edges_left = cv2.Canny(left_roi, 30, 100)
-                    cnts_left, _ = cv2.findContours(edges_left, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    if cnts_left:
-                        best_cnt = max(cnts_left, key=cv2.contourArea)
-                        lx, ly, lw, lh = cv2.boundingRect(best_cnt)
-                        cand_target_x = float(x1 + min_loc[0]) if min_val < 90 else cx
-                        cand_piece_x = float(lx + lw)
-                        cand_delta = cand_target_x - cand_piece_x
-                        if cand_delta > 30 and min_val < 90:
-                            target_x = cand_target_x
-                            piece_x = cand_piece_x
-                            delta_x_phys = cand_delta
-                            method = "circular_receptacle"
-                            confidence = 0.95
 
     # Method 3: Robust Jigsaw Notch & Cutout Slot (General Fallback)
     # Method 4: Robust Jigsaw Notch & Cutout Slot (General Fallback)
@@ -1012,7 +1205,7 @@ def solve_puzzle_cv(
         best_cand_x = None
         best_cand_score = -1.0
 
-        for tx in range(int(cw * 0.35), cw - piece_w - 5):
+        for tx in range(5, cw - piece_w - 5):
             edge_score = float(band_prof[tx] + band_prof[tx + piece_w])
             window_darkness = float(255.0 - gray_band[:, tx:tx+piece_w].mean())
             combined = edge_score * 1.0 + window_darkness * 1.2
@@ -1020,7 +1213,7 @@ def solve_puzzle_cv(
                 best_cand_score = combined
                 best_cand_x = tx
 
-        if best_cand_x is not None and best_cand_x > detected_piece_x + 20:
+        if best_cand_x is not None and abs(best_cand_x - detected_piece_x) > 20:
             target_x = float(best_cand_x)
             piece_x = float(detected_piece_x)
             delta_x_phys = target_x - piece_x
@@ -1057,7 +1250,13 @@ def solve_puzzle_cv(
     puzzle_travel_css = delta_x_phys / max(0.1, scale)
     handle_travel_css = puzzle_travel_css * scale_ratio
 
-    bounded_travel = int(round(max(20.0, min(handle_travel_css, max_handle_travel - 3.0))))
+    # NO "shopee is usually dragged >60%" prior here. That heuristic used to replace any
+    # small/medium answer with 63.5% of the track — on the mortar-&-pestle variant it shoved
+    # the piece straight out of the frame (clipped against the canvas edge). A low-confidence
+    # method now reports its honest (signed) number plus a low `confidence`; the caller decides.
+    travel_limit = max(8.0, max_handle_travel - 3.0)
+    bounded_travel = int(round(max(-travel_limit, min(handle_travel_css, travel_limit))))
+    direction = "left" if bounded_travel < 0 else "right"
 
     return {
         "ok": True,
@@ -1065,6 +1264,8 @@ def solve_puzzle_cv(
         "puzzle_travel": int(round(puzzle_travel_css)),
         "max_travel": int(round(max_handle_travel)),
         "scale_ratio": round(scale_ratio, 3),
+        "direction": direction,
+        "piece_kind": sprite_piece.get("kind") if sprite_piece else "",
         "method": method,
         "confidence": round(confidence, 2),
         "details": {
@@ -1072,6 +1273,8 @@ def solve_puzzle_cv(
             "piece_x_phys": round(piece_x, 1),
             "delta_x_phys": round(delta_x_phys, 1),
             "scale": round(scale, 3),
+            "direction": direction,
+            "piece_kind": sprite_piece.get("kind") if sprite_piece else "",
             "canvas_w_phys": cw,
             "canvas_h_phys": ch,
         },

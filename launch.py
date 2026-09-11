@@ -4696,6 +4696,15 @@ def _print_setup_banner(google_ok: bool) -> None:
         lines.append(
             f"     ⇒ setup: `{VENV_PY} bridge\\tg_mtproto_mcp.py setup`"
         )
+    try:
+        import cv2  # noqa: F401 — the helper solves CAPTCHA puzzles in this process
+
+        cv_ready = True
+    except Exception:
+        cv_ready = False
+    lines.append(
+        f"  CAPTCHA CV solver: {'OK (numpy + opencv)' if cv_ready else 'UNAVAILABLE — numpy/opencv missing'}"
+    )
     lines.append("=" * 60)
     lines.append("")
     print("\n".join(lines))
@@ -4727,6 +4736,13 @@ def _ensure_pip_deps() -> None:
             ("telethon", "telethon"),
             ("pyautogui", "pyautogui"),
             ("pillow", "PIL"),
+            # CAPTCHA computer-vision solver (browser_bridge/captcha_detector.py served on
+            # /browser/solve_puzzle_cv). Without these the endpoint answers
+            # `cv2_or_numpy_missing` and the extension silently degrades to its crude
+            # pixel/golden-ratio guesses — the "always off by 5-15px / piece pushed out of
+            # the frame" failures. Installing them here makes that impossible to regress.
+            ("numpy", "numpy"),
+            ("opencv-python-headless", "cv2"),
             ("mcp-server-git", "mcp_server_git"),
             ("mcp-server-fetch", "mcp_server_fetch"),
         )
@@ -4747,6 +4763,49 @@ def _ensure_pip_deps() -> None:
         return
     print(f"[launch] installing into {VENV_DIR.name}: {', '.join(missing)} ...")
     subprocess.run(installer + missing, check=False)
+
+
+def _ensure_cv_deps() -> None:
+    """numpy + OpenCV for the CAPTCHA CV solver, in the interpreter serving the helper.
+
+    `/browser/solve_puzzle_cv` runs *inside this process*, so the packages must exist in
+    `sys.executable` — which is not always the venv Python (launch.py is routinely started as
+    `python launch.py` with the system interpreter). When they were missing the endpoint
+    answered `cv2_or_numpy_missing` and the extension quietly fell back to pixel heuristics,
+    which is where the "always off by 5-15px / piece shoved out of frame" misses came from.
+    """
+    try:
+        import cv2  # noqa: F401
+        import numpy  # noqa: F401
+
+        return
+    except Exception:
+        pass
+    print("[launch] installing CAPTCHA CV deps (numpy, opencv-python-headless) ...")
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "numpy",
+                "opencv-python-headless",
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        print(f"[launch] CV dep install failed: {exc}", file=sys.stderr)
+        return
+    if proc.returncode != 0:
+        print(
+            "[launch] CAPTCHA CV deps could not be installed — the solver will answer "
+            f"cv2_or_numpy_missing. Install manually: {sys.executable} -m pip install "
+            "numpy opencv-python-headless",
+            file=sys.stderr,
+        )
 
 
 def _preflight_port(host: str, port: int, label: str) -> None:
@@ -4808,6 +4867,7 @@ def main() -> None:
         )
 
     _ensure_pip_deps()
+    _ensure_cv_deps()
 
     npm = shutil.which("npm") or shutil.which("npm.cmd")
     if not npm:

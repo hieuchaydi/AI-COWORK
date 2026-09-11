@@ -924,6 +924,64 @@ def test_solve_puzzle_cv_compartment_receptacle():
     assert 105 <= res["travel"] <= 120
 
 
+def _shopee_photo_scene(piece_left: int) -> "object":
+    """Photographic-style mortar & pestle frame (grain + flat cavity + warm wooden prop).
+
+    `piece_left` parks the pestle at that x — Shopee parks it against EITHER edge, and the
+    right-parked case is the one the old left-band-only detector could not see at all.
+    """
+    import cv2
+    import numpy as np
+
+    rng = np.random.default_rng(7)
+    base = np.full((150, 280, 3), 200, dtype=np.int16)
+    base += rng.integers(-9, 10, size=base.shape, dtype=np.int16)  # photo grain
+    canvas = np.clip(base, 0, 255).astype(np.uint8)
+
+    # Mortar body + flat dispenser-style cavity at x 115..185 (centre 150).
+    cv2.circle(canvas, (150, 75), 62, (155, 155, 155), -1)
+    cv2.circle(canvas, (150, 75), 62, (95, 95, 95), 3)
+    cv2.rectangle(canvas, (115, 55), (185, 95), (120, 120, 120), -1)
+    cv2.rectangle(canvas, (115, 55), (185, 95), (70, 70, 70), 2)
+
+    # Warm wooden pestle (BGR), parked at `piece_left` (may overflow the right edge).
+    cv2.rectangle(canvas, (piece_left, 40), (piece_left + 62, 92), (60, 110, 170), -1)
+    return canvas
+
+
+def test_solve_puzzle_cv_photo_scene_piece_parked_right_drags_left():
+    from browser_bridge.captcha_detector import solve_puzzle_cv
+
+    res = solve_puzzle_cv(
+        _shopee_photo_scene(piece_left=238),  # clipped against the right edge
+        canvas_rect={"x": 0, "y": 0, "width": 280, "height": 150},
+        track_rect={"x": 0, "y": 165, "width": 280, "height": 40},
+        handle_rect={"x": 4, "y": 165, "width": 40, "height": 40},
+        device_pixel_ratio=1.0,
+    )
+    assert res["ok"] is True
+    assert res["piece_kind"] == "warm"  # the pestle itself, not a backdrop edge
+    assert res["direction"] == "left"
+    assert -170 <= res["travel"] <= -50  # pushes the piece back toward the cavity
+    assert res["travel"] == res["puzzle_travel"]
+
+
+def test_solve_puzzle_cv_photo_scene_piece_parked_left_drags_right():
+    from browser_bridge.captcha_detector import solve_puzzle_cv
+
+    res = solve_puzzle_cv(
+        _shopee_photo_scene(piece_left=20),
+        canvas_rect={"x": 0, "y": 0, "width": 280, "height": 150},
+        track_rect={"x": 0, "y": 165, "width": 280, "height": 40},
+        handle_rect={"x": 4, "y": 165, "width": 40, "height": 40},
+        device_pixel_ratio=1.0,
+    )
+    assert res["ok"] is True
+    assert res["piece_kind"] == "warm"
+    assert res["direction"] == "right"
+    assert 50 <= res["travel"] <= 170
+
+
 def test_solve_compartment_receptacle_subpixel_and_adaptive_jitter():
     import cv2
     import numpy as np

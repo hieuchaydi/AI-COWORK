@@ -2121,24 +2121,15 @@ async function captureTabEvidence(tabId) {
     try {
       await chrome.tabs.update(targetId, { active: true });
       if (tab.windowId && chrome.windows) await chrome.windows.update(tab.windowId, { focused: true });
-      await new Promise((r) => setTimeout(r, 200));
+      await new Promise((r) => setTimeout(r, 150));
     } catch {}
-    return await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
 
     // 1. Thử capture qua chrome.tabs.captureVisibleTab
-    if (chrome.tabs?.captureVisibleTab) {
-      try {
-        const tab = await chrome.tabs.get(targetId);
-        if (tab?.windowId) {
-          await chrome.tabs.update(targetId, { active: true });
-          if (tab.windowId && chrome.windows) await chrome.windows.update(tab.windowId, { focused: true });
-          await new Promise((r) => setTimeout(r, 150));
-          const res = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
-          if (res) return res;
-        }
-      } catch (tabsErr) {
-        console.warn("[bridge] captureVisibleTab failed, trying debugger fallback:", tabsErr?.message || tabsErr);
-      }
+    try {
+      const res = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+      if (res) return res;
+    } catch (tabsErr) {
+      console.warn("[bridge] captureVisibleTab failed, trying debugger fallback:", tabsErr?.message || tabsErr);
     }
 
     // 2. Dự phòng bằng Chrome Debugger API Page.captureScreenshot (luôn hoạt động)
@@ -2397,7 +2388,7 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
           const bRect = bgEl.getBoundingClientRect();
           const pieceInitialX = pRect.left - bRect.left;
           if (pieceInitialX >= 0) {
-            const defaultTargetX = (bRect.width - pRect.width) * 0.58;
+            const defaultTargetX = (bRect.width - pRect.width) * 0.64;
             const targetTravel = Math.round((defaultTargetX - pieceInitialX) * (maxTravel / bRect.width));
             if (targetTravel > 40 && targetTravel < maxTravel) {
               return { method: "dom_piece_estimate", travel: targetTravel, maxTravel, domInfo };
@@ -2405,10 +2396,11 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
           }
         }
 
-        // 5. Fallback chuẩn theo tỉ lệ vàng của slider puzzle Shopee (~ 58% track)
+        // 5. Fallback chuẩn theo phân phối Shopee CAPTCHA: thanh trượt thường kéo khoảng >60% (~64% track)
+        console.warn("[bridge] No CV/DOM evidence — falling back to the blind 64%-of-track guess");
         return {
           method: "golden_ratio_fallback",
-          travel: Math.round(maxTravel * 0.58),
+          travel: Math.round(maxTravel * 0.64),
           maxTravel,
           domInfo
         };
@@ -2437,9 +2429,25 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
         });
         if (cvRes.ok) {
           const cvData = await cvRes.json();
-          if (cvData?.ok && typeof cvData.travel === "number" && cvData.travel > 0) {
-            console.log(`[bridge] CV puzzle solver success: method=${cvData.method}, travel=${cvData.travel}px, confidence=${cvData.confidence}`);
-            return cvData.travel;
+          // Signed travel: a NEGATIVE value means the piece must be dragged LEFT — Shopee
+          // parks the sprite against the right edge for several prop variants (mortar & pestle,
+          // tray & lid). Squashing those to a positive "usual" drag is what pushed the piece
+          // out of the frame, so the solver's answer is now taken as-is.
+          if (cvData?.ok && Number.isFinite(cvData.travel) && cvData.travel !== 0) {
+            const travel = Math.trunc(cvData.travel);
+            const dbg = cvData.debug_info || cvData.details || {};
+            console.log(
+              `[bridge] CV puzzle solver: method=${cvData.method}, travel=${travel}px, ` +
+              `direction=${cvData.direction || (travel < 0 ? "left" : "right")}, ` +
+              `confidence=${cvData.confidence}, piece=${JSON.stringify(dbg.piece_center || dbg.piece_x_phys || null)}, ` +
+              `slot=${JSON.stringify(dbg.slot_center || dbg.target_x_phys || null)}`
+            );
+            return travel;
+          }
+          if (cvData && cvData.ok === false) {
+            // Most common cause: the sidecar Python lacks numpy/opencv → say so loudly instead
+            // of silently degrading to the crude heuristics below.
+            console.warn(`[bridge] CV puzzle solver unavailable: ${cvData.error || "unknown error"}`);
           }
         }
       }
@@ -2455,7 +2463,8 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
   }
 
   const fallbackMax = Math.max(120, Number(sliderInfo?.width || 300) - 44);
-  return Math.round(fallbackMax * 0.58);
+  console.warn("[bridge] No puzzle evidence at all — blind 64%-of-track guess as last resort");
+  return Math.round(fallbackMax * 0.64);
 }
 
 /**
@@ -2468,7 +2477,8 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
 function generateHumanTrajectory(startX, startY, distance) {
   const points = [];
   const totalSteps = 26 + Math.floor(Math.random() * 8); // 26-34 bước
-  const overshoot = 2 + Math.floor(Math.random() * 3);   // Lố nhẹ 2-4px
+  // Overshoot follows the drag's own direction (a leftward drag overshoots to the left).
+  const overshoot = (distance < 0 ? -1 : 1) * (2 + Math.floor(Math.random() * 3)); // Lố nhẹ 2-4px
   const targetXWithOvershoot = startX + distance + overshoot;
 
   let currentY = startY;
@@ -2523,6 +2533,12 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
         func: () => {
           // 1. Selector chuẩn cho nút trượt
           const handleSelectors = [
+            "canvas.MqzVM5",
+            "div._4U309i canvas",
+            "div._4U309i",
+            "div.FkR97h",
+            "canvas[style*='cursor: pointer']",
+            "canvas[style*='cursor:pointer']",
             ".shopee-captcha-slider__btn",
             ".shopee-captcha-slider__button",
             "div[class*='slider__btn']",
@@ -2734,16 +2750,20 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
   const startY = slider.y;
   let distance = await calculatePuzzleDistance(tabId, slider);
   const attemptNum = Number(options?.attempt || detection?.attempt || 1);
+  // Keep the sign of the travel (left drags are real) — only guard the magnitude.
+  const withMinMagnitude = (d) => (d < 0 ? -Math.max(8, Math.abs(d)) : Math.max(8, d));
   if (attemptNum > 1) {
     // P1-1: Nếu là lần thử thứ 2+, bù trừ micro-jitter có định hướng (+4px, -4px, +8px, -8px)
     // để khắc phục triệt để hiện tượng kéo "gần tới" (thiếu) hoặc "kéo quá 1 chút" (thừa)
     const sign = attemptNum % 2 === 0 ? 1 : -1;
     const step = 4 + Math.floor((attemptNum - 2) / 2) * 4;
-    const jitter = sign * step;
-    distance = Math.max(40, distance + jitter);
+    // Jitter follows the drag's direction: on a leftward drag "go further" means further left.
+    const dir = distance < 0 ? -1 : 1;
+    const jitter = sign * dir * step;
+    distance = withMinMagnitude(distance + jitter);
     console.log(`[bridge] Auto-drag retry #${attemptNum}: applying micro-jitter ${jitter >= 0 ? "+" : ""}${jitter}px -> distance: ${distance}px (startX: ${startX}, startY: ${startY})`);
   } else {
-    console.log(`[bridge] Calculated puzzle travel: ${distance}px (startX: ${startX}, startY: ${startY})`);
+    console.log(`[bridge] Calculated puzzle travel: ${distance}px (${distance < 0 ? "left" : "right"}, startX: ${startX}, startY: ${startY})`);
   }
   const points = generateHumanTrajectory(startX, startY, distance);
   const endX = startX + distance;
@@ -2877,6 +2897,12 @@ async function detectCaptchaInTab(tabId, options = {}) {
 
         // 2. Tìm Nút trượt màu cam (Slider Handle/Button) - Nút người dùng cần kéo
         const handleSelectors = [
+          "canvas.MqzVM5",
+          "div._4U309i canvas",
+          "div._4U309i",
+          "div.FkR97h",
+          "canvas[style*='cursor: pointer']",
+          "canvas[style*='cursor:pointer']",
           ".shopee-captcha-slider__btn",
           ".shopee-captcha-slider__button",
           "div[class*='slider__btn']",
@@ -3895,6 +3921,24 @@ async function handleAction(action, params) {
       };
     }
 
+    case "captcha.solve":
+    case "captcha.autoSolve": {
+      const targetTabId = params.tabId || (await getActiveTabId());
+      if (!targetTabId) throw new Error("No target tab specified");
+      const check = await detectCaptchaInTab(targetTabId, { scrollIntoView: true });
+      if (!check?.detected) {
+        return { ok: false, attempted: false, message: "No CAPTCHA challenge detected on target tab", check };
+      }
+      const attempt = Number(params.attempt || 1);
+      const dragResult = await tryAutoDragShopeeCaptcha(targetTabId, check, { attempt });
+      return {
+        ok: Boolean(dragResult?.attempted),
+        attempted: Boolean(dragResult?.attempted),
+        check,
+        dragResult,
+      };
+    }
+
     case "fetch.sameOrigin": {
       const targetTabId = params.tabId || (await getActiveTabId());
       const tab = await chrome.tabs.get(targetTabId);
@@ -4398,20 +4442,22 @@ async function connectBridge() {
       let wsUrl = stored.gatewayUrl || "ws://127.0.0.1:8766/browser/v1/ws";
       if (stored.connectionEnabled === false) {
         let shouldAutoRecover = false;
-        try {
-          const statusUrl = new URL(wsUrl || "ws://127.0.0.1:8766/browser/v1/ws");
-          statusUrl.protocol = statusUrl.protocol === "wss:" ? "https:" : "http:";
-          if (statusUrl.port === "8767") statusUrl.port = "8766";
-          statusUrl.pathname = "/browser/status";
-          statusUrl.search = statusUrl.hash = "";
-          const statusRes = await fetch(statusUrl.toString(), { cache: "no-store" });
-          if (statusRes.ok) {
-            const statusData = await statusRes.json();
-            if (statusData && statusData.connected === false) {
-              shouldAutoRecover = true;
+        if (stored.connectionConflict) {
+          try {
+            const statusUrl = new URL(wsUrl || "ws://127.0.0.1:8766/browser/v1/ws");
+            statusUrl.protocol = statusUrl.protocol === "wss:" ? "https:" : "http:";
+            if (statusUrl.port === "8767") statusUrl.port = "8766";
+            statusUrl.pathname = "/browser/status";
+            statusUrl.search = statusUrl.hash = "";
+            const statusRes = await fetch(statusUrl.toString(), { cache: "no-store" });
+            if (statusRes.ok) {
+              const statusData = await statusRes.json();
+              if (statusData && statusData.connected === false) {
+                shouldAutoRecover = true;
+              }
             }
-          }
-        } catch {}
+          } catch {}
+        }
         if (!shouldAutoRecover) {
           connectionEnabled = false;
           closeBridgeSocket({ rejectPending: true });
@@ -4762,5 +4808,6 @@ if (typeof module !== "undefined" && module.exports) {
     calculatePuzzleDistance,
     generateHumanTrajectory,
     tryAutoDragShopeeCaptcha,
+    handleAction,
   };
 }

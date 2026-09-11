@@ -42,8 +42,11 @@ dev = ["pytest>=8", "pytest-asyncio", "httpx"]
 # aiohttp is slack-bolt's Socket Mode transport at runtime (and the FakeSlack test harness
 # drives the real handler) — declare it so CI installs it, not just transitively.
 messaging = ["python-telegram-bot>=21", "slack-bolt>=1.18", "aiohttp>=3.9"]
-# Interactive Cowork browser automation.
-browser = ["playwright>=1.44"]
+# Interactive Cowork browser automation. numpy + opencv-power the CAPTCHA CV solver
+# (browser_bridge/captcha_detector.py) served by the launcher's helper on :8766 — without
+# them `/browser/solve_puzzle_cv` answers `cv2_or_numpy_missing` and the extension silently
+# degrades to its crude pixel/golden-ratio guesses (5-15px systematic error, clipped pieces).
+browser = ["playwright>=1.44", "numpy>=1.26", "opencv-python-headless>=4.9"]
 # AWS Bedrock provider (lazy-imported; desktop builds bundle it, pip users opt in).
 bedrock = ["boto3>=1.34"]
 

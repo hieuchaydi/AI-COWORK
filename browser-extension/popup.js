@@ -454,6 +454,8 @@ async function changeConnection(action) {
     }
     const response = await chrome.runtime.sendMessage({
       action,
+      url: gatewayUrlInput.value.trim(),
+      token: pairingTokenInput.value.trim(),
       url,
       token,
       // A manual Connect is the explicit user consent to take over the owner lease.
@@ -463,31 +465,12 @@ async function changeConnection(action) {
     await new Promise((r) => setTimeout(r, 500));
     await loadConfig();
   } catch (error) {
+    document.getElementById("connectionError").textContent = error.message;
     if (errEl) errEl.textContent = error.message;
   }
 }
 
-btnAutoPair.addEventListener("click", async () => {
-  btnAutoPair.disabled = true;
-  btnAutoPair.textContent = "Đang kết nối...";
-  const errEl = document.getElementById("connectionError");
-  if (errEl) errEl.textContent = "Đang tự động ghép nối với Gateway...";
-  try {
-    const url = gatewayUrlInput.value.trim() || "ws://127.0.0.1:8766/browser/v1/ws";
-    const response = await chrome.runtime.sendMessage({
-      action: "autoPair",
-      url,
-    });
-    if (!response || !response.ok) throw new Error(response?.error || "Extension worker không phản hồi");
-    await new Promise((r) => setTimeout(r, 600));
-    await loadConfig();
-  } catch (error) {
-    if (errEl) errEl.textContent = error.message;
-  } finally {
-    btnAutoPair.disabled = false;
-    btnAutoPair.textContent = "Auto Pair";
-  }
-});
+btnAutoPair.addEventListener("click", () => changeConnection("connect"));
 btnConnect.addEventListener("click", () => changeConnection("connect"));
 btnDisconnect.addEventListener("click", () => changeConnection("disconnect"));
 btnExportSnapshot.addEventListener("click", exportSnapshot);
