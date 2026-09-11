@@ -11,7 +11,8 @@ Today: `openai` (the default, with an optional custom endpoint that covers Azure
 `AnthropicProvider`), `gemini` (native Google GenAI API via `GeminiProvider`), `bedrock`
 (models in the user's own AWS account — Claude natively, everything else via Converse),
 `vertex` (the user's own GCP project — Gemini and Claude natively, open-weight via the
-MaaS endpoint), and `ollama` (local, OpenAI-compatible `/v1`).
+MaaS endpoint), and `ollama` (a local server, or Ollama Cloud with an API key — both
+OpenAI-compatible `/v1`).
 """
 
 from __future__ import annotations
@@ -29,6 +30,10 @@ from .openai_provider import OpenAIProvider
 from .vertex_provider import VertexProvider
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
+# Ollama Cloud — same OpenAI-compatible `/v1` surface, but inference needs an API key
+# (`OLLAMA_API_KEY`, https://ollama.com/settings/keys). Model ids are the published tags,
+# e.g. `gpt-oss:120b`.
+OLLAMA_CLOUD_URL = "https://ollama.com"
 CLOUDFLARE_API_ROOT = "https://api.cloudflare.com/client/v4/accounts"
 CLOUDFLARE_MAX_TOKENS = 8192
 
@@ -179,10 +184,34 @@ def _build_vertex(profile: dict[str, Any], secrets: Any) -> ProviderClient:
 
 
 def _build_ollama(profile: dict[str, Any], secrets: Any) -> ProviderClient:
-    # Ollama's OpenAI-compatible endpoint ignores the key but the SDK requires a non-empty
-    # string, so we pass a placeholder. `base_url` comes from the stored profile (or the default).
-    base_url = _normalize_ollama_url((profile or {}).get("base_url"))
-    return OpenAIProvider(api_key="ollama", base_url=base_url)
+    # Two deployments share this provider: a local `ollama serve` (keyless — the endpoint
+    # ignores the key, but the SDK requires a non-empty string, so we pass a placeholder) and
+    # Ollama Cloud (key required). A stored/env key with no explicit endpoint means the cloud,
+    # so the key alone is enough to point the provider at ollama.com.
+    profile = profile or {}
+    key = ollama_api_key(profile)
+    base_url = _normalize_ollama_url(
+        (profile.get("base_url") or "").strip() or (OLLAMA_CLOUD_URL if key else "")
+    )
+    return OpenAIProvider(api_key=key or "ollama", base_url=base_url)
+
+
+def ollama_api_key(profile: Optional[dict[str, Any]] = None) -> str:
+    """The Ollama API key: stored profile first, then `OLLAMA_API_KEY`. Empty for a keyless
+    local server."""
+    return ((profile or {}).get("api_key") or "").strip() or os.environ.get(
+        "OLLAMA_API_KEY", ""
+    ).strip()
+
+
+def ollama_is_cloud(profile: Optional[dict[str, Any]] = None) -> bool:
+    """Whether the ollama provider is pointed at Ollama Cloud (keyed, remote) rather than a
+    local server. A key with no endpoint override means the cloud; an explicit local URL
+    (`localhost`, a LAN host, …) means local even when a key is present."""
+    stored = ((profile or {}).get("base_url") or "").strip().rstrip("/")
+    if stored:
+        return stored.startswith(OLLAMA_CLOUD_URL)
+    return bool(ollama_api_key(profile))
 
 
 def _openai_compat(
@@ -698,22 +727,31 @@ DESCRIPTORS: list[ProviderDescriptor] = [
     ),
     ProviderDescriptor(
         name="ollama",
-        title="Ollama (local models)",
+        title="Ollama (local + cloud models)",
         needs_key=False,
         fields=[
+            ProviderField(
+                "api_key",
+                "Ollama API key (optional)",
+                secret=True,
+                required=False,
+                help="Paste an Ollama Cloud key (ollama.com ▸ Settings ▸ Keys) to use the hosted models — gpt-oss:120b and friends. Leave blank for a local `ollama serve`.",
+            ),
             ProviderField(
                 "base_url",
                 "Ollama server URL",
                 secret=False,
                 required=False,
                 placeholder=DEFAULT_OLLAMA_URL,
-                help="Where `ollama serve` is listening. The OpenAI-compatible /v1 path is added automatically.",
+                help="Where `ollama serve` is listening — or https://ollama.com for the cloud. The OpenAI-compatible /v1 path is added automatically.",
             ),
         ],
         build=_build_ollama,
-        # connect-AI: matches the model pre-pulled by our launcher setup.
-        # `ollama pull qwen2.5:7b` (~4.7GB, fits comfortably in 24GB RAM).
-        recommended_model="qwen2.5:7b",
+        # Cloud-first default: `gpt-oss:120b` is on every Ollama Cloud account and pulls
+        # locally as well (`ollama pull gpt-oss:120b`). Added to the picker on configure.
+        recommended_model="gpt-oss:120b",
+        env_key="OLLAMA_API_KEY",
+        blurb="Local models via `ollama serve`, or Ollama Cloud with an API key (gpt-oss:120b, …).",
     ),
 ]
 
@@ -1024,8 +1062,14 @@ def verify_provider_key(
                 timeout=timeout,
             )
         elif name == "ollama":
-            base = _normalize_ollama_url(base_url)
-            resp = httpx.get(base.rstrip("/") + "/models", timeout=timeout)
+            # Local servers ignore the header; Ollama Cloud 401s without it.
+            base = _normalize_ollama_url(
+                (base_url or "").strip() or (OLLAMA_CLOUD_URL if key else "")
+            )
+            kwargs: dict[str, Any] = {"timeout": timeout}
+            if key:
+                kwargs["headers"] = {"Authorization": f"Bearer {key}"}
+            resp = httpx.get(base.rstrip("/") + "/models", **kwargs)
         else:  # openai + any OpenAI-compatible endpoint (Azure, OpenRouter, vendors, vLLM…)
             default_base = next(
                 (f.default for f in d.fields if f.key == "base_url" and f.default), ""
@@ -1050,6 +1094,8 @@ def verify_provider_key(
         return {"ok": True}
     if resp.status_code in (401, 403):
         if name == "ollama":
+            if key:
+                return {"ok": False, "error": "Ollama rejected the API key."}
             return {"ok": False, "error": "Server rejected the request."}
         return {"ok": False, "error": "Invalid API key."}
     if resp.status_code == 404 and name == "ollama":

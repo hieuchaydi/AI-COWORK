@@ -113,6 +113,10 @@ COHERE_KEY = os.environ.get("COHERE_API_KEY", "")
 AION_KEY = os.environ.get("AION_API_KEY", "")
 CLOUDFLARE_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
 CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+# Ollama Cloud (https://ollama.com/settings/keys). Local `ollama serve` needs no key; with a key
+# the ollama provider points at ollama.com instead and serves the hosted tags (gpt-oss:120b, …).
+OLLAMA_KEY = os.environ.get("OLLAMA_API_KEY", "")
+OLLAMA_BASE_URL = (os.environ.get("OLLAMA_BASE_URL", "") or "https://ollama.com").strip().rstrip("/")
 API_TOKEN = os.environ.get("CONNECT_AI_API_TOKEN") or os.environ.get(
     "COWORKER_API_TOKEN", "connect-ai-dev-token"
 )
@@ -4368,6 +4372,21 @@ def _seed_runtime_state() -> None:
         picker.extend([
             "cloudflare:google/gemini-3.8-flash",
         ])
+    # Ollama Cloud — the same OpenAI-compatible `/v1` surface as a local server, so a key is
+    # the whole configuration. `set_provider` already drops `recommended_model` into the picker;
+    # the extra ids below are the other tags worth having one click away.
+    if OLLAMA_KEY:
+        _ow_post(
+            "/v1/providers",
+            {"name": "ollama", "fields": {
+                "api_key": OLLAMA_KEY,
+                "base_url": OLLAMA_BASE_URL,
+            }},
+        )
+        picker.extend([
+            "ollama:gpt-oss:120b",
+            "ollama:gpt-oss:20b",
+        ])
     # Auto-add Claude models when the key is present — best tool-use quality.
     if ANTHROPIC_KEY:
         picker[:0] = [
@@ -4422,6 +4441,8 @@ def _seed_runtime_state() -> None:
         default_model = "cloudflare:google/gemini-3.8-flash"
     elif COHERE_KEY:
         default_model = "cohere:command-a-reasoning-08-2025"
+    elif OLLAMA_KEY:
+        default_model = "ollama:gpt-oss:120b"
     else:
         default_model = "gemini:gemini-3.5-flash-lite"
     _ow_post("/v1/settings/default-model", {"model": default_model})
@@ -4823,6 +4844,9 @@ def main() -> None:
         env["COHERE_API_KEY"] = COHERE_KEY
     if AION_KEY:
         env["AION_API_KEY"] = AION_KEY
+    if OLLAMA_KEY:
+        env["OLLAMA_API_KEY"] = OLLAMA_KEY
+        env["OLLAMA_BASE_URL"] = OLLAMA_BASE_URL
     env["CONNECT_AI_API_TOKEN"] = API_TOKEN
     env["COWORKER_API_TOKEN"] = API_TOKEN  # legacy readers (bridges, old scripts)
     # Pin state dir explicitly. Without this, if launch.py is invoked from a

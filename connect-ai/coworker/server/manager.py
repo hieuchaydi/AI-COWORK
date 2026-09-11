@@ -80,6 +80,12 @@ from ..providers import (
     provider_descriptors,
     verify_provider_key,
 )
+from ..providers.registry import (
+    DEFAULT_OLLAMA_URL,
+    OLLAMA_CLOUD_URL,
+    ollama_api_key,
+    ollama_is_cloud,
+)
 from ..secrets import SecretStore, state_dir
 from ..sessions import SessionRecord
 from ..skills import SkillLoader
@@ -1531,13 +1537,23 @@ class SessionManager:
             "c4ai-aya-expanse-32b",
         ],
     }
+    # Ollama Cloud tags to suggest when the live catalog probe fails (offline, rate-limited):
+    # `gpt-oss:120b` is the everyday agent model there, 20b the cheap one.
+    OLLAMA_CLOUD_FALLBACK_MODELS = ("gpt-oss:120b", "gpt-oss:20b")
 
     def _suggested_models(self, name: str) -> list[str]:
         """Bare model-name suggestions for the 'add model' form (datalist), per provider.
-        Ollama → live `/api/tags` (best-effort); everyone else → the curated matrix,
-        topped up with the compat-vendor extras the matrix doesn't vouch for."""
+        Ollama → live `/api/tags` (best-effort, falling back to the cloud tags we know exist);
+        everyone else → the curated matrix, topped up with the compat-vendor extras the matrix
+        doesn't vouch for."""
         if name == "ollama":
-            return [m.split(":", 1)[-1] for m in self._ollama_models()]
+            live = [m.split(":", 1)[-1] for m in self._ollama_models()]
+            if live:
+                return list(dict.fromkeys(live))
+            profile = self.secrets.get("provider:ollama") or {}
+            if ollama_api_key(profile) and ollama_is_cloud(profile):
+                return list(self.OLLAMA_CLOUD_FALLBACK_MODELS)
+            return []
         from ..providers.matrix import models_for_provider
 
         return list(
@@ -1687,11 +1703,13 @@ class SessionManager:
         return {"ok": True, "dm_session": self.dm_session()}
 
     def _ollama_alive(self) -> bool:
-        """Best-effort local-Ollama liveness, cached 30s (get_settings runs on every GUI
-        fetch — no 2s probe inline). Keyless is not the same as PRESENT: `ollama:*` picker
-        entries render only when an Ollama actually answers, so a machine with no Ollama
-        never shows phantom local models (e.g. a stray pasted string saved as a model id,
-        caught 2026-07-21)."""
+        """Best-effort Ollama liveness, cached 30s (get_settings runs on every GUI fetch — no
+        2s probe inline). Keyless is not the same as PRESENT: `ollama:*` picker entries render
+        only when an Ollama actually answers, so a machine with no Ollama never shows phantom
+        local models (e.g. a stray pasted string saved as a model id, caught 2026-07-21).
+
+        Cloud (`https://ollama.com` via `OLLAMA_API_KEY`) counts only while the key is set —
+        the endpoint serves model listings anonymously, but inference would 401."""
         import time
 
         now = time.monotonic()
@@ -1699,32 +1717,53 @@ class SessionManager:
         if cached and now - cached[0] < 30:
             return cached[1]
         profile = self.secrets.get("provider:ollama") or {}
-        base = (profile.get("base_url") or "http://localhost:11434").strip().rstrip("/")
-        if base.endswith("/v1"):
-            base = base[: -len("/v1")]
-        try:
-            import httpx
+        base, key = self._ollama_endpoint(profile)
+        alive = False
+        if key or not ollama_is_cloud(profile):
+            headers = {"Authorization": f"Bearer {key}"} if key else {}
+            try:
+                import httpx
 
-            alive = httpx.get(base + "/api/tags", timeout=0.8).status_code == 200
-        except Exception:
-            alive = False
+                alive = (
+                    httpx.get(
+                        base + "/api/tags", headers=headers, timeout=0.8
+                    ).status_code
+                    == 200
+                )
+            except Exception:
+                alive = False
         self._ollama_alive_cache = (now, alive)
         return alive
 
+    @staticmethod
+    def _ollama_endpoint(profile: dict[str, Any]) -> tuple[str, str]:
+        """(native API root, api key) for the configured Ollama. Profile first, then env; a key
+        with no stored endpoint means Ollama Cloud, otherwise we stay on the local default.
+        The native root drops any `/v1` suffix (that suffix is for the OpenAI-compatible path)."""
+        key = ollama_api_key(profile)
+        base = (profile.get("base_url") or "").strip().rstrip("/")
+        if not base:
+            base = OLLAMA_CLOUD_URL if key else DEFAULT_OLLAMA_URL
+        if base.endswith("/v1"):
+            base = base[: -len("/v1")]
+        return base, key
+
     def _ollama_models(self) -> list[str]:
-        """Live list of models pulled into the configured Ollama server (via its native
-        `/api/tags`), as `ollama:<name>` so they're directly selectable. Empty if Ollama isn't
-        configured or unreachable — best-effort, never raises."""
+        """Live list of models the configured Ollama serves (its native `/api/tags`), as
+        `ollama:<name>` so they're directly selectable — a local server's pulled models, or the
+        Ollama Cloud catalog (keyed). Empty if Ollama isn't configured or unreachable —
+        best-effort, never raises."""
         profile = self.secrets.get("provider:ollama")
         if not profile:
             return []
-        base = (profile.get("base_url") or "http://localhost:11434").strip().rstrip("/")
-        if base.endswith("/v1"):
-            base = base[: -len("/v1")]
+        base, key = self._ollama_endpoint(profile)
+        if key == "" and ollama_is_cloud(profile):
+            return []  # cloud catalog is useless without the key that pays for it
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
         try:
             import httpx
 
-            data = httpx.get(base + "/api/tags", timeout=2.0).json()
+            data = httpx.get(base + "/api/tags", headers=headers, timeout=2.0).json()
             return [
                 f"ollama:{m['name']}" for m in data.get("models", []) if m.get("name")
             ]
@@ -3698,6 +3737,10 @@ class SessionManager:
         invalidate = getattr(self.provider, "invalidate", None)
         if callable(invalidate):
             invalidate(name)
+        # A changed ollama endpoint/key must not wait out the liveness probe's 30s cache —
+        # otherwise the picker looks stale right after the user saves the form.
+        if name in (None, "ollama"):
+            self._ollama_alive_cache = None
 
     # -- read models ------------------------------------------------------------
     def list_sessions(self, workspace: Optional[str] = None) -> list[dict[str, Any]]:

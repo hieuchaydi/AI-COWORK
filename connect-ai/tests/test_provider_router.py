@@ -13,6 +13,7 @@ from coworker.providers import (
     ProviderRouter,
     StreamChunk,
     capabilities_for,
+    get_descriptor,
 )
 from coworker.providers.registry import _normalize_ollama_url, build_provider_client
 from coworker.providers.openai_provider import _salvage_tool_calls_from_text
@@ -89,6 +90,7 @@ def test_build_ollama_client_uses_base_url(monkeypatch):
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
     monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
     client = build_provider_client(
         "ollama", {"base_url": "http://box:11434"}, secrets=None
@@ -96,6 +98,103 @@ def test_build_ollama_client_uses_base_url(monkeypatch):
     client._ensure_client()  # type: ignore[attr-defined]
     assert captured["base_url"] == "http://box:11434/v1"
     assert captured["api_key"] == "ollama"  # placeholder, Ollama ignores it
+
+
+# -- ollama cloud (key in the profile or OLLAMA_API_KEY) --------------------------
+def test_ollama_descriptor_takes_an_optional_key():
+    d = get_descriptor("ollama")
+    assert d is not None and d.env_key == "OLLAMA_API_KEY"
+    assert d.recommended_model == "gpt-oss:120b"
+    key_field = next(f for f in d.fields if f.key == "api_key")
+    assert key_field.secret and not key_field.required
+
+
+def test_build_ollama_client_uses_env_key_and_cloud_default(monkeypatch):
+    captured: dict = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("OLLAMA_API_KEY", "cloud-key")
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+    build_provider_client("ollama", {}, secrets=None)._ensure_client()  # type: ignore[attr-defined]
+    assert captured == {"api_key": "cloud-key", "base_url": "https://ollama.com/v1"}
+
+
+def test_build_ollama_client_prefers_stored_key_and_explicit_url(monkeypatch):
+    captured: dict = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("OLLAMA_API_KEY", "env-key")
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+    client = build_provider_client(
+        "ollama",
+        {"api_key": "stored-key", "base_url": "http://192.168.1.9:11434"},
+        secrets=None,
+    )
+    client._ensure_client()  # type: ignore[attr-defined]
+    assert captured == {
+        "api_key": "stored-key",
+        "base_url": "http://192.168.1.9:11434/v1",
+    }
+
+
+def test_ollama_cloud_needs_the_key_and_lists_remote_models(monkeypatch, tmp_path):
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    calls: list[tuple[str, dict]] = []
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"models": [{"name": "gpt-oss:120b"}, {"name": "gpt-oss:20b"}]}
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setattr("httpx.get", fake_get)
+    from coworker.server.manager import SessionManager
+
+    mgr = SessionManager(data_dir=tmp_path)
+    mgr.set_provider("ollama", {"base_url": "https://ollama.com"})
+    # Cloud without a key: not usable, and the probe never hits the wire.
+    assert mgr._ollama_alive() is False
+    assert calls == []
+
+    mgr.set_provider("ollama", {"api_key": "cloud-key"})
+    assert mgr._ollama_alive() is True
+    assert calls[-1][0] == "https://ollama.com/api/tags"
+    assert calls[-1][1]["headers"] == {"Authorization": "Bearer cloud-key"}
+    assert mgr._ollama_models() == ["ollama:gpt-oss:120b", "ollama:gpt-oss:20b"]
+    # Suggestions are bare names (no `ollama:` prefix) for the add-model form.
+    assert mgr._suggested_models("ollama") == ["gpt-oss:120b", "gpt-oss:20b"]
+    # Recommended model lands in the picker, prefixed, right after configuring.
+    assert "ollama:gpt-oss:120b" in mgr.get_settings()["models"]
+
+
+def test_ollama_suggestions_fall_back_to_cloud_tags_when_probe_fails(monkeypatch, tmp_path):
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+
+    def boom(*args, **kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr("httpx.get", boom)
+    from coworker.server.manager import SessionManager
+
+    mgr = SessionManager(data_dir=tmp_path)
+    mgr.set_provider("ollama", {"api_key": "cloud-key", "base_url": "https://ollama.com"})
+    assert mgr._suggested_models("ollama") == ["gpt-oss:120b", "gpt-oss:20b"]
+    # A local server keeps an empty suggestion list — no phantom cloud tags.
+    mgr.set_provider("ollama", {"base_url": "http://localhost:11434"})
+    assert mgr._suggested_models("ollama") == []
 
 
 # -- router routing -------------------------------------------------------------
@@ -400,11 +499,11 @@ def test_set_provider_auto_adds_recommended_when_pulled(tmp_path, monkeypatch):
     monkeypatch.setattr(  # pretend the recommended model is pulled
         mgr,
         "_suggested_models",
-        lambda name: ["qwen2.5:7b"] if name == "ollama" else [],
+        lambda name: ["gpt-oss:120b"] if name == "ollama" else [],
     )
     res = mgr.set_provider("ollama", {"base_url": "http://localhost:11434"})
-    assert res["recommended_model"] == "qwen2.5:7b"
-    assert "ollama:qwen2.5:7b" in mgr.get_settings()["models"]
+    assert res["recommended_model"] == "gpt-oss:120b"
+    assert "ollama:gpt-oss:120b" in mgr.get_settings()["models"]
 
 
 def test_set_provider_skips_recommended_when_not_pulled(tmp_path, monkeypatch):
@@ -414,7 +513,7 @@ def test_set_provider_skips_recommended_when_not_pulled(tmp_path, monkeypatch):
     mgr = SessionManager(data_dir=tmp_path)
     monkeypatch.setattr(mgr, "_suggested_models", lambda name: [])  # nothing pulled
     mgr.set_provider("ollama", {"base_url": "http://localhost:11434"})
-    assert "ollama:qwen2.5:7b" not in mgr.get_settings()["models"]
+    assert "ollama:gpt-oss:120b" not in mgr.get_settings()["models"]
 
 
 def test_provider_builders(monkeypatch):
