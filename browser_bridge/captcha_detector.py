@@ -266,6 +266,11 @@ def detect_sprite_piece(canvas_bgr: Any, gray: Any = None) -> Optional[Dict[str,
         # Tinted plastic pieces.
         "blue": ((b - r > 25) & (b > 120)),
     }
+    # Dark props (chess-piece / silhouette sprites) only appear on photographic backdrops. The
+    # synthetic flat canvases the unit tests build use a dark rectangle as the *cavity*, so the
+    # family stays out of their way and their historical contracts are preserved.
+    if distinct_colour_count(canvas_bgr) > 400:
+        masks["dark"] = (gray < 85) & (hsv_s < 150)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     best: Optional[Dict[str, Any]] = None
@@ -285,8 +290,12 @@ def detect_sprite_piece(canvas_bgr: Any, gray: Any = None) -> Optional[Dict[str,
             if bw * bh > 0.55 * cw * ch:
                 continue
             fill = area / float(max(1, bw * bh))
-            if fill < 0.18:
-                continue  # sparse speckle, not a solid sprite
+            # cv2.contourArea reports the *outer* polygon, so a hollow outline (a cavity border)
+            # scores as a full rectangle. Count actual mask pixels inside the box instead: a
+            # movable sprite is solid, an outline is not.
+            pixel_fill = float(np.count_nonzero(m[by:by + bh, bx:bx + bw])) / float(max(1, bw * bh))
+            if pixel_fill < (0.30 if kind == "dark" else 0.15):
+                continue  # sparse speckle or a hollow outline, not a solid sprite
             mrect = cv2.minAreaRect(c)
             (mcx, mcy), (rw, rh), angle = mrect
             long_side, short_side = max(rw, rh), max(1.0, min(rw, rh))
@@ -315,6 +324,78 @@ def detect_sprite_piece_safe(canvas_bgr: Any, gray: Any = None) -> Optional[Dict
         return detect_sprite_piece(canvas_bgr, gray)
     except Exception as exc:  # noqa: BLE001 - defensive: solver must degrade, not crash
         logger.warning("Sprite detection failed: %s", exc)
+        return None
+
+
+def detect_outlined_hole(canvas_bgr: Any, gray: Any = None) -> Optional[Dict[str, Any]]:
+    """Find the jigsaw cut-out: a compact outlined region whose interior is flat background.
+
+    The current Shopee challenge draws the hole as a bright outline around a low-variance area
+    (the hole shows the backdrop's next layer), while the movable sprite is a solid blob. Relying
+    on edges alone used to pair the hole with whatever strong edge was nearby, which pointed the
+    drag away from the hole — the piece landed "almost right" and the challenge never validated.
+
+    Returns ``{center, bbox, w, h, area, std}`` in canvas pixels, or ``None``.
+    """
+    try:
+        import numpy as np
+        import cv2
+    except ImportError:  # pragma: no cover - callers guard this
+        return None
+
+    if canvas_bgr is None or getattr(canvas_bgr, "size", 0) == 0:
+        return None
+    if gray is None:
+        gray = cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2GRAY)
+    ch, cw = gray.shape[:2]
+
+    edges = cv2.Canny(gray, 40, 130)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+    cnts, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    best = None
+    best_score = 0.0
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        if w < 22 or h < 22 or w > cw * 0.55 or h > ch * 0.8:
+            continue
+        if not (0.5 <= w / float(h) <= 2.2):
+            continue
+        pad_x, pad_y = max(2, int(w * 0.22)), max(2, int(h * 0.22))
+        interior = gray[y + pad_y:y + h - pad_y, x + pad_x:x + w - pad_x]
+        if interior.size < 100:
+            continue
+        std = float(np.std(interior))
+        if std > 34:
+            continue  # textured → that's scenery, not a cut-out
+        perimeter = float(cv2.arcLength(c, True))
+        if perimeter <= 0:
+            continue
+        area = float(cv2.contourArea(c))
+        if area < 0.35 * w * h:
+            continue
+        # A cut-out is flat inside but strongly outlined; prefer the flattest, best enclosed one.
+        score = (area / float(w * h)) * (200.0 / (std + 6.0)) * min(1.0, perimeter / (2.0 * (w + h)))
+        if score > best_score:
+            best_score = score
+            best = {
+                "center": (float(x + w / 2.0), float(y + h / 2.0)),
+                "bbox": (int(x), int(y), int(w), int(h)),
+                "w": float(w),
+                "h": float(h),
+                "area": int(area),
+                "std": round(std, 2),
+            }
+    return best
+
+
+def detect_outlined_hole_safe(canvas_bgr: Any, gray: Any = None) -> Optional[Dict[str, Any]]:
+    """`detect_outlined_hole` that never raises."""
+    try:
+        return detect_outlined_hole(canvas_bgr, gray)
+    except Exception as exc:  # noqa: BLE001 - solver contract: degrade, never crash
+        logger.warning("Hole detection failed: %s", exc)
         return None
 
 
@@ -995,6 +1076,41 @@ def solve_puzzle_cv(
     # and cannot beat real piece evidence; on the synthetic flat canvases (a handful of
     # colours) the classic methods stay authoritative so their contracts are unchanged.
     is_photographic = distinct_colour_count(canvas_crop) > 400
+
+    # Method 0a: outlined cut-out + solid sprite on a photographic scene. The hole is a flat,
+    # strongly outlined region; the movable sprite is a solid blob (warm/bright/blue/dark). Pair
+    # them directly and keep the sign, instead of letting edge heuristics pair the hole with a
+    # neighbouring edge — the failure that dragged the piece away from the hole.
+    if is_photographic:
+        hole = detect_outlined_hole_safe(canvas_crop, gray)
+        if hole is not None and sprite_piece is not None:
+            hole_x = float(hole["center"][0])
+            sprite_x = float(sprite_piece["center"][0])
+            delta = hole_x - sprite_x
+            if 18.0 <= abs(delta) <= cw * 0.92:
+                return {
+                    "ok": True,
+                    "travel": int(round(delta / max(0.1, scale))),
+                    "puzzle_travel": int(round(delta / max(0.1, scale))),
+                    "max_travel": int(round(max(50.0, (float(track_rect.get("width")) if track_rect else cw) - (float(handle_rect.get("width")) if handle_rect else 40.0)))),
+                    "scale_ratio": 1.0,
+                    "direction": "left" if delta < 0 else "right",
+                    "piece_kind": sprite_piece.get("kind", ""),
+                    "method": "outlined_hole_sprite",
+                    "confidence": 0.93,
+                    "details": {
+                        "hole_center": [round(hole_x, 1), round(hole["center"][1], 1)],
+                        "sprite_center": [round(sprite_x, 1), round(sprite_piece["center"][1], 1)],
+                        "hole_bbox": list(hole["bbox"]),
+                        "sprite_bbox": list(sprite_piece["bbox"]),
+                        "hole_std": hole["std"],
+                        "delta_x_phys": round(delta, 1),
+                        "direction": "left" if delta < 0 else "right",
+                        "canvas_w_phys": cw,
+                        "canvas_h_phys": ch,
+                    },
+                }
+
     if (
         is_photographic
         and sprite_piece is not None
