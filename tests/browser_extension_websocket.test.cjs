@@ -2592,3 +2592,129 @@ test('generateHumanTrajectory drags left when the distance is negative', async (
   const minPointX = Math.min(...points.map((p) => p.x));
   assert.ok(minPointX < 180, 'overshoot must follow the drag direction (further left)');
 });
+
+test('calculatePuzzleDistance refuses to drag when the CV solver says the frame has no puzzle', async () => {
+  // Live evidence: on an error page the solver returned a constant 237 px with confidence 0.94, the
+  // extension dragged it, and each such drag burned one of Shopee's ~3 attempts (logs/extension.log
+  // 09:56-09:59). An abstaining solver must therefore leave the mouse alone.
+  const { context } = await worker();
+  context.setTimeout = (fn) => { queueMicrotask(fn); return 1; };
+  let cvCalls = 0;
+  context.fetch = async (url) => {
+    if (url.includes('/browser/solve_puzzle_cv')) {
+      cvCalls++;
+      return {
+        ok: true,
+        json: async () => ({
+          ok: false, abstain: true, reason: 'no_puzzle_in_frame', method: 'cv_abstain', confidence: 0.05,
+        }),
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+  context.chrome.tabs = {
+    captureVisibleTab: async () => 'data:image/png;base64,BLANK-LOCKED-PAGE',
+    get: async () => ({ windowId: 10 }),
+    update: async () => {},
+  };
+  vm.runInContext(`
+    chrome.scripting = { executeScript: async () => [{ result: null }] };
+  `, context);
+
+  const travel = await vm.runInContext('calculatePuzzleDistance(904, { width: 320 })', context);
+  assert.equal(travel, 0, 'an abstaining solver must not produce a drag distance');
+  assert.equal(cvCalls, 1);
+  const evidence = vm.runInContext('lastPuzzleEvidence', context);
+  assert.equal(evidence.ok, false);
+  assert.equal(evidence.abstain, true);
+  assert.equal(evidence.reason, 'no_puzzle_in_frame');
+  // The gate the drag path reads: |distance| >= 20 plus confidence >= 0.85.
+  assert.ok(Math.abs(travel) < 20, 'plausibility gate must block the drag');
+  assert.ok(Number(evidence.confidence) < 0.85, 'confidence gate must block the drag');
+});
+
+test('calculatePuzzleDistance reuses the cached verdict for an unchanged frame', async () => {
+  // The watcher fires every 2.5 s and the drag re-enters it after each attempt, so the same frame used
+  // to be solved two or three times in a row (log 13:47:24/13:47:26, 13:48:20/13:48:23) at ~1 s each.
+  const { context } = await worker();
+  context.setTimeout = (fn) => { queueMicrotask(fn); return 1; };
+  let cvCalls = 0;
+  context.fetch = async (url) => {
+    if (url.includes('/browser/solve_puzzle_cv')) {
+      cvCalls++;
+      return {
+        ok: true,
+        json: async () => ({ ok: true, travel: 76, method: 'circular_receptacle', confidence: 0.95 }),
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+  context.chrome.tabs = {
+    captureVisibleTab: async () => 'data:image/png;base64,THE-SAME-UNCHANGED-PUZZLE-FRAME',
+    get: async () => ({ windowId: 10 }),
+    update: async () => {},
+  };
+  vm.runInContext(`
+    chrome.scripting = { executeScript: async () => [{ result: null }] };
+  `, context);
+
+  const first = await vm.runInContext('calculatePuzzleDistance(905, { width: 320 })', context);
+  const second = await vm.runInContext('calculatePuzzleDistance(905, { width: 320 })', context);
+
+  assert.equal(first, 76);
+  assert.equal(second, 76, 'the cached verdict must answer the second call');
+  assert.equal(cvCalls, 1, 'an unchanged frame must not be posted to the CV solver twice');
+  assert.equal(vm.runInContext('lastPuzzleEvidence.cached', context), true);
+});
+
+test('an aborted drag still releases the mouse button instead of leaving it held', async () => {
+  // 13:48:48 solver answered 121 -> 13:49:13 "debugger drag timed out after 22000ms": the release
+  // never fired, so the next attempt pressed on top of a stale button state.
+  const { context, timeouts } = await worker();
+  const pending = new Map();
+  let timerSeq = 0;
+  // Let the drag get as far as pressing the button (the first couple of sleeps), then stall it — that
+  // reproduces the live failure where the trajectory was abandoned mid-way.
+  let allowTimers = 3;
+  context.setTimeout = (fn) => {
+    if (allowTimers-- > 0) {
+      queueMicrotask(fn);
+      return 0;
+    }
+    pending.set(++timerSeq, fn);
+    return timerSeq;
+  };
+  vm.runInContext(`
+    chrome.scripting = {
+      executeScript: async () => [{ result: { method: 'canvas_pixel_analysis', travel: 160, maxTravel: 260 } }],
+    };
+  `, context);
+  const debuggerCommands = [];
+  context.chrome.debugger = {
+    attach: async () => {},
+    detach: async () => {},
+    sendCommand: async (target, cmd, params) => {
+      debuggerCommands.push({ cmd, params });
+    },
+  };
+  const detection = { detected: true, slider: { x: 100, y: 300, width: 320, isOrangeHandle: true } };
+
+  const dragPromise = vm.runInContext(`tryAutoDragShopeeCaptcha(601, ${JSON.stringify(detection)})`, context);
+  for (let i = 0; i < 25 && !debuggerCommands.some((c) => c.params.type === 'mousePressed'); i++) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  const pressCount = debuggerCommands.filter((c) => c.params.type === 'mousePressed').length;
+  assert.ok(pressCount >= 1, 'the drag must have started before the deadline');
+
+  // Force the drag's own deadline (22000 ms) instead of waiting for it.
+  const deadline = [...timeouts.values()].filter((entry) => entry.ms === 22000);
+  assert.equal(deadline.length, 1, 'the drag must run under a bounded deadline');
+  deadline[0].fn();
+
+  const result = await dragPromise;
+  assert.equal(result.attempted, false, 'a timed-out drag must not be reported as attempted');
+  const releases = debuggerCommands.filter((c) => c.params.type === 'mouseReleased');
+  assert.ok(releases.length >= 1, 'the mouse button must be released even when the drag aborts');
+  assert.equal(releases[releases.length - 1].params.button, 'left');
+});

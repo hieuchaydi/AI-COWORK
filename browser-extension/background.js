@@ -2185,6 +2185,69 @@ async function captureTabEvidence(tabId) {
  */
 let lastPuzzleEvidence = null;
 
+/**
+ * Why this exists: the user reports "the mouse only starts moving 5-6 s after the captcha shows up,
+ * then it times out". Every stage between "challenge visible" and "first mouse event" is now timed,
+ * because the last fix attacked the wrong stage and the next one must not be another guess.
+ */
+let challengeSeenAt = 0;
+let lastPuzzleTiming = null;
+
+function markChallengeSeen() {
+  challengeSeenAt = Date.now();
+}
+
+/**
+ * The watcher fires every 2.5 s and the drag re-enters it after each attempt, so the same frame used
+ * to be measured two or three times in a row (log 13:47:24/13:47:26, 13:48:20/13:48:23) at ~1 s a
+ * round-trip. An unchanged frame is the same puzzle, so its verdict is cached briefly.
+ */
+const puzzleVerdictCache = new Map();
+const PUZZLE_CACHE_TTL_MS = 15000;
+const PUZZLE_CACHE_MAX = 12;
+
+function frameFingerprint(pngDataUrl) {
+  if (!pngDataUrl || typeof pngDataUrl !== "string") return null;
+  // FNV-1a over the base64 payload: a few ms even for a 1 MB frame, and stable for an unchanged frame.
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < pngDataUrl.length; i++) {
+    hash ^= pngDataUrl.charCodeAt(i);
+    hash = (hash * 0x01000193) >>> 0;
+  }
+  return `${pngDataUrl.length}:${hash.toString(16)}`;
+}
+
+function readPuzzleVerdict(fingerprint) {
+  if (!fingerprint) return null;
+  const hit = puzzleVerdictCache.get(fingerprint);
+  if (!hit) return null;
+  if (Date.now() - hit.at > PUZZLE_CACHE_TTL_MS) {
+    puzzleVerdictCache.delete(fingerprint);
+    return null;
+  }
+  return hit;
+}
+
+function rememberPuzzleVerdict(fingerprint, evidence) {
+  if (!fingerprint || !evidence) return;
+  puzzleVerdictCache.set(fingerprint, { at: Date.now(), evidence });
+  while (puzzleVerdictCache.size > PUZZLE_CACHE_MAX) {
+    puzzleVerdictCache.delete(puzzleVerdictCache.keys().next().value);
+  }
+}
+
+/**
+ * Refuse to drag and report why. Returns 0 so the caller's plausibility gate (|distance| >= 20)
+ * keeps the mouse off the page — a wrong drag regenerates the puzzle and burns one of the ~3 attempts
+ * Shopee grants before it locks the challenge.
+ */
+function refuseDrag(evidence) {
+  lastPuzzleEvidence = evidence;
+  bridgeLog("warn", "captcha drag blocked:", String(evidence?.reason || "no_measurement"),
+    "method", String(evidence?.method || "none"), "conf", String(evidence?.confidence ?? "unknown"));
+  return 0;
+}
+
 async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
   lastPuzzleEvidence = null;
   if (!tabId || !chrome.scripting?.executeScript) {
@@ -2487,8 +2550,20 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
 
     // Hướng 2: Gọi Python CV Solver qua HTTP với ảnh chụp tab sạch (bypasses canvas tainting CORS restriction)
     try {
+      const shotStartedAt = Date.now();
       const screenshot = await captureTabEvidence(tabId);
+      const fingerprint = frameFingerprint(screenshot);
+      const cachedVerdict = readPuzzleVerdict(fingerprint);
+      if (cachedVerdict) {
+        lastPuzzleEvidence = { ...cachedVerdict.evidence, cached: true };
+        lastPuzzleTiming = { shotMs: Date.now() - shotStartedAt, solveMs: 0, cached: true };
+        bridgeLog("info", "cv solver cache hit", String(lastPuzzleEvidence.travel ?? "no_travel"),
+          "method", String(lastPuzzleEvidence.method || "none"), "age_ms", String(Date.now() - cachedVerdict.at));
+        if (lastPuzzleEvidence.ok) return lastPuzzleEvidence.travel;
+        return refuseDrag(lastPuzzleEvidence);
+      }
       if (screenshot && typeof fetch === "function") {
+            const fetchStartedAt = Date.now();
             const cvRes = await fetch(`${HELPER}/browser/solve_puzzle_cv`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -2504,6 +2579,28 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
         });
         if (cvRes.ok) {
           const cvData = await cvRes.json();
+          lastPuzzleTiming = {
+            shotMs: fetchStartedAt - shotStartedAt,
+            solveMs: Date.now() - fetchStartedAt,
+            cached: false,
+          };
+          // The solver is allowed to answer "this frame contains no puzzle" (an error/locked page, or
+          // a frame captured before the puzzle rendered). That verdict is authoritative: falling
+          // through to the in-page guesses here is exactly what handed the mouse a constant 237 px on
+          // blank frames and burned Shopee's attempts (logs/extension.log 09:56-09:59).
+          if (cvData?.abstain === true) {
+            const abstainEvidence = {
+              ok: false,
+              abstain: true,
+              reason: cvData.reason || "no_puzzle_in_frame",
+              method: cvData.method || "cv_abstain",
+              confidence: Number(cvData.confidence) || 0,
+              details: cvData.debug_info || cvData.details || null,
+              travel: null,
+            };
+            rememberPuzzleVerdict(fingerprint, abstainEvidence);
+            return refuseDrag(abstainEvidence);
+          }
           // Signed travel: a NEGATIVE value means the piece must be dragged LEFT — Shopee
           // parks the sprite against the right edge for several prop variants (mortar & pestle,
           // tray & lid). Squashing those to a positive "usual" drag is what pushed the piece
@@ -2531,6 +2628,7 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
               canvasRect: (domInfo && domInfo.bgRect) || null,
               dpr: Number(domInfo?.devicePixelRatio) || 1,
             };
+            rememberPuzzleVerdict(fingerprint, lastPuzzleEvidence);
             return travel;
           }
           if (cvData && cvData.ok === false) {
@@ -2984,35 +3082,27 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
   // the piece rides along. The 2D "drop the piece" move only applies to the variant that has no
   // track at all (the piece is the draggable widget there).
   const hasTrack = detection?.hasTrack === true;
-  if (!hasTrack && geometry?.hole_center && canvasRect && Number.isFinite(canvasRect.x)) {
-    const holeX = canvasRect.x + geometry.hole_center[0] / dpr;
-    const holeY = canvasRect.y + geometry.hole_center[1] / dpr;
-    const dy = holeY - startY;
+  // ONE source of truth for the horizontal Δ: the solver's `travel`, which is already in the units
+  // the mouse moves in. The canvas bboxes used to overwrite it right here — in the same attempt the
+  // solver said -120 and the executed drag became -144, with a 21x16 sprite "matching" a 68x71 hole.
+  // That is the "sometimes it drags too far" report. The geometry below only picks the press point
+  // and the vertical drop of the no-track variant; it never re-derives the horizontal distance.
+  const pieceCentre = geometry?.piece_center || geometry?.sprite_center || null;
+  const slotCentre = geometry?.slot_center || geometry?.hole_center || null;
+  if (!hasTrack && Array.isArray(slotCentre) && canvasRect && Number.isFinite(canvasRect.x)) {
+    const slotY = canvasRect.y + slotCentre[1] / dpr;
+    if (Array.isArray(pieceCentre)) {
+      // Anchor the press on the sprite itself (canvas → viewport), not on the DOM handle.
+      startX = Math.round(canvasRect.x + pieceCentre[0] / dpr);
+      startY = Math.round(canvasRect.y + pieceCentre[1] / dpr);
+    }
+    const dy = Math.round(slotY - startY);
     if (Math.abs(dy) > 14) {
-      if (geometry.sprite_center) {
-        // Anchor the press on the sprite itself (canvas → viewport), not on the DOM handle.
-        startX = Math.round(canvasRect.x + geometry.sprite_center[0] / dpr);
-        startY = Math.round(canvasRect.y + geometry.sprite_center[1] / dpr);
-      }
-      // A jigsaw piece has to *cover* the cut-out, so translate by the bounding-box corner
-      // delta. Aligning centres looks right on screen but leaves (Δw/2, Δh/2) of offset
-      // whenever the piece and the hole differ in size — Shopee then rejects the submit.
-      const spriteBox = Array.isArray(geometry.sprite_bbox) ? geometry.sprite_bbox : null;
-      const holeBox = Array.isArray(geometry.hole_bbox) ? geometry.hole_bbox : null;
-      let alignMode = "centre";
-      let deltaX = holeX - startX;
-      let deltaY = holeY - startY;
-      if (spriteBox && holeBox) {
-        alignMode = "corner";
-        deltaX = (holeBox[0] - spriteBox[0]) / dpr;
-        deltaY = (holeBox[1] - spriteBox[1]) / dpr;
-      }
-      distance = Math.round(deltaX);
-      endY = Math.round(startY + deltaY);
+      endY = startY + dy;
       dropMode = true;
-      bridgeLog("info", "2D piece drop", `(${alignMode} align)`, "from", `${startX},${startY}`,
-        "to", `${Math.round(startX + deltaX)},${endY}`, "dx", String(distance), "dy", String(endY - startY),
-        "spriteBox", JSON.stringify(spriteBox), "holeBox", JSON.stringify(holeBox));
+      bridgeLog("info", "2D piece drop", "(travel-sourced Δ)", "from", `${startX},${startY}`,
+        "to", `${Math.round(startX + distance)},${endY}`, "dx", String(distance), "dy", String(dy),
+        "piece", JSON.stringify(pieceCentre), "slot", JSON.stringify(slotCentre));
     }
   }
 
@@ -3053,15 +3143,33 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
     const outcome = await withDebuggerLock(async () => {
       let attached = false;
       let sessionToken = null;
+      // The mouse button must never be left held: a timeout used to abandon the drag mid-trajectory,
+      // so the next attempt pressed again on top of a stale button state (log 13:49:13, "debugger
+      // drag timed out after 22000ms" followed by a fresh mousePressed).
+      let lastPointer = { x: startX, y: startY };
+      const releaseAt = (x, y) => {
+        lastPointer = { x: Math.round(x), y: Math.round(y) };
+        fire({ type: "mouseReleased", x: lastPointer.x, y: lastPointer.y, button: "left", clickCount: 1 });
+      };
       try {
         const session = await withTimeout(attachDebuggerSession(target), 6000, "debugger attach");
         if (!session.ok) return { error: session.error, result: null };
         attached = true;
         sessionToken = claimDebuggerSession(tabId);
         await withTimeout((async () => {
+          const dragStartedAt = Date.now();
           fire({ type: "mouseMoved", x: startX, y: startY, button: "none" });
           await new Promise((r) => setTimeout(r, 60 + Math.random() * 40));
           fire({ type: "mousePressed", x: startX, y: startY, button: "left", clickCount: 1 });
+          lastPointer = { x: startX, y: startY };
+          // The measurement the user actually asked for: how long after the challenge appeared does
+          // the cursor first move, and where did those milliseconds go?
+          bridgeLog("info", "captcha.timeline",
+            "drag_start_ms", String(dragStartedAt - (challengeSeenAt || dragStartedAt)),
+            "shot_ms", String(lastPuzzleTiming?.shotMs ?? "?"),
+            "solve_ms", String(lastPuzzleTiming?.solveMs ?? "?"),
+            "cached", String(Boolean(lastPuzzleTiming?.cached)),
+            "travel", String(distance));
           // Fewer CDP round-trips. Every sendCommand can stall for seconds on a busy renderer
           // (that stall is what pushed the drag past its deadline and dropped it onto the
           // untrusted DOM-event path, where Shopee always rejects). A ~26-34 point human
@@ -3071,6 +3179,7 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
             : points;
           for (const point of tracePoints) {
             fire({ type: "mouseMoved", x: point.x, y: point.y, button: "left", buttons: 1 });
+            lastPointer = { x: point.x, y: point.y };
             await new Promise((r) => setTimeout(r, point.delay));
           }
           await new Promise((r) => setTimeout(r, 90 + Math.random() * 40));
@@ -3078,7 +3187,10 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
           // Dừng nghỉ ổn định (Settle delay) để DOM và anti-bot script ghi nhận mảnh ghép đã khớp hoàn toàn
           await new Promise((r) => setTimeout(r, 150 + Math.random() * 50));
           await new Promise((r) => setTimeout(r, 140 + Math.random() * 50));
-          fire({ type: "mouseReleased", x: endX, y: endY, button: "left", clickCount: 1 });
+          releaseAt(endX, endY);
+          bridgeLog("info", "captcha.timeline done",
+            "release_ms", String(Date.now() - dragStartedAt), "travel", String(distance),
+            "drop_mode", String(dropMode));
           // This variant shows a "Gửi" button: the piece only counts once it is submitted.
           if (dropMode) {
             const submit = await findSubmitButtonCentre(tabId);
@@ -3096,9 +3208,14 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
         // command for several seconds, so the budget stays well under the 30 s command deadline
         // without abandoning a drag that is merely slow (an abandonment used to leave the piece
         // half-dragged and then fall back to untrusted events).
-        })(), 22000, "debugger drag");
+        })(), Number(options?.dragBudgetMs) || 22000, "debugger drag");
         return { error: null, result: { attempted: true, method: "debugger", startX, startY, endX, endY, distance, dropMode } };
       } catch (err) {
+        // Guarantee the button is released even when the drag is aborted mid-trajectory.
+        try {
+          releaseAt(lastPointer.x, lastPointer.y);
+          bridgeLog("warn", "drag aborted — mouse button released at", `${lastPointer.x},${lastPointer.y}`);
+        } catch {}
         return { error: String(err?.message || err), result: null };
       } finally {
         if (attached) {
@@ -3651,6 +3768,8 @@ function startVerificationWatcher(details) {
 
   let consecutiveAbsentCount = 0;
   let autoDragAttempts = 0;
+  let refusedDrags = 0;
+  let lastDragRefusal = null;
   let challengeLockedUntil = 0;
   // P2-2: Concurrency guard ngăn chặn thực thi chồng chéo giữa interval, event listener và post-drag
   let checkInProgress = false;
@@ -3774,18 +3893,34 @@ function startVerificationWatcher(details) {
           return;
         }
         challengeLockedUntil = 0;
+        if (!challengeSeenAt || Date.now() - challengeSeenAt > 60000) markChallengeSeen();
         // Thử tự động kéo thông minh tối đa 3 lần (với micro-jitter +4px, -4px, +8px, -8px)
         if (autoDragAttempts < 3) {
-          autoDragAttempts++;
           try {
-            console.log(`[bridge] CAPTCHA visible; attempting intelligent slider drag ${autoDragAttempts}/3 for job ${jid}...`);
+            console.log(`[bridge] CAPTCHA visible; attempting intelligent slider drag ${autoDragAttempts + 1}/3 for job ${jid}...`);
             // P1-1: Truyền attempt để tự động bù micro-jitter offset ở các lần thử tiếp theo
-            const dragRes = await tryAutoDragShopeeCaptcha(targetTabId, check, { attempt: autoDragAttempts });
+            const dragRes = await tryAutoDragShopeeCaptcha(targetTabId, check, { attempt: autoDragAttempts + 1 });
             console.log("[bridge] Intelligent slider drag result:", dragRes);
             if (dragRes?.attempted) {
+              // Only a drag that really happened counts against Shopee's ~3 attempts.
+              autoDragAttempts++;
               await new Promise((r) => setTimeout(r, 1200));
               checkInProgress = false;
               return performCheckAndPreflight();
+            }
+            // A refused drag (no puzzle in this frame, or below the confidence floor) is not a wasted
+            // attempt: Shopee only sees a drag when `attempted` is true, so the budget is untouched
+            // and the watcher simply waits for a frame it can actually measure.
+            const refusal = String(dragRes?.reason || "not_attempted");
+            if (refusal !== lastDragRefusal) {
+              lastDragRefusal = refusal;
+              bridgeLog("info", "captcha drag not attempted:", refusal,
+                "distance", String(dragRes?.distance ?? "?"), "method", String(dragRes?.method || "none"));
+            }
+            if (++refusedDrags >= 12) {
+              console.warn("[bridge] No measurable puzzle after 12 checks — leaving the challenge to the user.");
+              bridgeLog("warn", "captcha: no measurable puzzle after 12 checks — passive handover");
+              autoDragAttempts = 3;
             }
           } catch (err) {
             console.warn("[bridge] Auto-drag attempt failed:", err?.message || err);
