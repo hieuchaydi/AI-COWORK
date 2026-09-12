@@ -2306,7 +2306,10 @@ test('tryAutoDragShopeeCaptcha executes realistic drag via chrome.debugger', asy
   const mousePressedCmds = debuggerCommands.filter((c) => c.cmd === 'Input.dispatchMouseEvent' && c.params.type === 'mousePressed');
   const mouseReleasedCmds = debuggerCommands.filter((c) => c.cmd === 'Input.dispatchMouseEvent' && c.params.type === 'mouseReleased');
 
-  assert.ok(mouseMovedCmds.length >= 24, 'must dispatch at least 24 mouseMoved events');
+  // The trusted path deliberately thins the trajectory (~10 points) because every CDP
+  // sendCommand can stall on a busy renderer — that stalling is what pushed the drag past its
+  // deadline and dropped it onto the untrusted DOM-event path.
+  assert.ok(mouseMovedCmds.length >= 10, 'must dispatch at least 10 mouseMoved events');
   assert.equal(mousePressedCmds.length, 1, 'must dispatch exactly 1 mousePressed event');
   assert.equal(mouseReleasedCmds.length, 1, 'must dispatch exactly 1 mouseReleased event');
   assert.equal(mouseReleasedCmds[0].params.button, 'left');

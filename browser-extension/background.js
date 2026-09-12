@@ -3025,7 +3025,14 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
           await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: startX, y: startY, button: "none" });
           await new Promise((r) => setTimeout(r, 60 + Math.random() * 40));
           await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mousePressed", x: startX, y: startY, button: "left", clickCount: 1 });
-          for (const point of points) {
+          // Fewer CDP round-trips. Every sendCommand can stall for seconds on a busy renderer
+          // (that stall is what pushed the drag past its deadline and dropped it onto the
+          // untrusted DOM-event path, where Shopee always rejects). A ~26-34 point human
+          // trajectory is thinned to ~10; the settle pauses below keep it from looking robotic.
+          const tracePoints = points.length > 12
+            ? points.filter((_, index) => index % Math.ceil(points.length / 10) === 0).concat(points[points.length - 1])
+            : points;
+          for (const point of tracePoints) {
             await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y, button: "left", buttons: 1 });
             await new Promise((r) => setTimeout(r, point.delay));
           }
