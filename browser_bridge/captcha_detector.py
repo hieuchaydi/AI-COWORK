@@ -1172,7 +1172,8 @@ def solve_puzzle_cv(
     # gradient/edge heuristics below latch onto the backdrop's strongest edges on photo scenes
     # and cannot beat real piece evidence; on the synthetic flat canvases (a handful of
     # colours) the classic methods stay authoritative so their contracts are unchanged.
-    is_photographic = distinct_colour_count(canvas_crop) > 400
+    distinct_colours = int(distinct_colour_count(canvas_crop))
+    is_photographic = distinct_colours > 400
 
     # Colour families miss some props (a moss-green disc on a forest photo) and can also latch
     # onto scenery: on that same frame the "dark" family matched a rock at x=75 while the real
@@ -1185,6 +1186,52 @@ def solve_puzzle_cv(
             near_edge = min(sbx, cw - (sbx + sbw)) <= cw * 0.12
             if sprite_piece is None or near_edge:
                 sprite_piece = salient
+
+    # ---- Evidence gate: never invent a travel figure on a frame that holds no puzzle ----
+    # Every heuristic below (coloured blob, gradient column, jigsaw notch) can fire on a plain
+    # page, so "did a detector fire?" is not evidence of a puzzle. On Shopee's blank
+    # "Vui lòng thử lại sau" lock screen the sprite scan latched onto the orange Shopee logo and
+    # the cut-out scan onto the white error card's border, and the code reported
+    # `travel 237, confidence 0.94` — again and again for minutes — while the extension dragged on
+    # a page that had no puzzle at all. That is what burned the account's attempts and locked it.
+    #
+    # What actually separates a challenge from an error page is that a challenge canvas is a
+    # photograph. Measured on outputs/evidence: the three real frames carry >=1951 distinct
+    # colours over ~2% blown-out white, while the three lock/error pages carry <=180 colours and
+    # are 98.7-99.7% pure white. The synthetic flat canvases the unit tests use sit at 0% white,
+    # so this leaves their long-standing contracts untouched.
+    hole_probe = detect_outlined_hole_safe(canvas_crop, gray)
+    near_white_fraction = float(np.mean(gray >= 245))
+    if near_white_fraction >= 0.60 and not is_photographic:
+        return {
+            "ok": False,
+            "abstain": True,
+            "reason": "no_puzzle_in_frame",
+            "travel": None,
+            "puzzle_travel": None,
+            "direction": None,
+            "piece_kind": "",
+            "method": "abstain",
+            "confidence": 0.0,
+            "details": {
+                "near_white_fraction": round(near_white_fraction, 3),
+                "distinct_colours": distinct_colours,
+                "mean_saturation": round(mean_sat, 1),
+                "sprite_found": sprite_piece is not None,
+                "outlined_hole_found": hole_probe is not None,
+                "canvas_w_phys": cw,
+                "canvas_h_phys": ch,
+            },
+            "debug_info": {
+                "piece_center": None,
+                "slot_center": None,
+                "sprite_bbox": None,
+                "hole_bbox": None,
+                "travel_canvas": None,
+                "frame_w": cw,
+                "frame_h": ch,
+            },
+        }
 
     # Method 0a: outlined cut-out + solid sprite on a photographic scene. The hole is a flat,
     # strongly outlined region; the movable sprite is a solid blob (warm/bright/blue/dark). Pair
@@ -1210,7 +1257,7 @@ def solve_puzzle_cv(
         ):
             return comp_first
 
-        hole = detect_outlined_hole_safe(canvas_crop, gray)
+        hole = hole_probe
         if hole is not None and sprite_piece is not None:
             hole_x = float(hole["center"][0])
             sprite_x = float(sprite_piece["center"][0])
@@ -1521,6 +1568,15 @@ def solve_puzzle_cv(
             "piece_kind": sprite_piece.get("kind") if sprite_piece else "",
             "canvas_w_phys": cw,
             "canvas_h_phys": ch,
+            "gate": {
+                "mean_saturation": round(mean_sat, 1),
+                "distinct_colours": distinct_colours,
+                "near_white_fraction": round(near_white_fraction, 3),
+                "is_natural_scene": bool(is_natural_scene),
+                "is_photographic": bool(is_photographic),
+                "sprite_found": sprite_piece is not None,
+                "hole_found": hole_probe is not None,
+            },
         },
     }
 

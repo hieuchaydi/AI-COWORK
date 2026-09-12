@@ -1257,6 +1257,80 @@ def test_read_frame_rejects_continuation_without_start():
     assert opcode == 0x0
 
 
+# ── "no puzzle in this frame" gate ───────────────────────────────────────────
+# Regression for the 2026-09-12 incident. On Shopee's blank "Vui lòng thử lại sau" lock screen
+# the sprite scan latched onto the orange Shopee logo and the cut-out scan onto the white error
+# card's border, so solve_puzzle_cv reported `travel 237, confidence 0.94` — repeatedly, for
+# minutes — on a page that held no puzzle at all. The extension's confidence gate passed it every
+# time, so it dragged blindly, spent the account's three attempts, and got the account locked.
+# A blank frame must abstain instead of guessing.
+
+
+def _blank_shopee_lock_page() -> "object":
+    """White error page: orange Shopee logo, red 'Thử lại' button, a grey card with text."""
+    import cv2
+    import numpy as np
+
+    canvas = np.full((953, 1920, 3), 255, dtype=np.uint8)
+    cv2.rectangle(canvas, (398, 22), (522, 92), (30, 60, 238), -1)     # orange logo, BGR
+    cv2.rectangle(canvas, (795, 182), (1122, 484), (205, 205, 205), 1)  # error card border
+    cv2.rectangle(canvas, (905, 276), (1000, 292), (160, 160, 160), -1) # icon artwork
+    cv2.rectangle(canvas, (822, 352), (995, 364), (110, 110, 110), -1)  # body text
+    cv2.rectangle(canvas, (822, 372), (1000, 384), (110, 110, 110), -1)
+    cv2.rectangle(canvas, (915, 429), (1010, 476), (30, 60, 238), -1)   # red "Thử lại" button
+    return canvas
+
+
+def test_solve_puzzle_cv_abstains_on_blank_shopee_lock_page():
+    from browser_bridge.captcha_detector import solve_puzzle_cv
+
+    res = solve_puzzle_cv(_blank_shopee_lock_page(), device_pixel_ratio=1.0)
+
+    assert res["ok"] is False
+    assert res.get("abstain") is True
+    assert res.get("reason") == "no_puzzle_in_frame"
+    assert res.get("travel") is None
+    assert res["method"] == "abstain"
+    assert res["confidence"] <= 0.2
+
+
+@pytest.mark.parametrize("variant", ["pure_white", "logo_only", "text_only"])
+def test_solve_puzzle_cv_never_confidently_drags_a_blank_frame(variant):
+    """No code path may hand the extension a >=0.85 answer built from a frame with no puzzle."""
+    import cv2
+    import numpy as np
+    from browser_bridge.captcha_detector import solve_puzzle_cv
+
+    canvas = np.full((953, 1920, 3), 255, dtype=np.uint8)
+    if variant == "logo_only":
+        cv2.rectangle(canvas, (398, 22), (522, 92), (30, 60, 238), -1)
+    elif variant == "text_only":
+        cv2.rectangle(canvas, (822, 352), (995, 364), (110, 110, 110), -1)
+        cv2.rectangle(canvas, (915, 429), (1010, 476), (30, 60, 238), -1)
+
+    res = solve_puzzle_cv(canvas, device_pixel_ratio=1.0)
+
+    draggable = bool(res.get("ok")) and res.get("travel") is not None
+    assert not (draggable and float(res.get("confidence") or 0) >= 0.85), (
+        f"blank frame produced a drag the extension would trust: {res}"
+    )
+
+
+def test_solve_puzzle_cv_abstain_payload_matches_the_extension_contract():
+    """The extension reads ok/abstain/reason/travel/debug_info — keep them all present."""
+    from browser_bridge.captcha_detector import solve_puzzle_cv
+
+    res = solve_puzzle_cv(_blank_shopee_lock_page(), device_pixel_ratio=1.0)
+
+    for key in ("ok", "abstain", "reason", "travel", "direction", "confidence", "method"):
+        assert key in res, f"missing contract key {key}"
+    debug = res.get("debug_info")
+    assert isinstance(debug, dict)
+    for key in ("piece_center", "slot_center", "sprite_bbox", "hole_bbox", "frame_w", "frame_h"):
+        assert key in debug, f"missing debug_info key {key}"
+    assert debug["piece_center"] is None and debug["slot_center"] is None
+
+
 
 
 
