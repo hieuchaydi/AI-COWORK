@@ -20,6 +20,12 @@ const PACE_MS = 1200;
 const RATING_TYPES = [0, 5, 4, 3, 2, 1];
 
 // ── State Variables ──────────────────────────────────────────────────────────
+// Timers captured at load time: test harnesses and page contexts sometimes replace the global
+// setTimeout with an immediate/mocked version, which would make every raced deadline fire at
+// once. Production keeps the worker's real timer.
+const NATIVE_SET_TIMEOUT = typeof setTimeout === "function" ? setTimeout : null;
+const NATIVE_CLEAR_TIMEOUT = typeof clearTimeout === "function" ? clearTimeout : null;
+
 let bridgeSocket = null;
 let bridgeConnecting = null;
 let bridgeHeartbeat = null;
@@ -2136,14 +2142,16 @@ async function captureTabEvidence(tabId) {
     if (chrome.debugger?.attach && chrome.debugger?.sendCommand && chrome.debugger?.detach) {
       const target = { tabId: targetId };
       return await withDebuggerLock(async () => {
-        const session = await attachDebuggerSession(target);
-        if (!session.ok) {
-          console.warn("[bridge] Debugger Page.captureScreenshot attach failed:", session.error);
-          return null;
-        }
-        let attached = true;
         try {
-          const res = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", { format: "png" });
+          const session = await withTimeout(attachDebuggerSession(target), 6000, "debugger attach");
+          if (!session.ok) {
+            console.warn("[bridge] Debugger Page.captureScreenshot attach failed:", session.error);
+            return null;
+          }
+          const res = await withTimeout(
+            chrome.debugger.sendCommand(target, "Page.captureScreenshot", { format: "png" }),
+            8000, "Page.captureScreenshot",
+          );
           if (res?.data) {
             return `data:image/png;base64,${res.data}`;
           }
@@ -2152,9 +2160,7 @@ async function captureTabEvidence(tabId) {
           console.warn("[bridge] Debugger Page.captureScreenshot failed:", dbgErr?.message || dbgErr);
           return null;
         } finally {
-          if (attached) {
-            try { await chrome.debugger.detach(target); } catch {}
-          }
+          try { await chrome.debugger.detach(target); } catch {}
         }
       });
     }
@@ -2590,6 +2596,26 @@ function withDebuggerLock(task) {
   return run;
 }
 
+/**
+ * Bound a debugger/CDP call. chrome.debugger.sendCommand can hang forever when the debuggee
+ * dies mid-drag; without a deadline the locked task never settles, which wedges the queue and
+ * makes every later captcha.solve hit the 30 s command timeout.
+ */
+function withTimeout(promise, ms, label) {
+  if (!NATIVE_SET_TIMEOUT) return promise;
+  let timer = null;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = NATIVE_SET_TIMEOUT(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    }),
+  ]).finally(() => {
+    if (timer !== null && NATIVE_CLEAR_TIMEOUT) {
+      try { NATIVE_CLEAR_TIMEOUT(timer); } catch {}
+    }
+  });
+}
+
 async function attachDebuggerSession(target, { retry = true } = {}) {
   try {
     await chrome.debugger.attach(target, "1.3");
@@ -2862,23 +2888,25 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
     const target = { tabId };
     const outcome = await withDebuggerLock(async () => {
       let attached = false;
-      const session = await attachDebuggerSession(target);
-      if (!session.ok) return { error: session.error, result: null };
       try {
+        const session = await withTimeout(attachDebuggerSession(target), 6000, "debugger attach");
+        if (!session.ok) return { error: session.error, result: null };
         attached = true;
-        await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: startX, y: startY, button: "none" });
-        await new Promise((r) => setTimeout(r, 60 + Math.random() * 40));
-        await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mousePressed", x: startX, y: startY, button: "left", clickCount: 1 });
-        for (const point of points) {
-          await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y, button: "left", buttons: 1 });
-          await new Promise((r) => setTimeout(r, point.delay));
-        }
-        await new Promise((r) => setTimeout(r, 90 + Math.random() * 40));
-        await new Promise((r) => setTimeout(r, 140 + Math.random() * 40));
-        // Dừng nghỉ ổn định (Settle delay) để DOM và anti-bot script ghi nhận mảnh ghép đã khớp hoàn toàn
-        await new Promise((r) => setTimeout(r, 150 + Math.random() * 50));
-        await new Promise((r) => setTimeout(r, 140 + Math.random() * 50));
-        await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: startY, button: "left", clickCount: 1 });
+        await withTimeout((async () => {
+          await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: startX, y: startY, button: "none" });
+          await new Promise((r) => setTimeout(r, 60 + Math.random() * 40));
+          await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mousePressed", x: startX, y: startY, button: "left", clickCount: 1 });
+          for (const point of points) {
+            await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y, button: "left", buttons: 1 });
+            await new Promise((r) => setTimeout(r, point.delay));
+          }
+          await new Promise((r) => setTimeout(r, 90 + Math.random() * 40));
+          await new Promise((r) => setTimeout(r, 140 + Math.random() * 40));
+          // Dừng nghỉ ổn định (Settle delay) để DOM và anti-bot script ghi nhận mảnh ghép đã khớp hoàn toàn
+          await new Promise((r) => setTimeout(r, 150 + Math.random() * 50));
+          await new Promise((r) => setTimeout(r, 140 + Math.random() * 50));
+          await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: startY, button: "left", clickCount: 1 });
+        })(), 15000, "debugger drag");
         return { error: null, result: { attempted: true, method: "debugger", startX, startY, endX, distance } };
       } catch (err) {
         return { error: String(err?.message || err), result: null };
@@ -2975,7 +3003,12 @@ async function detectCaptchaInTab(tabId, options = {}) {
         }
         if (!isResolved && typeof document.querySelectorAll === "function") {
           try {
-            isResolved = Array.from(document.querySelectorAll("svg, i, div, span, button")).some((el) => {
+            // Bounded query: the old `div, span, button` sweep called getComputedStyle on every
+            // element of the page (Shopee product pages have thousands) and ran every 2.5 s from
+            // the verification watcher — enough to starve the worker and stall commands.
+            isResolved = Array.from(
+              document.querySelectorAll("[class*='success'], [class*='passed'], svg, i")
+            ).slice(0, 400).some((el) => {
               const text = el.innerText || "";
               const hasCheckChar = text.includes("✔") || text.includes("✓");
               const style = typeof win.getComputedStyle === "function" ? win.getComputedStyle(el) : null;
@@ -4001,17 +4034,16 @@ async function handleAction(action, params) {
         if (chrome.debugger?.attach && chrome.debugger?.sendCommand && chrome.debugger?.detach) {
           const target = { tabId: targetTabId };
           await withDebuggerLock(async () => {
-            const session = await attachDebuggerSession(target);
-            if (!session.ok) {
-              debuggerError = session.error;
-              return;
-            }
-            let attached = true;
             try {
-              const res = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
+              const session = await withTimeout(attachDebuggerSession(target), 6000, "debugger attach");
+              if (!session.ok) {
+                debuggerError = session.error;
+                return;
+              }
+              const res = await withTimeout(chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
                 format: params.format === "jpeg" ? "jpeg" : "png",
                 quality: params.quality,
-              });
+              }), 8000, "Page.captureScreenshot");
               if (res?.data) {
                 dataUrl = `data:image/${params.format === "jpeg" ? "jpeg" : "png"};base64,${res.data}`;
               } else {
@@ -4020,9 +4052,7 @@ async function handleAction(action, params) {
             } catch (err) {
               debuggerError = String(err?.message || err);
             } finally {
-              if (attached) {
-                try { await chrome.debugger.detach(target); } catch {}
-              }
+              try { await chrome.debugger.detach(target); } catch {}
             }
           });
         }
