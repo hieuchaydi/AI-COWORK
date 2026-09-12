@@ -2527,6 +2527,9 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
               confidence: Number(cvData.confidence) || 0,
               piece: dbg.piece_center || dbg.piece_x_phys || null,
               slot: dbg.slot_center || dbg.target_x_phys || null,
+              details: dbg,
+              canvasRect: (domInfo && domInfo.bgRect) || null,
+              dpr: Number(domInfo?.devicePixelRatio) || 1,
             };
             return travel;
           }
@@ -2573,7 +2576,7 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
  * - Kéo lố nhẹ (Overshoot: 2-4px) rồi nhích lùi tinh chỉnh (Correction) như phản xạ mắt người khi canh mảnh ghép.
  * - Tần số sự kiện ngẫu nhiên theo nhịp quét chuột phần cứng (12ms - 28ms).
  */
-function generateHumanTrajectory(startX, startY, distance) {
+function generateHumanTrajectory(startX, startY, distance, endY = startY) {
   const points = [];
   const totalSteps = 26 + Math.floor(Math.random() * 8); // 26-34 bước
   // Overshoot follows the drag's own direction (a leftward drag overshoots to the left).
@@ -2595,9 +2598,12 @@ function generateHumanTrajectory(startX, startY, distance) {
 
     // Nhiễu cơ sinh học trục Y: bước đi quán tính lò xo hồi quy về trục thanh trượt
     vy = vy * 0.5 + (Math.random() - 0.5) * 1.8;
-    vy += (startY - currentY) * 0.3;
+    // The "drag the missing piece" variant needs a vertical drop too, so the spring now settles
+    // on endY instead of the handle's own row.
+    const targetY = startY + (endY - startY) * ease;
+    vy += (targetY - currentY) * 0.3;
     currentY += vy;
-    const jitterY = Math.round(Math.max(startY - 2, Math.min(startY + 2, currentY)));
+    const jitterY = Math.round(Math.max(targetY - 2, Math.min(targetY + 2, currentY)));
 
     const delay = 12 + Math.floor(Math.random() * 16);
     points.push({ x: currentX, y: jitterY, delay });
@@ -2610,7 +2616,7 @@ function generateHumanTrajectory(startX, startY, distance) {
     const t = j / correctionSteps;
     const currentX = Math.round(targetXWithOvershoot + (finalX - targetXWithOvershoot) * t);
     const delay = 24 + Math.floor(Math.random() * 14);
-    points.push({ x: currentX, y: startY, delay });
+    points.push({ x: currentX, y: Math.round(endY), delay });
   }
 
   return points;
@@ -2835,6 +2841,7 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
             const candidates = Array.from(document.querySelectorAll("div, button, span, i"));
             const orangeEl = candidates.find((el) => {
               if (!el.offsetWidth || !el.offsetHeight) return false;
+              if (isSubmitLikeElement(el)) return false;  // "Gửi" is not the slider handle
               if (el.offsetWidth < 25 || el.offsetWidth > 90 || el.offsetHeight < 25 || el.offsetHeight > 90) return false;
               const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(el) : null;
               if (!style) return false;
@@ -2958,7 +2965,27 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
   } else {
     console.log(`[bridge] Calculated puzzle travel: ${distance}px (${distance < 0 ? "left" : "right"}, startX: ${startX}, startY: ${startY})`);
   }
-  const points = generateHumanTrajectory(startX, startY, distance);
+  // "Drag the missing piece" variant: the sprite starts beside/above the picture and must be
+  // dropped *into* the cut-out, so the drag needs a vertical component. The solver reports both
+  // centres for that layout (method outlined_hole_sprite).
+  const geometry = lastPuzzleEvidence?.details || null;
+  const canvasRect = lastPuzzleEvidence?.canvasRect || null;
+  const dpr = Number(lastPuzzleEvidence?.dpr) || 1;
+  let endY = startY;
+  let dropMode = false;
+  if (geometry?.hole_center && canvasRect && Number.isFinite(canvasRect.x)) {
+    const holeX = canvasRect.x + geometry.hole_center[0] / dpr;
+    const holeY = canvasRect.y + geometry.hole_center[1] / dpr;
+    const dy = holeY - startY;
+    if (Math.abs(dy) > 14) {
+      distance = Math.round(holeX - startX);
+      endY = Math.round(holeY);
+      dropMode = true;
+      bridgeLog("info", "2D piece drop", "dx", String(distance), "dy", String(Math.round(dy)));
+    }
+  }
+
+  const points = generateHumanTrajectory(startX, startY, distance, endY);
   const endX = startX + distance;
 
   let debuggerError = null;
@@ -2985,9 +3012,9 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
           // Dừng nghỉ ổn định (Settle delay) để DOM và anti-bot script ghi nhận mảnh ghép đã khớp hoàn toàn
           await new Promise((r) => setTimeout(r, 150 + Math.random() * 50));
           await new Promise((r) => setTimeout(r, 140 + Math.random() * 50));
-          await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: startY, button: "left", clickCount: 1 });
+          await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: endY, button: "left", clickCount: 1 });
         })(), 15000, "debugger drag");
-        return { error: null, result: { attempted: true, method: "debugger", startX, startY, endX, distance } };
+        return { error: null, result: { attempted: true, method: "debugger", startX, startY, endX, endY, distance, dropMode } };
       } catch (err) {
         return { error: String(err?.message || err), result: null };
       } finally {
@@ -3008,7 +3035,7 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
     const [res] = await chrome.scripting.executeScript({
       target: { tabId },
       world: "MAIN",
-      func: (pts, sx, sy, fx) => {
+      func: (pts, sx, sy, fx, fy) => {
         const target = document.elementFromPoint(sx, sy);
         if (!target) return { attempted: false, reason: "element_from_point_missing" };
         const fire = (type, px, py) => {
@@ -3020,11 +3047,11 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
         for (const pt of pts) {
           fire("mousemove", pt.x, pt.y);
         }
-        fire("mouseup", fx, sy);
+        fire("mouseup", fx, fy);
         return { attempted: true, method: "dom_events" };
         return { attempted: true, method: "dom_events_untrusted" };
       },
-      args: [points, startX, startY, endX],
+      args: [points, startX, startY, endX, endY],
     });
     bridgeLog("warn", "captcha drag fell back to untrusted DOM events:", debuggerError || "no debugger", "distance", String(distance));
     // Shopee's anti-bot ignores untrusted input, so this path can move the piece visually
@@ -3220,6 +3247,7 @@ async function detectCaptchaInTab(tabId, options = {}) {
             const candidates = Array.from(document.querySelectorAll("div, button, span, i"));
             handleEl = candidates.find((el) => {
               if (!el.offsetWidth || !el.offsetHeight) return false;
+              if (isSubmitLikeElement(el)) return false;  // "Gửi" is not the slider handle
               if (el.offsetWidth < 25 || el.offsetWidth > 90 || el.offsetHeight < 25 || el.offsetHeight > 90) return false;
               const style = typeof win.getComputedStyle === "function" ? win.getComputedStyle(el) : null;
               if (!style) return false;
@@ -3398,6 +3426,27 @@ function stopVerificationWatcher() {
       chrome.tabs.onUpdated.removeListener(activeTabUpdateListener);
     } catch {}
     activeTabUpdateListener = null;
+  }
+}
+
+/**
+ * Shopee's challenge footer holds an orange submit button ("Gửi") that matches the same colour
+ * test as the slider handle. Picking it made captcha.solve drag from the submit button and
+ * nothing else. Submit-ish labels are excluded from every orange-handle scan.
+ */
+const SUBMIT_LABEL_RE = /(g\u1eedi|submit|x\u00e1c nh\u1eadn|ti\u1ebfp t\u1ee5c|ho\u00e0n th\u00e0nh|\u0111\u0103ng nh\u1eadp|hu\u1ef7|cancel)/i;
+
+function isSubmitLikeElement(el) {
+  try {
+    const text = String(el?.innerText || el?.textContent || "").trim();
+    if (text && SUBMIT_LABEL_RE.test(text) && text.length <= 40) return true;
+    const type = String(el?.getAttribute?.("type") || "").toLowerCase();
+    if (type === "submit") return true;
+    const role = String(el?.getAttribute?.("role") || "").toLowerCase();
+    if (role === "button" && text && SUBMIT_LABEL_RE.test(text)) return true;
+    return false;
+  } catch {
+    return false;
   }
 }
 
