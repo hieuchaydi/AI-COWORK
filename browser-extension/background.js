@@ -3917,7 +3917,10 @@ function startVerificationWatcher(details) {
               bridgeLog("info", "captcha drag not attempted:", refusal,
                 "distance", String(dragRes?.distance ?? "?"), "method", String(dragRes?.method || "none"));
             }
-            if (++refusedDrags >= 12) {
+            refusedDrags++;
+            // Log the hand-over once: the watcher keeps running to notice the challenge going away,
+            // and repeating this line every 32 s would drown the log it is meant to explain.
+            if (refusedDrags === 12) {
               console.warn("[bridge] No measurable puzzle after 12 checks — leaving the challenge to the user.");
               bridgeLog("warn", "captcha: no measurable puzzle after 12 checks — passive handover");
               autoDragAttempts = 3;
