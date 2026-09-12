@@ -2142,12 +2142,14 @@ async function captureTabEvidence(tabId) {
     if (chrome.debugger?.attach && chrome.debugger?.sendCommand && chrome.debugger?.detach) {
       const target = { tabId: targetId };
       return await withDebuggerLock(async () => {
+        let sessionToken = null;
         try {
           const session = await withTimeout(attachDebuggerSession(target), 6000, "debugger attach");
           if (!session.ok) {
             console.warn("[bridge] Debugger Page.captureScreenshot attach failed:", session.error);
             return null;
           }
+          sessionToken = claimDebuggerSession(targetId);
           const res = await withTimeout(
             chrome.debugger.sendCommand(target, "Page.captureScreenshot", { format: "png" }),
             8000, "Page.captureScreenshot",
@@ -2160,7 +2162,7 @@ async function captureTabEvidence(tabId) {
           console.warn("[bridge] Debugger Page.captureScreenshot failed:", dbgErr?.message || dbgErr);
           return null;
         } finally {
-          try { await chrome.debugger.detach(target); } catch {}
+          await releaseDebuggerSession(targetId, sessionToken);
         }
       });
     }
@@ -2637,6 +2639,24 @@ function withDebuggerLock(task) {
   return run;
 }
 
+// Tracks which debugger session is current per tab. When a drag hits its deadline the inner
+// promise keeps running, and its `finally` used to detach whatever session was attached *then*
+// — i.e. the next attempt's — which surfaced as "Detached while handling command".
+const debuggerSessionTokens = new Map();
+let debuggerSessionSeq = 0;
+
+function claimDebuggerSession(tabId) {
+  const token = ++debuggerSessionSeq;
+  debuggerSessionTokens.set(tabId, token);
+  return token;
+}
+
+async function releaseDebuggerSession(tabId, token) {
+  if (debuggerSessionTokens.get(tabId) !== token) return;  // a newer session owns the tab
+  debuggerSessionTokens.delete(tabId);
+  try { await chrome.debugger.detach({ tabId }); } catch {}
+}
+
 /**
  * Bound a debugger/CDP call. chrome.debugger.sendCommand can hang forever when the debuggee
  * dies mid-drag; without a deadline the locked task never settles, which wedges the queue and
@@ -2946,10 +2966,12 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
     const target = { tabId };
     const outcome = await withDebuggerLock(async () => {
       let attached = false;
+      let sessionToken = null;
       try {
         const session = await withTimeout(attachDebuggerSession(target), 6000, "debugger attach");
         if (!session.ok) return { error: session.error, result: null };
         attached = true;
+        sessionToken = claimDebuggerSession(tabId);
         await withTimeout((async () => {
           await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: startX, y: startY, button: "none" });
           await new Promise((r) => setTimeout(r, 60 + Math.random() * 40));
@@ -2970,7 +2992,7 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
         return { error: String(err?.message || err), result: null };
       } finally {
         if (attached) {
-          try { await chrome.debugger.detach(target); } catch {}
+          await releaseDebuggerSession(tabId, sessionToken);
         }
       }
     });
@@ -4127,12 +4149,14 @@ async function handleAction(action, params) {
         if (chrome.debugger?.attach && chrome.debugger?.sendCommand && chrome.debugger?.detach) {
           const target = { tabId: targetTabId };
           await withDebuggerLock(async () => {
+            let sessionToken = null;
             try {
               const session = await withTimeout(attachDebuggerSession(target), 6000, "debugger attach");
               if (!session.ok) {
                 debuggerError = session.error;
                 return;
               }
+              sessionToken = claimDebuggerSession(targetTabId);
               const res = await withTimeout(chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
                 format: params.format === "jpeg" ? "jpeg" : "png",
                 quality: params.quality,
@@ -4145,7 +4169,7 @@ async function handleAction(action, params) {
             } catch (err) {
               debuggerError = String(err?.message || err);
             } finally {
-              try { await chrome.debugger.detach(target); } catch {}
+              await releaseDebuggerSession(targetTabId, sessionToken);
             }
           });
         }
