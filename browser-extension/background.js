@@ -2177,9 +2177,17 @@ async function captureTabEvidence(tabId) {
  * - Phân tích pixel cột canvas để định vị điểm nhấn màu đỏ (red notch) hoặc cạnh viền puzzle.
  * - Áp dụng hệ số tỉ lệ scale = trackUsableWidth / bgUsableWidth.
  */
+/**
+ * Most recent solver answer, kept so callers can refuse to spend a Shopee attempt on a blind
+ * or low-confidence guess (a wrong drag regenerates the puzzle and burns one of ~3 tries).
+ */
+let lastPuzzleEvidence = null;
+
 async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
+  lastPuzzleEvidence = null;
   if (!tabId || !chrome.scripting?.executeScript) {
     const fallbackMax = Math.max(120, Number(sliderInfo?.width || 300) - 44);
+    lastPuzzleEvidence = { ok: false, method: "no_measurement", confidence: 0.3 };
     return Math.round(fallbackMax * 0.58);
   }
 
@@ -2305,10 +2313,26 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
               .filter((c) => c.offsetWidth <= 80 && c.offsetHeight <= 80)
               .sort((a, b) => b.offsetWidth * b.offsetHeight - a.offsetWidth * a.offsetHeight);
             const large = canvases
-              .filter((c) => c.offsetWidth > 100 && c.offsetHeight > 60)
+              // Only *visible*, on-screen canvases: Shopee also keeps big offscreen canvases
+              // around, and picking one of those made every measurement meaningless.
+              .filter((c) => {
+                if (c.offsetWidth <= 100 || c.offsetHeight <= 60) return false;
+                const r = c.getBoundingClientRect();
+                return r.width > 100 && r.height > 60 && r.top > -50 && r.left > -50;
+              })
               .sort((a, b) => b.offsetWidth * b.offsetHeight - a.offsetWidth * a.offsetHeight);
             if (!handleEl && small.length) handleEl = small[0];
-            if (!bgEl && large.length) bgEl = large[0];
+            if (!bgEl && large.length) {
+              // The puzzle strip sits directly above the slider bar the handle lives on.
+              const handleTop = handleEl ? handleEl.getBoundingClientRect().top : null;
+              const above = handleTop === null
+                ? []
+                : large.filter((c) => {
+                    const r = c.getBoundingClientRect();
+                    return r.bottom <= handleTop + 8 && handleTop - r.bottom < 320;
+                  });
+              bgEl = (above.length ? above : large)[0];
+            }
             if (!pieceEl && large.length > 1) {
               const twin = large.find(
                 (c) => c !== bgEl && Math.abs(c.offsetWidth - (bgEl ? bgEl.offsetWidth : 0)) <= 4
@@ -2494,6 +2518,14 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
             bridgeLog("info", "cv solver travel", String(travel), "method", String(cvData.method),
               "conf", String(cvData.confidence), "piece", JSON.stringify(dbg.piece_center || null),
               "slot", JSON.stringify(dbg.slot_center || null), "dpr", String(domInfo?.devicePixelRatio || 1));
+            lastPuzzleEvidence = {
+              ok: true,
+              travel,
+              method: cvData.method || null,
+              confidence: Number(cvData.confidence) || 0,
+              piece: dbg.piece_center || dbg.piece_x_phys || null,
+              slot: dbg.slot_center || dbg.target_x_phys || null,
+            };
             return travel;
           }
           if (cvData && cvData.ok === false) {
@@ -2512,7 +2544,15 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
     }
 
     if (validResult?.result?.travel) {
-      return validResult.result.travel;
+      const r = validResult.result;
+      const reliable = Boolean(r.method) && r.method !== "golden_ratio_fallback";
+      lastPuzzleEvidence = {
+        ok: reliable,
+        travel: r.travel,
+        method: r.method || null,
+        confidence: reliable ? 0.9 : 0.5,
+      };
+      return r.travel;
     }
   } catch (err) {
     console.warn("[bridge] calculatePuzzleDistance error:", err?.message || err);
@@ -2520,6 +2560,7 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
 
   const fallbackMax = Math.max(120, Number(sliderInfo?.width || 300) - 44);
   console.warn("[bridge] No puzzle evidence at all — blind 64%-of-track guess as last resort");
+  lastPuzzleEvidence = { ok: false, method: "golden_ratio_fallback", confidence: 0.4 };
   return Math.round(fallbackMax * 0.64);
 }
 
@@ -2864,6 +2905,23 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
   const startX = slider.x;
   const startY = slider.y;
   let distance = await calculatePuzzleDistance(tabId, slider);
+  // A blind or low-confidence answer costs one of the few attempts Shopee allows, and a wrong
+  // drag also regenerates the puzzle — so skip the drag and report instead.
+  const lastPuzzle = lastPuzzleEvidence;
+  const confident = Boolean(lastPuzzle?.ok) && Number(lastPuzzle?.confidence || 0) >= 0.85;
+  const plausible = Math.abs(distance) >= 20;
+  if (!confident || !plausible) {
+    bridgeLog("warn", "captcha drag skipped:",
+      confident ? "implausible distance" : "low-confidence solver", String(distance),
+      "conf", String(lastPuzzle?.confidence ?? "unknown"), "method", String(lastPuzzle?.method || "none"));
+    return {
+      attempted: false,
+      reason: confident ? "implausible_distance" : "low_confidence_solver",
+      distance,
+      confidence: lastPuzzle?.confidence ?? null,
+      method: lastPuzzle?.method || null,
+    };
+  }
   const attemptNum = Number(options?.attempt || detection?.attempt || 1);
   // Keep the sign of the travel (left drags are real) — only guard the magnitude.
   const withMinMagnitude = (d) => (d < 0 ? -Math.max(8, Math.abs(d)) : Math.max(8, d));
@@ -3321,6 +3379,28 @@ function stopVerificationWatcher() {
   }
 }
 
+/**
+ * Shopee answers too many wrong attempts with "Vui lòng thử lại sau / Chưa thể hoàn tất xác
+ * thực lúc này" and stops offering the slider. Dragging again only extends the cooldown — and
+ * each wrong attempt also regenerates the puzzle — so the watcher pauses instead.
+ */
+async function isShopeeChallengeLocked(tabId) {
+  if (!tabId || !chrome.scripting?.executeScript) return false;
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => {
+        const text = (document.body ? document.body.innerText : "").toLowerCase();
+        return text.includes("vui lòng thử lại sau") || text.includes("chưa thể hoàn tất xác thực");
+      },
+    });
+    return res?.result === true;
+  } catch {
+    return false;
+  }
+}
+
 function startVerificationWatcher(details) {
   stopVerificationWatcher();
   const jid = details?.job_id;
@@ -3334,6 +3414,7 @@ function startVerificationWatcher(details) {
 
   let consecutiveAbsentCount = 0;
   let autoDragAttempts = 0;
+  let challengeLockedUntil = 0;
   // P2-2: Concurrency guard ngăn chặn thực thi chồng chéo giữa interval, event listener và post-drag
   let checkInProgress = false;
 
@@ -3444,11 +3525,23 @@ function startVerificationWatcher(details) {
         }
       } else {
         consecutiveAbsentCount = 0;
-        // Thử tự động kéo thông minh tối đa 5 lần (với micro-jitter +4px, -4px, +8px, -8px) nếu CAPTCHA đang hiển thị
-        if (autoDragAttempts < 5) {
+        // Shopee tạm khoá xác thực sau vài lần sai ("Vui lòng thử lại sau"): kéo tiếp chỉ
+        // làm khoá lâu hơn, và mỗi lần kéo sai còn đổi puzzle mới.
+        if (await isShopeeChallengeLocked(targetTabId)) {
+          if (!challengeLockedUntil) {
+            challengeLockedUntil = Date.now();
+            console.warn("[bridge] Shopee locked the challenge ('Vui lòng thử lại sau'); pausing auto-drag.");
+            bridgeLog("warn", "shopee challenge temporarily locked — auto-drag paused");
+          }
+          stopVerificationWatcher();
+          return;
+        }
+        challengeLockedUntil = 0;
+        // Thử tự động kéo thông minh tối đa 3 lần (với micro-jitter +4px, -4px, +8px, -8px)
+        if (autoDragAttempts < 3) {
           autoDragAttempts++;
           try {
-            console.log(`[bridge] CAPTCHA visible; attempting intelligent slider drag ${autoDragAttempts}/5 for job ${jid}...`);
+            console.log(`[bridge] CAPTCHA visible; attempting intelligent slider drag ${autoDragAttempts}/3 for job ${jid}...`);
             // P1-1: Truyền attempt để tự động bù micro-jitter offset ở các lần thử tiếp theo
             const dragRes = await tryAutoDragShopeeCaptcha(targetTabId, check, { attempt: autoDragAttempts });
             console.log("[bridge] Intelligent slider drag result:", dragRes);

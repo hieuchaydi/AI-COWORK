@@ -2268,6 +2268,11 @@ test('calculatePuzzleDistance identifies target position from canvas pixel color
 test('tryAutoDragShopeeCaptcha executes realistic drag via chrome.debugger', async () => {
   const { context } = await worker();
   context.setTimeout = (fn) => { queueMicrotask(fn); return 1; };
+  // The drag only runs on a *measured* puzzle: a blind guess is no longer allowed to burn one
+  // of the few attempts Shopee grants before it locks the challenge.
+  context.chrome.scripting = {
+    executeScript: async () => [{ result: { method: 'canvas_pixel_analysis', travel: 160, maxTravel: 260 } }],
+  };
   const debuggerCommands = [];
   let attached = false;
   let detached = false;
@@ -2375,6 +2380,9 @@ test('detectCaptchaInTab finds orange button by track text when standard classes
 test('tryAutoDragShopeeCaptcha applies jitter offset on retry attempt 2', async () => {
   const { context } = await worker();
   context.setTimeout = (fn) => { queueMicrotask(fn); return 1; };
+  context.chrome.scripting = {
+    executeScript: async () => [{ result: { method: 'canvas_pixel_analysis', travel: 160, maxTravel: 260 } }],
+  };
   context.chrome.debugger = {
     attach: async () => {},
     detach: async () => {},
