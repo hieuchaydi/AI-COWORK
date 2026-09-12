@@ -1,4 +1,4 @@
-// AI Cowork — Manifest V3 Chrome Extension Browser Bridge (v2.2.0)
+// AI Cowork — Manifest V3 Chrome Extension Browser Bridge (v2.4.0)
 //
 // Realtime WebSocket control bridge & ingest worker.
 // Operates in the user's real Chrome profile with ordinary session cookies.
@@ -11,6 +11,7 @@
 // 5. Exponential backoff reconnect with random jitter and 20s keepalive heartbeats.
 // 6. Backward-compatible Shopee reviews extraction and acknowledged WebSocket result uploads.
 
+importScripts("captcha-lifecycle.js");
 const HELPER = "http://127.0.0.1:8766";
 // Match the Shopee web UI request size. Large batches (for example 50) make
 // an otherwise valid in-page session get redirected to /verify/traffic.
@@ -25,6 +26,74 @@ const RATING_TYPES = [0, 5, 4, 3, 2, 1];
 // once. Production keeps the worker's real timer.
 const NATIVE_SET_TIMEOUT = typeof setTimeout === "function" ? setTimeout : null;
 const NATIVE_CLEAR_TIMEOUT = typeof clearTimeout === "function" ? clearTimeout : null;
+const captchaLedger = new CaptchaLifecycle.Ledger({ setTimer: NATIVE_SET_TIMEOUT, clearTimer: NATIVE_CLEAR_TIMEOUT });
+let captchaBudgetWrite = Promise.resolve();
+let captchaBudgetError = null;
+const captchaBudgetReady = chrome.storage.local.get(["captchaBudgetsV1"])
+  .then(saved => captchaLedger.restore(saved.captchaBudgetsV1 || {}))
+  .catch(error => { captchaBudgetError = error; });
+const lastCaptchaOutcome = new Map();
+function persistCaptchaBudgets() {
+  const snapshot = captchaLedger.snapshot();
+  captchaBudgetWrite = captchaBudgetWrite.catch(() => {}).then(() => chrome.storage.local.set({ captchaBudgetsV1: snapshot }));
+  return captchaBudgetWrite;
+}
+let activeVerificationJobId = null;
+let activeVerificationTabId = null;
+let activeVerificationCheck = null;
+
+async function ensureCaptchaObserver(tabId) {
+  if (!chrome.tabs?.sendMessage) return;
+  try {
+    let observation;
+    try { observation = await withTimeout(chrome.tabs.sendMessage(tabId, { action: "captcha.snapshot" }, { frameId: 0 }), 400, "observer snapshot"); }
+    catch {
+      await withTimeout(chrome.scripting.executeScript({ target: { tabId }, files: ["captcha-observer.js"] }), 400, "observer install");
+      observation = await withTimeout(chrome.tabs.sendMessage(tabId, { action: "captcha.snapshot" }, { frameId: 0 }), 400, "observer snapshot");
+    }
+    if (observation) captchaLedger.observe(tabId, observation);
+  } catch (error) { bridgeLog("warn", "captcha observer unavailable:", error.message); }
+}
+
+async function runCaptchaChallenge(tabId, key, request = {}) {
+  await captchaBudgetReady;
+  if (captchaBudgetError) return { ok: false, solved: false, attempted: false, reason: "attempt_storage_unavailable" };
+  await ensureCaptchaObserver(tabId);
+  const result = await captchaLedger.run(tabId, key, async ctx => {
+    const check = await ctx.run("detect", () => detectCaptchaInTab(tabId, { scrollIntoView: false }), 500);
+    if (check?.resolved) return { ok: true, solved: true, attempted: false, status: "confirmed" };
+    if (!check?.detected || check?.error) return { ok: false, solved: false, attempted: false, reason: "challenge_not_visible" };
+    const attempt = (captchaLedger.job(key).frames[ctx.frame.id] || 0) + 1;
+    const dragResult = await tryAutoDragShopeeCaptcha(tabId, check, { attempt, context: ctx });
+    if (!dragResult.attempted || dragResult.error) return { ok: false, solved: false, ...dragResult };
+    // Input ACK means Chrome handled input, not that the site accepted the puzzle.
+    ctx.confirming = true;
+    while (ctx.remaining() > 100) {
+      const verdict = await ctx.run("confirm", () => detectCaptchaInTab(tabId, { scrollIntoView: false }), 400);
+      if (verdict?.resolved) return { ok: true, solved: true, attempted: true, status: "confirmed", dragResult };
+      if (!verdict?.detected && !verdict?.error) {
+        const info = verificationInfo;
+        if (info?.tab_id === tabId) {
+          const ids = idsFrom(info.url || "");
+          const preflight = await ctx.run("confirm_api", () => preflightRatingsInTab(tabId,
+            info.itemid || info.checkpoint?.itemid || ids.itemid,
+            info.shopid || info.checkpoint?.shopid || ids.shopid, info.referer || info.url), 700);
+          if (isUsableRatingsPreflight(preflight)) return { ok: true, solved: true, attempted: true, status: "confirmed", dragResult };
+        }
+        return { ok: false, solved: false, attempted: true, status: "awaiting_confirmation", dragResult };
+      }
+      if (verdict?.failed) return { ok: false, solved: false, attempted: true, status: "rejected", dragResult };
+      await ctx.sleep(150);
+    }
+    return { ok: false, solved: false, attempted: true, reason: "confirmation_timeout", dragResult };
+  }, request);
+  const outcomeKey = JSON.stringify([result.challengeId, result.reason, result.status, result.attempted]);
+  if (lastCaptchaOutcome.get(key) !== outcomeKey) {
+    lastCaptchaOutcome.set(key, outcomeKey);
+    bridgeLog("info", "captcha.outcome", JSON.stringify({ job: key, ...result, dragResult: undefined }));
+  }
+  return result;
+}
 
 let bridgeSocket = null;
 let bridgeConnecting = null;
@@ -1991,6 +2060,8 @@ async function restorePendingVerificationWatchers() {
   } catch {
     return;
   }
+  await captchaBudgetReady;
+  captchaLedger.restore(stored.captchaBudgetsV1 || {});
   const info = stored.verificationInfo;
   if (!info || !info.job_id || info.kind === "login") return;
   const storedJob = stored[`pending_job_${info.job_id}`];
@@ -2113,62 +2184,39 @@ function startApiBlockedWatcher(details) {
   scheduleNextBackoff();
 }
 
-async function captureTabEvidence(tabId) {
+async function captchaStep(context, stage, operation, ms = 700, reserve = 0) {
+  return context ? context.run(stage, operation, ms, reserve) : withTimeout(operation(), ms, stage);
+}
+
+async function captureTabEvidence(tabId, context = null) {
   try {
     if (!chrome.tabs?.captureVisibleTab) return null;
-    let targetId = tabId;
-    if (!targetId) {
-      const active = await getActiveTab();
-      targetId = active?.id;
-    }
+    const targetId = tabId || (await getActiveTab())?.id;
     if (!targetId) return null;
-    const tab = await chrome.tabs.get(targetId);
-    if (!tab || !tab.windowId) return null;
-    try {
-      await chrome.tabs.update(targetId, { active: true });
-      if (tab.windowId && chrome.windows) await chrome.windows.update(tab.windowId, { focused: true });
-      await new Promise((r) => setTimeout(r, 150));
-    } catch {}
-
-    // 1. Thử capture qua chrome.tabs.captureVisibleTab
-    try {
-      const res = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
-      if (res) return res;
-    } catch (tabsErr) {
-      console.warn("[bridge] captureVisibleTab failed, trying debugger fallback:", tabsErr?.message || tabsErr);
+    const tab = await captchaStep(context, "capture_tab", () => chrome.tabs.get(targetId), 400);
+    if (!tab?.windowId) return null;
+    if (tab.active === false) {
+      await captchaStep(context, "capture_focus", () => chrome.tabs.update(targetId, { active: true }), 400);
     }
-
-    // 2. Dự phòng bằng Chrome Debugger API Page.captureScreenshot (luôn hoạt động)
-    if (chrome.debugger?.attach && chrome.debugger?.sendCommand && chrome.debugger?.detach) {
-      const target = { tabId: targetId };
-      return await withDebuggerLock(async () => {
-        let sessionToken = null;
-        try {
-          const session = await withTimeout(attachDebuggerSession(target), 6000, "debugger attach");
-          if (!session.ok) {
-            console.warn("[bridge] Debugger Page.captureScreenshot attach failed:", session.error);
-            return null;
-          }
-          sessionToken = claimDebuggerSession(targetId);
-          const res = await withTimeout(
-            chrome.debugger.sendCommand(target, "Page.captureScreenshot", { format: "png" }),
-            8000, "Page.captureScreenshot",
-          );
-          if (res?.data) {
-            return `data:image/png;base64,${res.data}`;
-          }
-          return null;
-        } catch (dbgErr) {
-          console.warn("[bridge] Debugger Page.captureScreenshot failed:", dbgErr?.message || dbgErr);
-          return null;
-        } finally {
-          await releaseDebuggerSession(targetId, sessionToken);
-        }
-      });
-    }
-    return null;
-  } catch (err) {
-    console.warn("[bridge] captureTabEvidence failed:", err?.message || err);
+    try {
+      const shot = await captchaStep(context, "capture", () => chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" }), 600);
+      if (shot) return shot;
+    } catch (error) { if (context?.signal.aborted) throw error; }
+    if (!chrome.debugger?.attach) return null;
+    return await captchaStep(context, "capture_queue", () => withDebuggerLock(async () => {
+      context?.check();
+      const session = await attachDebuggerSession({ tabId: targetId }, { context });
+      if (!session.ok) throw new Error(session.error);
+      const token = claimDebuggerSession(targetId);
+      try {
+        const shot = await captchaStep(context, "capture_debugger", () => chrome.debugger.sendCommand(
+          { tabId: targetId }, "Page.captureScreenshot", { format: "png" }), 600);
+        return shot?.data ? 'data:image/png;base64,' + shot.data : null;
+      } finally { await releaseDebuggerSession(targetId, token); }
+    }, targetId), 1400);
+  } catch (error) {
+    if (context?.signal.aborted) throw error;
+    bridgeLog("warn", "capture failed:", error.message);
     return null;
   }
 }
@@ -2185,25 +2233,16 @@ async function captureTabEvidence(tabId) {
  */
 let lastPuzzleEvidence = null;
 
-/**
- * Why this exists: the user reports "the mouse only starts moving 5-6 s after the captcha shows up,
- * then it times out". Every stage between "challenge visible" and "first mouse event" is now timed,
- * because the last fix attacked the wrong stage and the next one must not be another guess.
- */
-let challengeSeenAt = 0;
+// Compatibility diagnostics; each live attempt keeps its own measurement context.
 let lastPuzzleTiming = null;
 
-function markChallengeSeen() {
-  challengeSeenAt = Date.now();
-}
-
 /**
- * The watcher fires every 2.5 s and the drag re-enters it after each attempt, so the same frame used
+ * The old watcher fired every 2.5 s and re-entered after each attempt, so the same frame used
  * to be measured two or three times in a row (log 13:47:24/13:47:26, 13:48:20/13:48:23) at ~1 s a
  * round-trip. An unchanged frame is the same puzzle, so its verdict is cached briefly.
  */
 const puzzleVerdictCache = new Map();
-const PUZZLE_CACHE_TTL_MS = 15000;
+const PUZZLE_CACHE_TTL_MS = 6000;
 const PUZZLE_CACHE_MAX = 12;
 
 function frameFingerprint(pngDataUrl) {
@@ -2248,16 +2287,28 @@ function refuseDrag(evidence) {
   return 0;
 }
 
-async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
-  lastPuzzleEvidence = null;
+async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1, context = null) {
+  const measurement = { context, evidence: null, timing: null };
+  try { return await calculatePuzzleMeasurement(tabId, sliderInfo, attempt, measurement); }
+  finally {
+    lastPuzzleEvidence = measurement.evidence;
+    lastPuzzleTiming = measurement.timing;
+    if (context) { context.evidence = measurement.evidence; context.timing = measurement.timing; }
+  }
+}
+
+async function calculatePuzzleMeasurement(tabId, sliderInfo, attempt, measurement) {
+  const context = measurement.context;
+  const refuse = evidence => { measurement.evidence = evidence; return refuseDrag(evidence); };
+  measurement.evidence = null;
   if (!tabId || !chrome.scripting?.executeScript) {
     const fallbackMax = Math.max(120, Number(sliderInfo?.width || 300) - 44);
-    lastPuzzleEvidence = { ok: false, method: "no_measurement", confidence: 0.3 };
+    measurement.evidence = { ok: false, method: "no_measurement", confidence: 0.3 };
     return Math.round(fallbackMax * 0.58);
   }
 
   try {
-    const results = await chrome.scripting.executeScript({
+    const results = await captchaStep(context, "measure_dom", () => chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
       world: "MAIN",
       func: () => {
@@ -2543,7 +2594,7 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
           domInfo
         };
       }
-    });
+    }), 500);
 
     const validResult = results?.find((r) => r?.result?.travel);
     const domInfo = validResult?.result?.domInfo || null;
@@ -2551,20 +2602,22 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
     // Hướng 2: Gọi Python CV Solver qua HTTP với ảnh chụp tab sạch (bypasses canvas tainting CORS restriction)
     try {
       const shotStartedAt = Date.now();
-      const screenshot = await captureTabEvidence(tabId);
-      const fingerprint = frameFingerprint(screenshot);
+      const screenshot = await captureTabEvidence(tabId, context);
+      const fingerprint = frameFingerprint(screenshot) + ":" + JSON.stringify([context?.frame.id, tabId, domInfo]);
       const cachedVerdict = readPuzzleVerdict(fingerprint);
       if (cachedVerdict) {
-        lastPuzzleEvidence = { ...cachedVerdict.evidence, cached: true };
-        lastPuzzleTiming = { shotMs: Date.now() - shotStartedAt, solveMs: 0, cached: true };
-        bridgeLog("info", "cv solver cache hit", String(lastPuzzleEvidence.travel ?? "no_travel"),
-          "method", String(lastPuzzleEvidence.method || "none"), "age_ms", String(Date.now() - cachedVerdict.at));
-        if (lastPuzzleEvidence.ok) return lastPuzzleEvidence.travel;
-        return refuseDrag(lastPuzzleEvidence);
+        measurement.evidence = { ...cachedVerdict.evidence, cached: true };
+        measurement.timing = { shotMs: Date.now() - shotStartedAt, solveMs: 0, cached: true };
+        bridgeLog("info", "cv solver cache hit", String(measurement.evidence.travel ?? "no_travel"),
+          "method", String(measurement.evidence.method || "none"), "age_ms", String(Date.now() - cachedVerdict.at));
+        if (measurement.evidence.ok) return measurement.evidence.travel;
+        return refuse(measurement.evidence);
       }
       if (screenshot && typeof fetch === "function") {
             const fetchStartedAt = Date.now();
-            const cvRes = await fetch(`${HELPER}/browser/solve_puzzle_cv`, {
+            const { cvRes, cvData } = await captchaStep(context, "solve", async () => {
+          const cvRes = await fetch(`${HELPER}/browser/solve_puzzle_cv`, {
+          signal: context?.signal,
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -2577,9 +2630,10 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
             attempt: Number(attempt || 1),
           }),
         });
-        if (cvRes.ok) {
-          const cvData = await cvRes.json();
-          lastPuzzleTiming = {
+          return { cvRes, cvData: await cvRes.json() };
+        }, 900);
+        {
+          measurement.timing = {
             shotMs: fetchStartedAt - shotStartedAt,
             solveMs: Date.now() - fetchStartedAt,
             cached: false,
@@ -2599,13 +2653,13 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
               travel: null,
             };
             rememberPuzzleVerdict(fingerprint, abstainEvidence);
-            return refuseDrag(abstainEvidence);
+            return refuse(abstainEvidence);
           }
           // Signed travel: a NEGATIVE value means the piece must be dragged LEFT — Shopee
           // parks the sprite against the right edge for several prop variants (mortar & pestle,
           // tray & lid). Squashing those to a positive "usual" drag is what pushed the piece
           // out of the frame, so the solver's answer is now taken as-is.
-          if (cvData?.ok && Number.isFinite(cvData.travel) && cvData.travel !== 0) {
+          if (cvRes.ok && cvData?.ok && Number.isFinite(cvData.travel) && cvData.travel !== 0) {
             const travel = Math.trunc(cvData.travel);
             const dbg = cvData.debug_info || cvData.details || {};
             console.log(
@@ -2617,7 +2671,7 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
             bridgeLog("info", "cv solver travel", String(travel), "method", String(cvData.method),
               "conf", String(cvData.confidence), "piece", JSON.stringify(dbg.piece_center || null),
               "slot", JSON.stringify(dbg.slot_center || null), "dpr", String(domInfo?.devicePixelRatio || 1));
-            lastPuzzleEvidence = {
+            measurement.evidence = {
               ok: true,
               travel,
               method: cvData.method || null,
@@ -2628,28 +2682,29 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
               canvasRect: (domInfo && domInfo.bgRect) || null,
               dpr: Number(domInfo?.devicePixelRatio) || 1,
             };
-            rememberPuzzleVerdict(fingerprint, lastPuzzleEvidence);
+            rememberPuzzleVerdict(fingerprint, measurement.evidence);
             return travel;
           }
-          if (cvData && cvData.ok === false) {
+          if (!cvRes.ok || cvData?.ok !== true) {
             // Most common cause: the sidecar Python lacks numpy/opencv → say so loudly instead
             // of silently degrading to the crude heuristics below.
             console.warn(`[bridge] CV puzzle solver unavailable: ${cvData.error || "unknown error"}`);
-            bridgeLog("warn", "cv solver unavailable:", String(cvData.error || "unknown error"));
+            return refuse({ ok: false, confidence: 0, reason: cvData?.error || "solver_unavailable", method: "cv_error" });
           }
         }
       } else {
         bridgeLog("warn", "no screenshot for CV solver (capture failed) — falling back to DOM heuristics");
       }
     } catch (cvErr) {
+      if (context?.signal.aborted) throw cvErr;
       console.warn("[bridge] CV puzzle solver call failed, falling back to heuristics:", cvErr?.message || cvErr);
       bridgeLog("warn", "cv solver call failed:", String(cvErr?.message || cvErr));
     }
 
     if (validResult?.result?.travel) {
       const r = validResult.result;
-      const reliable = Boolean(r.method) && r.method !== "golden_ratio_fallback";
-      lastPuzzleEvidence = {
+      const reliable = r.method === "canvas_pixel_analysis";
+      measurement.evidence = {
         ok: reliable,
         travel: r.travel,
         method: r.method || null,
@@ -2658,12 +2713,13 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
       return r.travel;
     }
   } catch (err) {
+    if (context?.signal.aborted) throw err;
     console.warn("[bridge] calculatePuzzleDistance error:", err?.message || err);
   }
 
   const fallbackMax = Math.max(120, Number(sliderInfo?.width || 300) - 44);
   console.warn("[bridge] No puzzle evidence at all — blind 64%-of-track guess as last resort");
-  lastPuzzleEvidence = { ok: false, method: "golden_ratio_fallback", confidence: 0.4 };
+  measurement.evidence = { ok: false, method: "golden_ratio_fallback", confidence: 0.4 };
   return Math.round(fallbackMax * 0.64);
 }
 
@@ -2736,11 +2792,22 @@ function generateHumanTrajectory(startX, startY, distance, endY = startY) {
 //     debugger drag failed: Detached while handling command.
 //     debugger drag failed: Debugger is not attached to the tab with id: NNN
 // Every session now runs through this queue.
-let debuggerChain = Promise.resolve();
-function withDebuggerLock(task) {
-  const run = debuggerChain.then(task, task);
-  debuggerChain = run.then(() => {}, () => {});
+const debuggerChains = new Map();
+const debuggerUnsettledTabs = new Map();
+function withDebuggerLock(task, tabId = "default") {
+  const run = (debuggerChains.get(tabId) || Promise.resolve()).then(task, task);
+  const tail = run.then(() => {}, () => {});
+  debuggerChains.set(tabId, tail);
+  tail.then(() => { if (debuggerChains.get(tabId) === tail) debuggerChains.delete(tabId); });
   return run;
+}
+function quarantineDebugger(tabId, pending) {
+  debuggerUnsettledTabs.set(tabId, pending);
+  pending.then(() => {
+    if (debuggerUnsettledTabs.get(tabId) === pending) debuggerUnsettledTabs.delete(tabId);
+  }, () => {
+    if (debuggerUnsettledTabs.get(tabId) === pending) debuggerUnsettledTabs.delete(tabId);
+  });
 }
 
 // Tracks which debugger session is current per tab. When a drag hits its deadline the inner
@@ -2761,9 +2828,14 @@ function claimDebuggerSession(tabId) {
 }
 
 async function releaseDebuggerSession(tabId, token) {
-  if (debuggerSessionTokens.get(tabId) !== token) return;  // a newer session owns the tab
+  if (debuggerSessionTokens.get(tabId) !== token) return;
   debuggerSessionTokens.delete(tabId);
-  try { await chrome.debugger.detach({ tabId }); } catch {}
+  const pending = chrome.debugger.detach({ tabId });
+  try { await withTimeout(pending, 350, "debugger detach"); }
+  catch (error) {
+    if (error.message.includes("timed out")) quarantineDebugger(tabId, pending);
+    bridgeLog("warn", "debugger cleanup:", error.message);
+  }
 }
 
 /**
@@ -2786,36 +2858,54 @@ function withTimeout(promise, ms, label) {
   });
 }
 
-async function attachDebuggerSession(target, { retry = true } = {}) {
+async function attachDebuggerSession(target, { retry = true, context = null } = {}) {
+  if (debuggerUnsettledTabs.has(target.tabId)) return { ok: false, error: "debugger_recovering" };
+  const pending = chrome.debugger.attach(target, "1.3");
   try {
-    await chrome.debugger.attach(target, "1.3");
+    await captchaStep(context, "debugger_attach", () => pending, 700);
     return { ok: true, error: null };
-  } catch (err) {
-    const first = String(err?.message || err);
-    if (!retry) return { ok: false, error: first };
-    try {
-      await chrome.debugger.detach(target);
-      await new Promise((r) => setTimeout(r, 150));
-      await chrome.debugger.attach(target, "1.3");
-      console.warn("[bridge] Re-attached debugger after a stale session:", first);
-      return { ok: true, error: null, recoveredFrom: first };
-    } catch (retryErr) {
-      return { ok: false, error: `${first} | retry: ${String(retryErr?.message || retryErr)}` };
+  } catch (error) {
+    if (context?.signal.aborted || error.message.includes("timeout") || error.message.includes("timed out")) {
+      // An abandoned attach may finish late. Keep this tab quarantined until its cleanup
+      // finishes so it cannot detach a newer session. Other tabs have independent queues.
+      quarantineDebugger(target.tabId, pending.then(() => chrome.debugger.detach(target)));
+      return { ok: false, error: error.message };
     }
+    if (!retry) return { ok: false, error: error.message };
+    try {
+      await withTimeout(chrome.debugger.detach(target), 350, "debugger recovery");
+      return await attachDebuggerSession(target, { retry: false, context });
+    } catch (recoveryError) { return { ok: false, error: recoveryError.message }; }
   }
 }
 
 async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
   if (!tabId || !detection?.detected) return { attempted: false, reason: "no_captcha_detection" };
 
+  const context = options.context || null;
+  context?.check(1000);
   let slider = detection.slider;
   // Nếu chưa có toạ độ hoặc toạ độ hiện tại chưa phải là Nút trượt cam thật sự (isOrangeHandle: false)
   if ((!slider || !slider.isOrangeHandle) && chrome.scripting?.executeScript) {
     try {
-      const results = await chrome.scripting.executeScript({
+      const results = await captchaStep(context, "handle_lookup", () => chrome.scripting.executeScript({
         target: { tabId, allFrames: true },
         world: "MAIN",
         func: () => {
+          function isSubmitLikeElement(el) {
+            try {
+              const text = String(el?.innerText || el?.textContent || "").trim();
+              if (text && /(gửi|submit|xác nhận|tiếp tục|hoàn thành|đăng nhập|huỷ|cancel)/i.test(text) && text.length <= 40) return true;
+              const type = String(el?.getAttribute?.("type") || "").toLowerCase();
+              if (type === "submit") return true;
+              const role = String(el?.getAttribute?.("role") || "").toLowerCase();
+              if (role === "button" && text && /(gửi|submit|xác nhận|tiếp tục|hoàn thành|đăng nhập|huỷ|cancel)/i.test(text)) return true;
+              return false;
+            } catch {
+              return false;
+            }
+          }
+
           // 1. Selector chuẩn cho nút trượt
           const handleSelectors = [
             "canvas.MqzVM5",
@@ -3002,7 +3092,7 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
           }
           return null;
         },
-      });
+      }), 400);
       const found = results?.find((r) => r?.result)?.result || null;
       if (found && (found.isOrangeHandle || !slider)) {
         slider = found;
@@ -3015,7 +3105,7 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
   // Chặn trình duyệt kích hoạt HTML5 native drag trên các thẻ ảnh (gây hiện tượng kéo bóng ảnh)
   if (chrome.scripting?.executeScript) {
     try {
-      await chrome.scripting.executeScript({
+      await captchaStep(context, "prepare_input", () => chrome.scripting.executeScript({
         target: { tabId, allFrames: true },
         world: "MAIN",
         func: () => {
@@ -3024,8 +3114,8 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
             el.ondragstart = (e) => e.preventDefault();
           });
         },
-      });
-    } catch {}
+      }), 300);
+    } catch (error) { if (context?.signal.aborted) throw error; }
   }
 
   if (!slider || !Number.isFinite(slider.x) || !Number.isFinite(slider.y)) {
@@ -3036,10 +3126,10 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
   // only a hint; the drop below re-anchors the press on the sprite centre the solver measured.
   let startX = slider.x;
   let startY = slider.y;
-  let distance = await calculatePuzzleDistance(tabId, slider);
+  let distance = await calculatePuzzleDistance(tabId, slider, Number(options.attempt) || 1, context);
   // A blind or low-confidence answer costs one of the few attempts Shopee allows, and a wrong
   // drag also regenerates the puzzle — so skip the drag and report instead.
-  const lastPuzzle = lastPuzzleEvidence;
+  const lastPuzzle = context ? context.evidence : lastPuzzleEvidence;
   const confident = Boolean(lastPuzzle?.ok) && Number(lastPuzzle?.confidence || 0) >= 0.85;
   const plausible = Math.abs(distance) >= 20;
   if (!confident || !plausible) {
@@ -3073,9 +3163,9 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
   // "Drag the missing piece" variant: the sprite starts beside/above the picture and must be
   // dropped *into* the cut-out, so the drag needs a vertical component. The solver reports both
   // centres for that layout (method outlined_hole_sprite).
-  const geometry = lastPuzzleEvidence?.details || null;
-  const canvasRect = lastPuzzleEvidence?.canvasRect || null;
-  const dpr = Number(lastPuzzleEvidence?.dpr) || 1;
+  const geometry = lastPuzzle?.details || null;
+  const canvasRect = lastPuzzle?.canvasRect || null;
+  const dpr = Number(lastPuzzle?.dpr) || 1;
   let endY = startY;
   let dropMode = false;
   // What a human does: on a slider layout they grab the orange button and slide it sideways —
@@ -3109,173 +3199,88 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
   const points = generateHumanTrajectory(startX, startY, distance, endY);
   const endX = startX + distance;
 
-  let debuggerError = null;
-  if (chrome.debugger?.attach && chrome.debugger?.sendCommand && chrome.debugger?.detach) {
-    const target = { tabId };
-    // Fire-and-forget CDP dispatch: awaiting every sendCommand is what made the drag start 5-6 s
-    // late and then blow past its deadline (one stalled ack per event × ~10 events). The browser
-    // processes commands on a session in order, so we only need to pace the *sleeps*; the ack is
-    // not needed for correctness and a stall must not block the trajectory.
-    const fire = (params) => {
-      try {
-        chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", params).catch(() => {});
-      } catch {}
-    };
-    // CDP input dispatch is queued while the tab's *window* is not focused: a trusted drag then
-    // sits until it times out (and the untrusted DOM fallback still "works", because synthetic
-    // events don't need focus — which is exactly the "it drags into place but Gửi rejects" case).
-    // Bring the tab forward first, like a human would.
-    // Only needed once per challenge: re-focusing before every attempt cost ~1 s of the budget.
+  if (!chrome.debugger?.attach || !chrome.debugger?.sendCommand || !chrome.debugger?.detach) {
+    return { attempted: false, reason: "trusted_input_unavailable" };
+  }
+  const target = { tabId };
+  try {
     if (challengeFocusTabId !== tabId || Date.now() - challengeFocusedAt > 30000) {
-      try {
-        const tabInfo = await chrome.tabs.get(tabId);
-        await chrome.tabs.update(tabId, { active: true });
-        if (tabInfo?.windowId && chrome.windows?.update) {
-          await chrome.windows.update(tabInfo.windowId, { focused: true });
-        }
-        challengeFocusTabId = tabId;
-        challengeFocusedAt = Date.now();
-        await new Promise((r) => setTimeout(r, 200));
-      } catch (focusErr) {
-        bridgeLog("warn", "could not focus the challenge tab before dragging:", String(focusErr?.message || focusErr));
-      }
+      await captchaStep(context, "focus", async () => {
+        const tab = await chrome.tabs?.get(tabId);
+        if (tab?.active === false) await chrome.tabs.update(tabId, { active: true });
+        if (tab?.windowId && chrome.windows?.update) await chrome.windows.update(tab.windowId, { focused: true });
+      }, 500);
+      challengeFocusTabId = tabId; challengeFocusedAt = Date.now();
     }
-    const outcome = await withDebuggerLock(async () => {
-      let attached = false;
-      let sessionToken = null;
-      // The mouse button must never be left held: a timeout used to abandon the drag mid-trajectory,
-      // so the next attempt pressed again on top of a stale button state (log 13:49:13, "debugger
-      // drag timed out after 22000ms" followed by a fresh mousePressed).
+    return await captchaStep(context, "input_queue", () => withDebuggerLock(async () => {
+      context?.check(1000);
+      let token = null, stopped = false, mouseDown = false, attempted = false;
       let lastPointer = { x: startX, y: startY };
-      const releaseAt = (x, y) => {
-        lastPointer = { x: Math.round(x), y: Math.round(y) };
-        fire({ type: "mouseReleased", x: lastPointer.x, y: lastPointer.y, button: "left", clickCount: 1 });
+      const guard = () => {
+        if (stopped || (token !== null && debuggerSessionTokens.get(tabId) !== token)) throw new Error("drag_cancelled");
+        context?.check(1000);
+        if (context && context.frame.phase !== "present") throw new Error("challenge_not_present");
       };
+      const fire = async params => {
+        guard();
+        await captchaStep(context, "mouse_ack", () => chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", params), 250, 1000);
+        if (stopped || debuggerSessionTokens.get(tabId) !== token) throw new Error("drag_cancelled");
+        context?.check();
+      };
+      const pause = async ms => { guard(); await new Promise(resolve => setTimeout(resolve, ms)); guard(); };
       try {
-        const session = await withTimeout(attachDebuggerSession(target), 6000, "debugger attach");
-        if (!session.ok) return { error: session.error, result: null };
-        attached = true;
-        sessionToken = claimDebuggerSession(tabId);
+        const session = await attachDebuggerSession(target, { context });
+        if (!session.ok) throw new Error(session.error);
+        token = claimDebuggerSession(tabId);
+        const startedAt = Date.now();
         await withTimeout((async () => {
-          const dragStartedAt = Date.now();
-          fire({ type: "mouseMoved", x: startX, y: startY, button: "none" });
-          await new Promise((r) => setTimeout(r, 60 + Math.random() * 40));
-          fire({ type: "mousePressed", x: startX, y: startY, button: "left", clickCount: 1 });
-          lastPointer = { x: startX, y: startY };
-          // The measurement the user actually asked for: how long after the challenge appeared does
-          // the cursor first move, and where did those milliseconds go?
-          bridgeLog("info", "captcha.timeline",
-            "drag_start_ms", String(dragStartedAt - (challengeSeenAt || dragStartedAt)),
-            "shot_ms", String(lastPuzzleTiming?.shotMs ?? "?"),
-            "solve_ms", String(lastPuzzleTiming?.solveMs ?? "?"),
-            "cached", String(Boolean(lastPuzzleTiming?.cached)),
-            "travel", String(distance));
-          // Fewer CDP round-trips. Every sendCommand can stall for seconds on a busy renderer
-          // (that stall is what pushed the drag past its deadline and dropped it onto the
-          // untrusted DOM-event path, where Shopee always rejects). A ~26-34 point human
-          // trajectory is thinned to ~10; the settle pauses below keep it from looking robotic.
-          const tracePoints = points.length > 12
-            ? points.filter((_, index) => index % Math.ceil(points.length / 10) === 0).concat(points[points.length - 1])
-            : points;
-          for (const point of tracePoints) {
-            fire({ type: "mouseMoved", x: point.x, y: point.y, button: "left", buttons: 1 });
-            lastPointer = { x: point.x, y: point.y };
-            await new Promise((r) => setTimeout(r, point.delay));
+          await fire({ type: "mouseMoved", x: startX, y: startY, button: "none" });
+          await pause(60);
+          context?.pressed();
+          if (context) await context.run("persist_attempt", persistCaptchaBudgets, 300, 1000);
+          attempted = true; mouseDown = true;
+          await fire({ type: "mousePressed", x: startX, y: startY, button: "left", clickCount: 1 });
+          const trace = points.length > 12
+            ? points.filter((_, index) => index % Math.ceil(points.length / 10) === 0).concat(points[points.length - 1]) : points;
+          for (const point of trace) {
+            await fire({ type: "mouseMoved", x: point.x, y: point.y, button: "left", buttons: 1 });
+            lastPointer = point;
+            await pause(point.delay);
           }
-          await new Promise((r) => setTimeout(r, 90 + Math.random() * 40));
-          await new Promise((r) => setTimeout(r, 140 + Math.random() * 40));
-          // Dừng nghỉ ổn định (Settle delay) để DOM và anti-bot script ghi nhận mảnh ghép đã khớp hoàn toàn
-          await new Promise((r) => setTimeout(r, 150 + Math.random() * 50));
-          await new Promise((r) => setTimeout(r, 140 + Math.random() * 50));
-          releaseAt(endX, endY);
-          bridgeLog("info", "captcha.timeline done",
-            "release_ms", String(Date.now() - dragStartedAt), "travel", String(distance),
-            "drop_mode", String(dropMode));
-          // This variant shows a "Gửi" button: the piece only counts once it is submitted.
-          if (dropMode) {
-            const submit = await findSubmitButtonCentre(tabId);
+          await pause(120);
+          if (context) context.confirming = true;
+          await fire({ type: "mouseReleased", x: endX, y: endY, button: "left", clickCount: 1 });
+          mouseDown = false;
+            if (dropMode && (!context || context.frame.phase === "present")) {
+            const submit = await captchaStep(context, "submit_lookup", () => findSubmitButtonCentre(tabId), 300, 1000);
             if (submit) {
-              await new Promise((r) => setTimeout(r, 220));
-              fire({ type: "mouseMoved", x: submit.x, y: submit.y, button: "none" });
-              await new Promise((r) => setTimeout(r, 60));
-              fire({ type: "mousePressed", x: submit.x, y: submit.y, button: "left", clickCount: 1 });
-              await new Promise((r) => setTimeout(r, 70));
-              fire({ type: "mouseReleased", x: submit.x, y: submit.y, button: "left", clickCount: 1 });
-              bridgeLog("info", "submitted captcha", `${submit.x},${submit.y}`);
+              await fire({ type: "mouseMoved", x: submit.x, y: submit.y, button: "none" });
+              lastPointer = submit; mouseDown = true;
+              await fire({ type: "mousePressed", x: submit.x, y: submit.y, button: "left", clickCount: 1 });
+              await pause(60);
+              await fire({ type: "mouseReleased", x: submit.x, y: submit.y, button: "left", clickCount: 1 });
+              mouseDown = false;
             }
           }
-        // A trusted 26-34 step drag normally takes ~2-4 s; Chrome occasionally stalls a CDP
-        // command for several seconds, so the budget stays well under the 30 s command deadline
-        // without abandoning a drag that is merely slow (an abandonment used to leave the piece
-        // half-dragged and then fall back to untrusted events).
-        })(), Number(options?.dragBudgetMs) || 22000, "debugger drag");
-        return { error: null, result: { attempted: true, method: "debugger", startX, startY, endX, endY, distance, dropMode } };
-      } catch (err) {
-        // Guarantee the button is released even when the drag is aborted mid-trajectory.
-        try {
-          releaseAt(lastPointer.x, lastPointer.y);
-          bridgeLog("warn", "drag aborted — mouse button released at", `${lastPointer.x},${lastPointer.y}`);
-        } catch {}
-        return { error: String(err?.message || err), result: null };
+        })(), Math.min(Number(options.dragBudgetMs) || 6000, context ? Math.max(1, context.remaining() - 1000) : 6000), "debugger drag");
+        bridgeLog("info", "captcha.input_ack", JSON.stringify({ challengeId: context?.frame.id, elapsedMs: Date.now() - startedAt,
+          ageMs: context ? Date.now() - context.frame.seenAt : null, timing: context?.timing, distance }));
+        return { attempted: true, method: "debugger", startX, startY, endX, endY, distance, dropMode };
+      } catch (error) {
+        return { attempted, reason: error.code || error.message, error: error.message };
       } finally {
-        if (attached) {
-          await releaseDebuggerSession(tabId, sessionToken);
+        stopped = true;
+        if (mouseDown && debuggerSessionTokens.get(tabId) === token) {
+          try { await withTimeout(chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+            type: "mouseReleased", x: lastPointer.x, y: lastPointer.y, button: "left", clickCount: 1,
+          }), 250, "emergency release"); } catch {}
         }
+        if (token !== null) await releaseDebuggerSession(tabId, token);
       }
-    });
-    if (outcome.result) return outcome.result;
-    debuggerError = outcome.error;
-    console.warn("[bridge] Debugger slider drag failed:", debuggerError);
-    bridgeLog("warn", "debugger drag failed:", debuggerError);
+    }, tabId), context ? Math.max(1, context.remaining() - 500) : 7500, context ? 500 : 0);
+  } catch (error) {
+    return { attempted: Boolean(context?.attempted), reason: error.code || error.message, error: error.message };
   }
-
-  // P1-4: DOM synthetic events fallback.
-  // Shopee's validator only accepts trusted input: the page *renders* a synthetic drag landing
-  // in the cut-out ("it looks right") but the submit is refused, and each rejected drag also
-  // regenerates the puzzle and burns one of the ~3 attempts before the challenge locks. So this
-  // path stays off unless someone explicitly wants a visual rehearsal.
-  const allowUntrustedDrag = false;
-  if (allowUntrustedDrag && chrome.scripting?.executeScript) {
-    console.warn("[bridge] Debugger unavailable; falling back to synthetic DOM mouse events (isTrusted=false, may be rejected by Shopee anti-bot)");
-    const [res] = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "MAIN",
-      func: (pts, sx, sy, fx, fy) => {
-        const target = document.elementFromPoint(sx, sy);
-        if (!target) return { attempted: false, reason: "element_from_point_missing" };
-        const fire = (type, px, py) => {
-          const opts = { bubbles: true, cancelable: true, clientX: px, clientY: py, screenX: px, screenY: py, buttons: type === "mouseup" ? 0 : 1 };
-          target.dispatchEvent(new MouseEvent(type, opts));
-          if (typeof PointerEvent !== "undefined") target.dispatchEvent(new PointerEvent(type.replace("mouse", "pointer"), { ...opts, pointerId: 1, pointerType: "mouse", isPrimary: true }));
-        };
-        fire("mousedown", sx, sy);
-        for (const pt of pts) {
-          fire("mousemove", pt.x, pt.y);
-        }
-        fire("mouseup", fx, fy);
-        return { attempted: true, method: "dom_events" };
-        return { attempted: true, method: "dom_events_untrusted" };
-      },
-      args: [points, startX, startY, endX, endY],
-    });
-    bridgeLog("warn", "captcha drag fell back to untrusted DOM events:", debuggerError || "no debugger", "distance", String(distance));
-    // Shopee's anti-bot ignores untrusted input, so this path can move the piece visually
-    // without ever validating. Report the debugger failure alongside it for diagnosis.
-    const untrusted = {
-      ...(res?.result || { attempted: true, method: "dom_events" }),
-      distance,
-      trusted: false,
-      debuggerError,
-    };
-    return untrusted;
-  }
-
-  // No trusted input available: report it instead of rehearsing the drag with synthetic events
-  // (which Shopee rejects and which costs one of the challenge's few attempts).
-  if (chrome.scripting?.executeScript) {
-    bridgeLog("warn", "captcha drag skipped: trusted debugger input unavailable", String(debuggerError || "no debugger"));
-  }
-  return { attempted: false, reason: "trusted_input_unavailable", distance, debuggerError };
 }
 
 async function detectCaptchaInTab(tabId, options = {}) {
@@ -3286,6 +3291,20 @@ async function detectCaptchaInTab(tabId, options = {}) {
       target: { tabId, allFrames: true },
       world: "MAIN",
       func: (allowScroll) => {
+        function isSubmitLikeElement(el) {
+          try {
+            const text = String(el?.innerText || el?.textContent || "").trim();
+            if (text && /(gửi|submit|xác nhận|tiếp tục|hoàn thành|đăng nhập|huỷ|cancel)/i.test(text) && text.length <= 40) return true;
+            const type = String(el?.getAttribute?.("type") || "").toLowerCase();
+            if (type === "submit") return true;
+            const role = String(el?.getAttribute?.("role") || "").toLowerCase();
+            if (role === "button" && text && /(gửi|submit|xác nhận|tiếp tục|hoàn thành|đăng nhập|huỷ|cancel)/i.test(text)) return true;
+            return false;
+          } catch {
+            return false;
+          }
+        }
+
         const win = typeof window !== "undefined" ? window : globalThis;
         const canScroll = allowScroll !== false;
         const url = location.href.toLowerCase();
@@ -3303,9 +3322,6 @@ async function detectCaptchaInTab(tabId, options = {}) {
           "[class*='slider'][class*='success']",
           "[class*='captcha'][class*='success']",
           "[class*='verify'][class*='success']",
-          "[class*='btn--success']",
-          "[class*='success']",
-          "[class*='passed']",
         ];
 
         let isResolved = false;
@@ -3332,9 +3348,8 @@ async function detectCaptchaInTab(tabId, options = {}) {
               const bg = style?.backgroundColor || "";
               const color = style?.color || "";
               const isGreen = bg.includes("38, 170, 153") || bg.includes("32, 178, 170") || color.includes("38, 170, 153") || bg.includes("26aa99") || bg.includes("210, 236, 231");
-              return hasCheckChar || (isGreen && (el.offsetWidth > 15 || el.offsetHeight > 15));
               // P1-3: Giới hạn chỉ match khi có ký tự checkmark hoặc phần tử nằm trong ngữ cảnh captcha/slider
-              const inCaptchaContext = hasCheckChar || Boolean(
+              const inCaptchaContext = isVerifyPage || Boolean(
                 (typeof el.closest === "function" && el.closest(".shopee-captcha-slider, .verify-slider, [class*='captcha'], [class*='verify'], [class*='slider']")) ||
                 (typeof el.className === "string" && (el.className.includes("slider") || el.className.includes("captcha") || el.className.includes("verify")))
               );
@@ -3615,6 +3630,7 @@ async function detectCaptchaInTab(tabId, options = {}) {
             detected: true,
             resolved: false,
             type: "dom_selector",
+            failed: /không chính xác|chưa chính xác|xác minh thất bại|verification failed|incorrect/.test(bodyText),
             selector: containerSelector || handleSelector || ".shopee-captcha-slider",
             handleSelector: handleSelector || null,
             elementFound: true,
@@ -3672,6 +3688,10 @@ async function detectCaptchaInTab(tabId, options = {}) {
 }
 
 function stopVerificationWatcher() {
+  if (activeVerificationTabId !== null) captchaLedger.cancel(activeVerificationTabId, "watcher_stopped");
+  activeVerificationJobId = null;
+  activeVerificationTabId = null;
+  activeVerificationCheck = null;
   if (verificationWatcherInterval) {
     clearInterval(verificationWatcherInterval);
     verificationWatcherInterval = null;
@@ -3756,6 +3776,7 @@ async function isShopeeChallengeLocked(tabId) {
 }
 
 function startVerificationWatcher(details) {
+  if (activeVerificationJobId === details?.job_id && activeVerificationTabId === details?.tab_id && verificationWatcherInterval) return;
   stopVerificationWatcher();
   const jid = details?.job_id;
   const targetTabId = details?.tab_id;
@@ -3767,10 +3788,9 @@ function startVerificationWatcher(details) {
   const referer = details?.referer || details?.url;
 
   let consecutiveAbsentCount = 0;
-  let autoDragAttempts = 0;
-  let refusedDrags = 0;
+  activeVerificationJobId = jid;
+  activeVerificationTabId = targetTabId;
   let lastDragRefusal = null;
-  let challengeLockedUntil = 0;
   // P2-2: Concurrency guard ngăn chặn thực thi chồng chéo giữa interval, event listener và post-drag
   let checkInProgress = false;
 
@@ -3782,7 +3802,8 @@ function startVerificationWatcher(details) {
         stopVerificationWatcher();
         return;
       }
-      const check = await detectCaptchaInTab(targetTabId, { scrollIntoView: false });
+      const check = await withTimeout(detectCaptchaInTab(targetTabId, { scrollIntoView: false }), 600, "watcher detect");
+      if (check?.error) return;
       if (check?.resolved || !check?.detected) {
         consecutiveAbsentCount++;
         console.log(`[bridge] CAPTCHA absent/resolved count: ${consecutiveAbsentCount}/2 (type: ${check?.type || "none"}) for job ${jid}`);
@@ -3881,59 +3902,23 @@ function startVerificationWatcher(details) {
         }
       } else {
         consecutiveAbsentCount = 0;
-        // Shopee tạm khoá xác thực sau vài lần sai ("Vui lòng thử lại sau"): kéo tiếp chỉ
-        // làm khoá lâu hơn, và mỗi lần kéo sai còn đổi puzzle mới.
-        if (await isShopeeChallengeLocked(targetTabId)) {
-          if (!challengeLockedUntil) {
-            challengeLockedUntil = Date.now();
-            console.warn("[bridge] Shopee locked the challenge ('Vui lòng thử lại sau'); pausing auto-drag.");
-            bridgeLog("warn", "shopee challenge temporarily locked — auto-drag paused");
+        if (await withTimeout(isShopeeChallengeLocked(targetTabId), 400, "lock check")) {
+          if (!captchaLedger.job(jid).passive) {
+            captchaLedger.pause(jid);
+            await persistCaptchaBudgets();
+            bridgeLog("warn", "captcha locked — automatic attempts paused for job", jid);
           }
-          stopVerificationWatcher();
-          return;
+          return; // Keep observing so manual completion can still resume this job.
         }
-        challengeLockedUntil = 0;
-        if (!challengeSeenAt || Date.now() - challengeSeenAt > 60000) markChallengeSeen();
-        // Thử tự động kéo thông minh tối đa 3 lần (với micro-jitter +4px, -4px, +8px, -8px)
-        if (autoDragAttempts < 3) {
-          try {
-            console.log(`[bridge] CAPTCHA visible; attempting intelligent slider drag ${autoDragAttempts + 1}/3 for job ${jid}...`);
-            // P1-1: Truyền attempt để tự động bù micro-jitter offset ở các lần thử tiếp theo
-            const dragRes = await tryAutoDragShopeeCaptcha(targetTabId, check, { attempt: autoDragAttempts + 1 });
-            console.log("[bridge] Intelligent slider drag result:", dragRes);
-            if (dragRes?.attempted) {
-              // Only a drag that really happened counts against Shopee's ~3 attempts.
-              autoDragAttempts++;
-              await new Promise((r) => setTimeout(r, 1200));
-              checkInProgress = false;
-              return performCheckAndPreflight();
-            }
-            // A refused drag (no puzzle in this frame, or below the confidence floor) is not a wasted
-            // attempt: Shopee only sees a drag when `attempted` is true, so the budget is untouched
-            // and the watcher simply waits for a frame it can actually measure.
-            const refusal = String(dragRes?.reason || "not_attempted");
-            if (refusal !== lastDragRefusal) {
-              lastDragRefusal = refusal;
-              bridgeLog("info", "captcha drag not attempted:", refusal,
-                "distance", String(dragRes?.distance ?? "?"), "method", String(dragRes?.method || "none"));
-            }
-            refusedDrags++;
-            // Log the hand-over once: the watcher keeps running to notice the challenge going away,
-            // and repeating this line every 32 s would drown the log it is meant to explain.
-            if (refusedDrags === 12) {
-              console.warn("[bridge] No measurable puzzle after 12 checks — leaving the challenge to the user.");
-              bridgeLog("warn", "captcha: no measurable puzzle after 12 checks — passive handover");
-              autoDragAttempts = 3;
-            }
-          } catch (err) {
-            console.warn("[bridge] Auto-drag attempt failed:", err?.message || err);
-          }
-        }
-        // Chế độ quan sát thụ động (Passive Handover): Nếu sau 5 lần tự động chưa khớp, nhường quyền kéo tay cho người dùng
-        if (check?.slider?.isOrangeHandle) {
-          console.log(`[bridge] Passive handover: Shopee orange slider button active at (${check.slider.x}, ${check.slider.y}). Chờ người dùng thao tác kéo...`);
+        const result = await runCaptchaChallenge(targetTabId, jid);
+        const refusal = result.reason || result.status || "awaiting_confirmation";
+        if (refusal !== lastDragRefusal) {
+          lastDragRefusal = refusal;
+          bridgeLog("info", "captcha state:", refusal, "job", jid);
         }
       }
+    } catch (error) {
+      bridgeLog("warn", "captcha watcher:", error.message);
     } finally {
       checkInProgress = false;
     }
@@ -3949,9 +3934,13 @@ function startVerificationWatcher(details) {
   chrome.tabs.onUpdated?.addListener(tabUpdateListener);
   activeTabUpdateListener = tabUpdateListener;
 
+  activeVerificationCheck = performCheckAndPreflight;
+  ensureCaptchaObserver(targetTabId).then(() => {
+    if (activeVerificationCheck === performCheckAndPreflight && captchaLedger.frames.has(targetTabId)) performCheckAndPreflight();
+  }).catch(() => {});
   verificationWatcherInterval = setInterval(async () => {
     await performCheckAndPreflight();
-  }, 2500);
+  }, 500);
 }
 
 async function triggerVerificationRequired(details) {
@@ -4164,7 +4153,7 @@ async function handleRecheckApi(jobId) {
 }
 
 // ── Action Registry Handlers (18 Precompiled Actions) ───────────────────────
-async function handleAction(action, params) {
+async function handleAction(action, params, request = {}) {
   params = params || {};
   switch (action) {
     case "browser.health":
@@ -4504,7 +4493,7 @@ async function handleAction(action, params) {
           await withDebuggerLock(async () => {
             let sessionToken = null;
             try {
-              const session = await withTimeout(attachDebuggerSession(target), 6000, "debugger attach");
+              const session = await attachDebuggerSession(target);
               if (!session.ok) {
                 debuggerError = session.error;
                 return;
@@ -4513,7 +4502,7 @@ async function handleAction(action, params) {
               const res = await withTimeout(chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
                 format: params.format === "jpeg" ? "jpeg" : "png",
                 quality: params.quality,
-              }), 8000, "Page.captureScreenshot");
+              }), captchaLedger.frames.get(targetTabId)?.phase === "present" ? 600 : 8000, "Page.captureScreenshot");
               if (res?.data) {
                 dataUrl = `data:image/${params.format === "jpeg" ? "jpeg" : "png"};base64,${res.data}`;
               } else {
@@ -4524,7 +4513,7 @@ async function handleAction(action, params) {
             } finally {
               await releaseDebuggerSession(targetTabId, sessionToken);
             }
-          });
+          }, targetTabId);
         }
         if (!dataUrl) {
           throw new Error(`captureVisibleTab: ${captureError}; debugger: ${debuggerError}`);
@@ -4540,20 +4529,9 @@ async function handleAction(action, params) {
 
     case "captcha.solve":
     case "captcha.autoSolve": {
-      const targetTabId = params.tabId || (await getActiveTabId());
-      if (!targetTabId) throw new Error("No target tab specified");
-      const check = await detectCaptchaInTab(targetTabId, { scrollIntoView: true });
-      if (!check?.detected) {
-        return { ok: false, attempted: false, message: "No CAPTCHA challenge detected on target tab", check };
-      }
-      const attempt = Number(params.attempt || 1);
-      const dragResult = await tryAutoDragShopeeCaptcha(targetTabId, check, { attempt });
-      return {
-        ok: Boolean(dragResult?.attempted),
-        attempted: Boolean(dragResult?.attempted),
-        check,
-        dragResult,
-      };
+      const tabId = params.tabId || (await getActiveTabId());
+      if (!tabId) throw new Error("No target tab specified");
+      return runCaptchaChallenge(tabId, verificationInfo?.tab_id === tabId ? verificationInfo.job_id : 'tab:' + tabId, request);
     }
 
     case "fetch.sameOrigin": {
@@ -4813,6 +4791,7 @@ async function dispatchEnvelope(envelope) {
     const params = envelope.params || {};
     const deadlineMs = Math.max(1000, Number(envelope.deadlineMs) || 30000);
 
+    const commandDeadlineAt = Date.now() + deadlineMs;
     const abortController = new AbortController();
     const timeoutId = setTimeout(() => {
       if (inFlightCommands.has(cmdId)) {
@@ -4844,7 +4823,7 @@ async function dispatchEnvelope(envelope) {
     });
 
     try {
-      const result = await handleAction(action, params);
+      const result = await handleAction(action, params, { signal: abortController.signal, deadlineAt: commandDeadlineAt });
       if (!inFlightCommands.has(cmdId)) {
         return; // Timed out or cancelled
       }
@@ -5324,6 +5303,16 @@ chrome.alarms.onAlarm.addListener(() => {
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.action === "captcha.observation") {
+    // Only extension content scripts in the top-level target document can set its clock.
+    if (!sender.tab?.id || (sender.frameId ?? 0) !== 0) { sendResponse({ ok: false }); return false; }
+    const observation = msg.observation;
+    if (observation?.identityReliable === false) { sendResponse({ ok: false }); return false; }
+    const frame = captchaLedger.observe(sender.tab.id, observation);
+    if (frame && sender.tab.id === activeVerificationTabId) activeVerificationCheck?.();
+    sendResponse({ ok: Boolean(frame) });
+    return false;
+  }
   if (msg.action === "getStatus") {
     chrome.storage.local.get([
       "gatewayUrl",

@@ -47,6 +47,16 @@ def test_command_dispatches_with_correlation(command_api):
         "tab.list", {}, deadline_ms=30000, command_id="cmd-7", session_id=None)
 
 
+def test_solver_abstention_is_a_successful_http_verdict(command_api, monkeypatch):
+    url, _ = command_api
+    verdict = {"ok": False, "abstain": True, "reason": "no_puzzle_in_frame", "travel": None}
+    monkeypatch.setattr("browser_bridge.captcha_detector.solve_puzzle_cv", lambda **kwargs: verdict)
+    status, body = request_command(url.replace("/browser/command", "/browser/solve_puzzle_cv"), {"screenshot": "blank"})
+    assert status == 200
+    assert body["abstain"] is True
+    assert body["travel"] is None
+
+
 @pytest.mark.parametrize("token,origin,status", [
     ("wrong", None, 401),
     ("test-bridge-token", "https://example.com", 403),

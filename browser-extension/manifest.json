@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI Cowork — Browser Bridge",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "description": "Realtime WebSocket Browser Bridge for user-authorized automation and ingest in a real Chrome profile.",
   "permissions": [
     "alarms",
@@ -34,6 +34,16 @@
         "https://shoppe.vn/*"
       ],
       "js": ["content.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://*.shopee.vn/*",
+        "https://shopee.vn/*",
+        "https://*.shoppe.vn/*",
+        "https://shoppe.vn/*"
+      ],
+      "js": ["captcha-observer.js"],
       "run_at": "document_start"
     }
   ]

@@ -64,6 +64,7 @@ async function worker(options = {}) {
       alarms: { onAlarm: listener, create() {} },
     },
   });
+  context.importScripts = name => vm.runInContext(fs.readFileSync(path.join(__dirname, '../browser-extension', name), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../browser-extension/background.js'), 'utf8'), context);
   await new Promise(resolve => setImmediate(resolve));
   return { context, frames, fetches, timers, timeouts, sockets, stored, getMessageListener: () => messageListener };
@@ -2604,7 +2605,7 @@ test('calculatePuzzleDistance refuses to drag when the CV solver says the frame 
     if (url.includes('/browser/solve_puzzle_cv')) {
       cvCalls++;
       return {
-        ok: true,
+        ok: false, status: 400,
         json: async () => ({
           ok: false, abstain: true, reason: 'no_puzzle_in_frame', method: 'cv_abstain', confidence: 0.05,
         }),
@@ -2618,7 +2619,7 @@ test('calculatePuzzleDistance refuses to drag when the CV solver says the frame 
     update: async () => {},
   };
   vm.runInContext(`
-    chrome.scripting = { executeScript: async () => [{ result: null }] };
+    chrome.scripting = { executeScript: async () => [{ result: { method: 'canvas_pixel_analysis', travel: 160 } }] };
   `, context);
 
   const travel = await vm.runInContext('calculatePuzzleDistance(904, { width: 320 })', context);
@@ -2707,14 +2708,119 @@ test('an aborted drag still releases the mouse button instead of leaving it held
   const pressCount = debuggerCommands.filter((c) => c.params.type === 'mousePressed').length;
   assert.ok(pressCount >= 1, 'the drag must have started before the deadline');
 
-  // Force the drag's own deadline (22000 ms) instead of waiting for it.
-  const deadline = [...timeouts.values()].filter((entry) => entry.ms === 22000);
+  // Force the bounded input deadline; the old 22 s limit outlived a 7 s challenge.
+  const deadline = [...timeouts.values()].filter((entry) => entry.ms === 6000);
   assert.equal(deadline.length, 1, 'the drag must run under a bounded deadline');
   deadline[0].fn();
 
   const result = await dragPromise;
-  assert.equal(result.attempted, false, 'a timed-out drag must not be reported as attempted');
+  assert.equal(result.attempted, true, 'a press already sent must consume an attempt even if the drag aborts');
+  assert.match(result.error, /timed out/);
   const releases = debuggerCommands.filter((c) => c.params.type === 'mouseReleased');
   assert.ok(releases.length >= 1, 'the mouse button must be released even when the drag aborts');
   assert.equal(releases[releases.length - 1].params.button, 'left');
+  const countAfterAbort = debuggerCommands.length;
+  context.setTimeout = fn => { queueMicrotask(fn); return 0; };
+  for (const resume of pending.values()) resume();
+  for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(debuggerCommands.length, countAfterAbort, 'a late old trajectory must not dispatch into the next session');
+});
+
+test('rejected CDP commands are reported as errors instead of successful input', async () => {
+  const { context } = await worker();
+  context.setTimeout = fn => { queueMicrotask(fn); return 0; };
+  context.chrome.scripting = { executeScript: async () => [{ result: { method: 'canvas_pixel_analysis', travel: 160 } }] };
+  context.chrome.debugger = {
+    attach: async () => {}, detach: async () => {},
+    sendCommand: async () => { throw new Error('Detached while handling command'); },
+  };
+  const result = await vm.runInContext('tryAutoDragShopeeCaptcha(601, {detected:true, slider:{x:100,y:300,isOrangeHandle:true}})', context);
+  assert.equal(result.attempted, false);
+  assert.match(result.error, /Detached/);
+});
+
+test('a hanging detach settles the caller and quarantines only its own tab', async () => {
+  const { context, timeouts } = await worker();
+  context.setTimeout = fn => { queueMicrotask(fn); return 0; };
+  context.chrome.scripting = { executeScript: async () => [{ result: { method: 'canvas_pixel_analysis', travel: 160 } }] };
+  let finishDetach;
+  context.chrome.debugger = {
+    attach: async () => {}, sendCommand: async () => {},
+    detach: async ({ tabId }) => { if (tabId === 601) await new Promise(resolve => { finishDetach = resolve; }); },
+  };
+  const call = id => vm.runInContext(`tryAutoDragShopeeCaptcha(${id}, {detected:true, slider:{x:100,y:300,isOrangeHandle:true}})`, context);
+  const first = call(601);
+  for (let i = 0; i < 10 && !finishDetach; i++) await new Promise(resolve => setImmediate(resolve));
+  const cleanup = [...timeouts.values()].find(t => t.ms === 350);
+  assert.ok(cleanup); cleanup.fn();
+  await first;
+  assert.equal((await call(601)).reason, 'debugger_recovering');
+  assert.equal((await call(602)).attempted, true);
+  finishDetach();
+});
+
+test('MAIN-world orange handle fallback carries its own helper after serialization', async () => {
+  const { context } = await worker();
+  const orange = {
+    offsetWidth: 44, offsetHeight: 44, innerText: '', getAttribute: () => null,
+    getBoundingClientRect: () => ({ left: 100, top: 300, width: 44, height: 44 }),
+  };
+  context.chrome.scripting = { executeScript: async ({ func, args }) => [{ result: vm.runInNewContext(
+    `(${func.toString()})(...args)`, {
+      args, location: { href: 'https://shopee.vn/verify/captcha' },
+      document: { body: { innerText: '' }, querySelector: () => null,
+        querySelectorAll: selector => selector === 'div, button, span, i' ? [orange] : [] },
+      window: { getComputedStyle: () => ({ backgroundColor: 'rgb(238, 77, 45)' }) },
+    }) }] };
+  const result = await vm.runInContext('detectCaptchaInTab(7, {scrollIntoView:false})', context);
+  assert.equal(result.slider.x, 122);
+  assert.equal(result.slider.y, 322);
+});
+
+test('heartbeat restore leaves the live watcher and its attempt budget intact', async () => {
+  const { context, stored } = await worker();
+  context.chrome.tabs = { onUpdated: { addListener() {}, removeListener() {} } };
+  stored.verificationInfo = { job_id: 'heartbeat-job', tab_id: 7, kind: 'verification' };
+  vm.runInContext(`
+    verificationInfo = {job_id:'heartbeat-job',tab_id:7,kind:'verification'};
+    startVerificationWatcher(verificationInfo);
+    captchaLedger.reserve('heartbeat-job', 'image');
+  `, context);
+  const before = vm.runInContext('verificationWatcherInterval', context);
+  await vm.runInContext('restorePendingVerificationWatchers()', context);
+  assert.equal(vm.runInContext('verificationWatcherInterval', context), before);
+  assert.equal(vm.runInContext("captchaLedger.job('heartbeat-job').attempts", context), 1);
+  vm.runInContext('stopVerificationWatcher()', context);
+});
+
+test('captcha.solve only reports success after the page confirms the attempt', async () => {
+  const { context } = await worker();
+  context.chrome.tabs = {};
+  vm.runInContext(`
+    captchaLedger.observe(7,{id:'image',seenAt:Date.now(),knownStart:true,phase:'present'});
+    var detectionCalls = 0;
+    detectCaptchaInTab = async () => ++detectionCalls === 1 ? {detected:true} : {detected:false,resolved:true};
+    tryAutoDragShopeeCaptcha = async (_tab, _check, options) => { options.context.pressed(); return {attempted:true,method:'debugger'}; };
+  `, context);
+  const result = await vm.runInContext("handleAction('captcha.solve', {tabId:7})", context);
+  assert.equal(result.ok, true);
+  assert.equal(result.solved, true);
+  assert.equal(result.status, 'confirmed');
+  assert.equal(vm.runInContext('detectionCalls', context), 2);
+});
+
+test('captcha.solve distinguishes a completed drag from an unconfirmed disappeared challenge', async () => {
+  const { context } = await worker();
+  context.chrome.tabs = {};
+  vm.runInContext(`
+    captchaLedger.observe(7,{id:'image',seenAt:Date.now(),knownStart:true,phase:'present'});
+    var detectionCalls = 0;
+    detectCaptchaInTab = async () => ++detectionCalls === 1 ? {detected:true} : {detected:false};
+    tryAutoDragShopeeCaptcha = async (_tab, _check, options) => { options.context.pressed(); return {attempted:true}; };
+  `, context);
+  const result = await vm.runInContext("handleAction('captcha.solve', {tabId:7})", context);
+  assert.equal(result.attempted, true);
+  assert.equal(result.ok, false);
+  assert.equal(result.solved, false);
+  assert.equal(result.status, 'awaiting_confirmation');
 });

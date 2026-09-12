@@ -3691,7 +3691,9 @@ class _HelperHandler(BaseHTTPRequestHandler):
                 ),
                 file=sys.stderr,
             )
-            _reply(200 if result.get("ok") else 400, result)
+            # Abstention is a valid solver verdict, not a malformed HTTP request.
+            # The extension also reads legacy HTTP 400 verdicts during rolling reloads.
+            _reply(200 if result.get("ok") or result.get("abstain") else 400, result)
             return
 
 
