@@ -1059,6 +1059,114 @@ def test_visualize_debug_output(tmp_path):
     assert ret.stat().st_size > 500
 
 
+# ── Gateway liveness (zombie socket recovery) ────────────────────────────────
+# Chrome keeps an extension's WebSocket open after its MV3 service worker dies, so the
+# gateway can end up holding a connection that never answers again. These tests pin the
+# recovery rules: a silent socket must be replaceable/droppable instead of blocking the
+# extension's next reconnect as a duplicate client.
+
+
+class _FakeSocket:
+    def __init__(self) -> None:
+        self.frames: list[bytes] = []
+
+    def sendall(self, data: bytes) -> None:
+        self.frames.append(data)
+
+    def shutdown(self, _how: int) -> None:  # pragma: no cover - trivial
+        pass
+
+    def close(self) -> None:  # pragma: no cover - trivial
+        pass
+
+
+def _gateway_with_owner(client_id: str = "client-a"):
+    from browser_bridge.server import BrowserGatewayServer, GatewayClientConnection
+
+    gateway = BrowserGatewayServer(token="liveness-token")
+    owner = GatewayClientConnection(_FakeSocket(), "ext-id", client_id)
+    registered, rejected = gateway._register(owner)
+    assert registered is True
+    assert rejected is None
+    return gateway, owner
+
+
+def _silence(conn, seconds: float) -> None:
+    conn.last_rx_at = time.time() - seconds
+
+
+def test_gateway_rejects_duplicate_while_owner_is_answering():
+    from browser_bridge.server import GatewayClientConnection
+
+    gateway, owner = _gateway_with_owner()
+    try:
+        newcomer = GatewayClientConnection(_FakeSocket(), "ext-id", "client-b")
+        registered, rejected = gateway._register(newcomer)
+        assert registered is False
+        assert rejected and rejected["clientId"] == "client-a"
+        assert gateway._active_conn is owner
+    finally:
+        gateway.stop()
+
+
+def test_gateway_replaces_owner_that_missed_the_heartbeat_window():
+    from browser_bridge.server import GatewayClientConnection, LIVENESS_IDLE_SECONDS
+
+    gateway, owner = _gateway_with_owner()
+    try:
+        _silence(owner, LIVENESS_IDLE_SECONDS + 5)
+        newcomer = GatewayClientConnection(_FakeSocket(), "ext-id", "client-b")
+        registered, rejected = gateway._register(newcomer)
+        assert registered is True
+        assert rejected is None
+        assert gateway._active_conn is newcomer
+        assert owner.closed is True
+    finally:
+        gateway.stop()
+
+
+def test_liveness_sweep_drops_silent_connection_and_allows_reconnect():
+    from browser_bridge.server import GatewayClientConnection, LIVENESS_IDLE_SECONDS
+
+    gateway, owner = _gateway_with_owner()
+    try:
+        _silence(owner, LIVENESS_IDLE_SECONDS + 5)
+        gateway._liveness_sweep()
+        assert gateway.is_connected is False
+        assert owner.closed is True
+
+        replacement = GatewayClientConnection(_FakeSocket(), "ext-id", "client-b")
+        registered, rejected = gateway._register(replacement)
+        assert registered is True
+        assert rejected is None
+    finally:
+        gateway.stop()
+
+
+def test_liveness_sweep_keeps_a_connection_that_is_still_pinging():
+    gateway, owner = _gateway_with_owner()
+    try:
+        owner.touch("heartbeat")
+        gateway._liveness_sweep()
+        assert gateway.is_connected is True
+        assert owner.closed is False
+    finally:
+        gateway.stop()
+
+
+def test_connection_info_exposes_idle_age_for_troubleshooting():
+    gateway, owner = _gateway_with_owner()
+    try:
+        _silence(owner, 42)
+        info = gateway.active_connection_info()
+        assert info is not None
+        assert info["clientId"] == "client-a"
+        assert info["idleSeconds"] >= 42
+        assert "lastMessageKind" in info
+    finally:
+        gateway.stop()
+
+
 
 
 

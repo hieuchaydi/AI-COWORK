@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
 
 import pytest
 
+import browser_bridge.server as gateway_module
 from browser_bridge.protocol import MessageEnvelope, MessageType
 from browser_bridge.server import BrowserGatewayServer
 from browser_bridge.transport import ExtensionState
@@ -596,6 +597,72 @@ def test_e2e_ingest_progress_chunks_and_result_over_websocket(gateway_server, mo
     finally:
         client.close()
         rpc.executor.shutdown(wait=True)
+
+
+# ── Zombie-socket recovery ───────────────────────────────────────────────────
+# Chrome keeps an extension WebSocket open after the MV3 worker dies, so the gateway can
+# end up owning a connection that never answers again. A silent socket must not block the
+# extension's next reconnect (exclusive policy) nor keep reporting "connected" forever.
+
+
+def _live_gateway(monkeypatch, idle_seconds: float, sweep_seconds: float):
+    monkeypatch.setattr(gateway_module, "LIVENESS_IDLE_SECONDS", idle_seconds)
+    monkeypatch.setattr(gateway_module, "LIVENESS_SWEEP_SECONDS", sweep_seconds)
+    token = secrets.token_urlsafe(32)
+    server = BrowserGatewayServer(token=token)
+    port = server.start("127.0.0.1", 0)
+    return server, port, token
+
+
+def test_e2e_silent_owner_is_replaced_without_manual_takeover(monkeypatch):
+    server, port, token = _live_gateway(monkeypatch, idle_seconds=1.5, sweep_seconds=0.3)
+    first = SimpleWebSocketTestClient("127.0.0.1", port)
+    duplicate = SimpleWebSocketTestClient("127.0.0.1", port)
+    newcomer = SimpleWebSocketTestClient("127.0.0.1", port)
+    try:
+        assert first.connect(token=token, client_id="client-a") == 101
+        assert first.recv_json(timeout=2.0)["type"] == "hello"
+
+        # While the owner is answering, a second client is still a duplicate.
+        assert duplicate.connect(token=token, client_id="client-b") == 101
+        refusal = duplicate.recv_json(timeout=2.0)
+        assert refusal["type"] == "error"
+        assert refusal["error"]["code"] == "CLIENT_ALREADY_CONNECTED"
+
+        # ...but once it goes silent past the heartbeat window it is stale, not the owner.
+        time.sleep(1.8)
+        assert newcomer.connect(token=token, client_id="client-b") == 101
+        assert newcomer.recv_json(timeout=2.0)["type"] == "hello"
+        assert server.is_connected is True
+        assert server.active_connection_info()["clientId"] == "client-b"
+    finally:
+        first.close()
+        duplicate.close()
+        newcomer.close()
+        server.stop()
+
+
+def test_e2e_watchdog_drops_silent_connection_and_frees_the_gateway(monkeypatch):
+    server, port, token = _live_gateway(monkeypatch, idle_seconds=0.6, sweep_seconds=0.2)
+    frozen = SimpleWebSocketTestClient("127.0.0.1", port)
+    replacement = SimpleWebSocketTestClient("127.0.0.1", port)
+    try:
+        assert frozen.connect(token=token, client_id="client-a") == 101
+        assert frozen.recv_json(timeout=2.0)["type"] == "hello"
+        assert server.is_connected is True
+
+        deadline = time.time() + 6
+        while time.time() < deadline and server.is_connected:
+            time.sleep(0.1)
+        assert server.is_connected is False, "a silent socket must be dropped"
+
+        assert replacement.connect(token=token, client_id="client-b") == 101
+        assert replacement.recv_json(timeout=2.0)["type"] == "hello"
+        assert server.is_connected is True
+    finally:
+        frozen.close()
+        replacement.close()
+        server.stop()
 
 
 def test_ingest_finalize_sends_only_metadata_to_store():

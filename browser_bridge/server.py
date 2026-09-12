@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import socket
 import socketserver
 import struct
@@ -34,6 +35,14 @@ from .transport import ExtensionState, WebSocketTransport
 
 logger = logging.getLogger("browser_bridge.server")
 _WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+# A live extension pings every 20 s (hello.heartbeatMs). Silence past this window means the
+# socket is a zombie — Chrome keeps extension WebSockets open after the MV3 service worker
+# dies, so the TCP connection survives while nothing reads it any more. Without this the
+# gateway keeps the stale connection registered, the extension's reconnect is rejected as a
+# duplicate and the whole session wedges ("connected" but every command times out).
+LIVENESS_IDLE_SECONDS = float(os.environ.get("BRIDGE_LIVENESS_IDLE_SECONDS", "90"))
+LIVENESS_SWEEP_SECONDS = float(os.environ.get("BRIDGE_LIVENESS_SWEEP_SECONDS", "10"))
 
 
 class WebSocketProtocolError(Exception):
@@ -158,6 +167,16 @@ class GatewayClientConnection:
         self.send_lock = threading.Lock()
         self.closed = False
         self.close_sent = False
+        self.last_rx_at = time.time()
+        self.last_rx_kind = "handshake"
+
+    def touch(self, kind: str = "frame") -> None:
+        """Record inbound activity so the liveness watchdog can spot a dead peer."""
+        self.last_rx_at = time.time()
+        self.last_rx_kind = kind
+
+    def idle_seconds(self) -> float:
+        return max(0.0, time.time() - self.last_rx_at)
 
     def send(self, payload: Dict[str, Any] | MessageEnvelope) -> None:
         if hasattr(payload, "to_dict"):
@@ -232,6 +251,8 @@ class BrowserGatewayServer:
         self._lock = threading.RLock()
         self._server: Optional[socketserver.ThreadingTCPServer] = None
         self._thread: Optional[threading.Thread] = None
+        self._liveness_stop = threading.Event()
+        self._liveness_thread: Optional[threading.Thread] = None
 
         # Bind transport
         self.transport = WebSocketTransport(
@@ -315,10 +336,12 @@ class BrowserGatewayServer:
             daemon=True,
         )
         self._thread.start()
+        self._ensure_liveness_watchdog()
         logger.info("Browser Gateway Server started on %s:%d", host, self.port)
         return self.port  # type: ignore
 
     def stop(self) -> None:
+        self._liveness_stop.set()
         server = self._server
         self._server = None
         with self._lock:
@@ -354,6 +377,8 @@ class BrowserGatewayServer:
             "extensionId": conn.extension_id,
             "clientId": conn.client_id,
             "connectedAt": self._active_since,
+            "idleSeconds": round(conn.idle_seconds(), 1),
+            "lastMessageKind": conn.last_rx_kind,
         }
 
     def active_connection_info(self) -> Optional[Dict[str, Any]]:
@@ -371,16 +396,44 @@ class BrowserGatewayServer:
         takeover: bool = False,
     ) -> tuple[bool, Optional[Dict[str, Any]]]:
         rejected_owner: Optional[Dict[str, Any]] = None
+        stale_owner: Optional[Dict[str, Any]] = None
         with self._lock:
             prev = self._active_conn
-            if prev and not prev.closed and not takeover:
+            prev_is_stale = bool(
+                prev and not prev.closed and prev.idle_seconds() >= LIVENESS_IDLE_SECONDS
+            )
+            if prev and not prev.closed and not takeover and not prev_is_stale:
                 rejected_owner = self._connection_info_locked(prev)
             else:
+                if prev_is_stale:
+                    stale_owner = self._connection_info_locked(prev)
                 self._active_conn = conn
                 self._active_since = time.time()
                 if prev and prev is not conn:
-                    self.transport.reset_pending("Extension connection replaced by explicit takeover")
+                    self.transport.reset_pending(
+                        "Extension connection replaced by explicit takeover"
+                        if takeover
+                        else "Stale extension connection replaced"
+                    )
                 self.transport.set_state(ExtensionState.CONNECTED)
+
+        if stale_owner:
+            # The previous owner went quiet past the heartbeat window (dead MV3 worker while
+            # Chrome kept the socket open). Accept the fresh connection instead of rejecting it
+            # as a duplicate — otherwise the extension backs off and never recovers.
+            logger.warning(
+                "Replacing stale extension connection client_id=%s (idle %.1fs)",
+                stale_owner.get("clientId"),
+                stale_owner.get("idleSeconds") or 0.0,
+            )
+            self.audit.record(
+                "client.stale_replaced",
+                details={
+                    "stale_client_id": stale_owner.get("clientId"),
+                    "new_client_id": conn.client_id,
+                    "idle_seconds": stale_owner.get("idleSeconds"),
+                },
+            )
 
         if rejected_owner:
             logger.info(
@@ -406,6 +459,9 @@ class BrowserGatewayServer:
             "client.connected",
             details={"extension_id": conn.extension_id, "client_id": conn.client_id, "takeover": takeover},
         )
+        # Serve the helper-plain-HTTP upgrade path too: the extension usually connects on the
+        # helper port, where start() was called for a *different* listener.
+        self._ensure_liveness_watchdog()
 
         # Send greeting envelope
         hello_env = MessageEnvelope(
@@ -444,6 +500,45 @@ class BrowserGatewayServer:
                     self.on_disconnect()
                 except Exception as e:
                     logger.warning("on_disconnect callback raised: %s", e)
+
+    def _liveness_sweep(self) -> None:
+        """Drop the active connection once it stops talking (dead MV3 worker, frozen socket)."""
+        with self._lock:
+            conn = self._active_conn
+        if conn is None or conn.closed:
+            return
+        idle = conn.idle_seconds()
+        if idle < LIVENESS_IDLE_SECONDS:
+            return
+        logger.warning(
+            "Extension connection idle for %.1fs (> %.1fs) — dropping it so a reconnect can land",
+            idle,
+            LIVENESS_IDLE_SECONDS,
+        )
+        self.audit.record(
+            "client.stale_timeout",
+            details={"client_id": conn.client_id, "idle_seconds": idle},
+        )
+        self._unregister(conn)
+
+    def _ensure_liveness_watchdog(self) -> None:
+        """Start the idle-sweeper thread once; it dies with stop()."""
+        with self._lock:
+            if self._liveness_thread is not None and self._liveness_thread.is_alive():
+                return
+            self._liveness_stop.clear()
+
+            def _run() -> None:
+                while not self._liveness_stop.wait(LIVENESS_SWEEP_SECONDS):
+                    try:
+                        self._liveness_sweep()
+                    except Exception as exc:  # noqa: BLE001 — the sweeper must never die
+                        logger.warning("Liveness sweep failed: %s", exc)
+                self._liveness_thread = None
+
+            thread = threading.Thread(target=_run, name="browser-gateway-liveness", daemon=True)
+            self._liveness_thread = thread
+        thread.start()
 
     def _upgrade_and_register(
         self,
@@ -557,6 +652,7 @@ class BrowserGatewayServer:
         try:
             while True:
                 opcode, raw = _read_frame(reader)
+                conn.touch("frame")
                 if opcode == 0x8:  # Close
                     if not conn.close_sent:
                         try:
@@ -584,9 +680,12 @@ class BrowserGatewayServer:
                     continue
 
                 if not isinstance(payload, dict):
+                    conn.touch("json")
                     continue
 
                 msg_type = payload.get("type")
+                is_heartbeat = msg_type in (MessageType.PING, MessageType.PONG, "bridge.ping", "ping", "pong")
+                conn.touch("heartbeat" if is_heartbeat else str(msg_type or "message"))
                 if msg_type == MessageType.PING or msg_type == "bridge.ping":
                     conn.send(MessageEnvelope(type=MessageType.PONG, params={"at": time.time()}).to_dict())
                     continue

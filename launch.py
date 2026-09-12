@@ -874,6 +874,38 @@ def _on_browser_ws_connect() -> None:
             break
 
 
+def _on_browser_ws_disconnect() -> None:
+    """Extension socket died (worker killed/frozen, socket stale): requeue its work.
+
+    Leaving the job in ``_INGEST_INFLIGHT`` stranded it: the gateway reported "connected"
+    forever, /ingest/result never answered and every later command timed out. Requeueing
+    lets the next connection pick the job back up instead of requiring a manual retry.
+    """
+    try:
+        with _INGEST_JOBS_LOCK:
+            stranded = [jid for jid in _INGEST_INFLIGHT]
+        if not stranded:
+            return
+        _release_inflight_jobs(requeue=True)
+        for jid in stranded:
+            if jid in _INGEST_RESULTS:
+                continue
+            _update_ingest_progress(
+                jid,
+                {
+                    "status": "queued",
+                    "stage": "extension_disconnected",
+                    "message": "Chrome extension mất kết nối (worker treo/tắt); job đã được xếp lại, chờ kết nối mới",
+                    "error": None,
+                    "verification_required": False,
+                    "percent": 0,
+                },
+            )
+        print("[bridge] extension socket dropped — requeued in-flight ingest jobs", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 — never let a callback kill the frame loop
+        print(f"[bridge] disconnect requeue failed: {exc}", file=sys.stderr)
+
+
 def _on_browser_ws_message(message: dict) -> None:
     kind = message.get("type")
     if kind == "ingest.rpc":
@@ -1067,6 +1099,7 @@ _INGEST_RPC = IngestRPC(
 
 _BROWSER_WS.on_connect = _on_browser_ws_connect
 _BROWSER_WS.on_message = _on_browser_ws_message
+_BROWSER_WS.on_disconnect = _on_browser_ws_disconnect
 
 
 def _store_ingest_payload(body, name_hint: str = "") -> tuple[int, dict]:
