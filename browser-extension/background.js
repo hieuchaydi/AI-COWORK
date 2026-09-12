@@ -2985,11 +2985,25 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
         startX = Math.round(canvasRect.x + geometry.sprite_center[0] / dpr);
         startY = Math.round(canvasRect.y + geometry.sprite_center[1] / dpr);
       }
-      distance = Math.round(holeX - startX);
-      endY = Math.round(holeY);
+      // A jigsaw piece has to *cover* the cut-out, so translate by the bounding-box corner
+      // delta. Aligning centres looks right on screen but leaves (Δw/2, Δh/2) of offset
+      // whenever the piece and the hole differ in size — Shopee then rejects the submit.
+      const spriteBox = Array.isArray(geometry.sprite_bbox) ? geometry.sprite_bbox : null;
+      const holeBox = Array.isArray(geometry.hole_bbox) ? geometry.hole_bbox : null;
+      let alignMode = "centre";
+      let deltaX = holeX - startX;
+      let deltaY = holeY - startY;
+      if (spriteBox && holeBox) {
+        alignMode = "corner";
+        deltaX = (holeBox[0] - spriteBox[0]) / dpr;
+        deltaY = (holeBox[1] - spriteBox[1]) / dpr;
+      }
+      distance = Math.round(deltaX);
+      endY = Math.round(startY + deltaY);
       dropMode = true;
-      bridgeLog("info", "2D piece drop", "from", `${startX},${startY}`, "to", `${Math.round(holeX)},${endY}`,
-        "dx", String(distance), "dy", String(endY - startY));
+      bridgeLog("info", "2D piece drop", `(${alignMode} align)`, "from", `${startX},${startY}`,
+        "to", `${Math.round(startX + deltaX)},${endY}`, "dx", String(distance), "dy", String(endY - startY),
+        "spriteBox", JSON.stringify(spriteBox), "holeBox", JSON.stringify(holeBox));
     }
   }
 
@@ -3034,7 +3048,11 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
               bridgeLog("info", "submitted captcha", `${submit.x},${submit.y}`);
             }
           }
-        })(), 15000, "debugger drag");
+        // A trusted 26-34 step drag normally takes ~2-4 s; Chrome occasionally stalls a CDP
+        // command for several seconds, so the budget stays well under the 30 s command deadline
+        // without abandoning a drag that is merely slow (an abandonment used to leave the piece
+        // half-dragged and then fall back to untrusted events).
+        })(), 22000, "debugger drag");
         return { error: null, result: { attempted: true, method: "debugger", startX, startY, endX, endY, distance, dropMode } };
       } catch (err) {
         return { error: String(err?.message || err), result: null };
