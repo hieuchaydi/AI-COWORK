@@ -2975,7 +2975,11 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
   const dpr = Number(lastPuzzleEvidence?.dpr) || 1;
   let endY = startY;
   let dropMode = false;
-  if (geometry?.hole_center && canvasRect && Number.isFinite(canvasRect.x)) {
+  // What a human does: on a slider layout they grab the orange button and slide it sideways —
+  // the piece rides along. The 2D "drop the piece" move only applies to the variant that has no
+  // track at all (the piece is the draggable widget there).
+  const hasTrack = detection?.hasTrack === true;
+  if (!hasTrack && geometry?.hole_center && canvasRect && Number.isFinite(canvasRect.x)) {
     const holeX = canvasRect.x + geometry.hole_center[0] / dpr;
     const holeY = canvasRect.y + geometry.hole_center[1] / dpr;
     const dy = holeY - startY;
@@ -3210,13 +3214,27 @@ async function detectCaptchaInTab(tabId, options = {}) {
         }
 
         // 2. Tìm Nút trượt màu cam (Slider Handle/Button) - Nút người dùng cần kéo
-        const handleSelectors = [
+        // Slider layouts draw the *piece* on a canvas with a pointer cursor — grabbing that
+        // canvas does nothing (only the orange button on the track is draggable). Watch what a
+        // human does: press the orange button at the bottom of the track, slide horizontally.
+        // So when the track hint is present the piece canvases are tried last.
+        let trackHint = false;
+        try {
+          trackHint = Array.from(document.querySelectorAll("div, span, p")).some((el) => {
+            const t = (el.innerText || "").toLowerCase();
+            return t.includes("kéo qua để hoàn thiện bức hình") || t.includes("kéo thanh trượt");
+          });
+        } catch {}
+
+        const pieceCanvasSelectors = [
           "canvas.MqzVM5",
           "div._4U309i canvas",
           "div._4U309i",
           "div.FkR97h",
           "canvas[style*='cursor: pointer']",
           "canvas[style*='cursor:pointer']",
+        ];
+        const trackButtonSelectors = [
           ".shopee-captcha-slider__btn",
           ".shopee-captcha-slider__button",
           "div[class*='slider__btn']",
@@ -3237,6 +3255,9 @@ async function detectCaptchaInTab(tabId, options = {}) {
           ".geetest_slider_btn",
           "[role='slider']",
         ];
+        const handleSelectors = trackHint
+          ? [...trackButtonSelectors]
+          : [...pieceCanvasSelectors, ...trackButtonSelectors];
 
         let handleEl = null;
         let handleSelector = null;
@@ -3436,6 +3457,7 @@ async function detectCaptchaInTab(tabId, options = {}) {
             elementFound: true,
             pageUrl: location.href,
             slider: sliderCoordinates,
+            hasTrack: Boolean(trackEl) || trackHint,
           };
         }
 

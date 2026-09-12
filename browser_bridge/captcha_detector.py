@@ -289,6 +289,11 @@ def detect_sprite_piece(canvas_bgr: Any, gray: Any = None) -> Optional[Dict[str,
             # A sprite fills a small slice of the frame; anything huge is background.
             if bw * bh > 0.55 * cw * ch:
                 continue
+            # ...and it is compact: a dark forest patch 207x110 on a 285x153 frame passed the
+            # area cap above (23k vs 24k) and was reported as "the piece". Real sprites are a
+            # small fraction of either axis.
+            if bw > cw * 0.42 or bh > ch * 0.42:
+                continue
             fill = area / float(max(1, bw * bh))
             # cv2.contourArea reports the *outer* polygon, so a hollow outline (a cavity border)
             # scores as a full rectangle. Count actual mask pixels inside the box instead: a
@@ -324,6 +329,79 @@ def detect_sprite_piece_safe(canvas_bgr: Any, gray: Any = None) -> Optional[Dict
         return detect_sprite_piece(canvas_bgr, gray)
     except Exception as exc:  # noqa: BLE001 - defensive: solver must degrade, not crash
         logger.warning("Sprite detection failed: %s", exc)
+        return None
+
+
+def detect_salient_piece(canvas_bgr: Any, gray: Any = None) -> Optional[Dict[str, Any]]:
+    """Colour-agnostic sprite finder: the compact blob that stands out from its surroundings.
+
+    The colour families (warm/bright/blue/dark) only cover the props seen so far. A moss-green
+    disc on a forest photo matched none of them, so the solver fell back to edge heuristics and
+    pointed the drag the wrong way. Compare each pixel with a heavily blurred copy of the frame
+    (a cheap saliency map) and keep the most prominent compact blob of sprite size.
+    """
+    try:
+        import numpy as np
+        import cv2
+    except ImportError:  # pragma: no cover - callers guard this
+        return None
+
+    if canvas_bgr is None or getattr(canvas_bgr, "size", 0) == 0:
+        return None
+    if gray is None:
+        gray = cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2GRAY)
+    ch, cw = gray.shape[:2]
+
+    # Two scales: a small sigma catches a ~30px sprite on a busy photo, a large one catches
+    # blobs that differ from the wider scene. Either can win.
+    small = cv2.absdiff(gray, cv2.GaussianBlur(gray, (0, 0), 4))
+    wide = cv2.absdiff(gray, cv2.GaussianBlur(gray, (0, 0), 12))
+    diff = cv2.max(small, wide)
+    # A fixed threshold turns a textured photo (forest, gravel) into one giant blob — 90% of the
+    # frame above 18. Keep only the most salient tail of the distribution.
+    threshold = max(16.0, float(np.percentile(diff, 92)))
+    mask = (diff > threshold).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    # No MORPH_OPEN here: a sprite whose *interior* is uniform (a moss-green disc) only shows up
+    # as a thin salient outline, and opening erases thin structures — the detector found nothing
+    # at all on that frame until this was removed.
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    best = None
+    best_score = 0.0
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        if not (14 <= w <= 110 and 14 <= h <= 110):
+            continue
+        if w * h > 0.5 * cw * ch:
+            continue
+        pixels = int(np.count_nonzero(mask[y:y + h, x:x + w]))
+        fill = pixels / float(max(1, w * h))
+        if fill < 0.32:
+            continue
+        strength = float(np.mean(diff[y:y + h, x:x + w]))
+        score = pixels * (1.0 + strength / 40.0)
+        if score > best_score:
+            best_score = score
+            best = {
+                "center": (float(x + w / 2.0), float(y + h / 2.0)),
+                "bbox": (int(x), int(y), int(w), int(h)),
+                "w": float(w),
+                "h": float(h),
+                "area": pixels,
+                "kind": "salient",
+                "strength": round(strength, 1),
+            }
+    return best
+
+
+def detect_salient_piece_safe(canvas_bgr: Any, gray: Any = None) -> Optional[Dict[str, Any]]:
+    """`detect_salient_piece` that never raises."""
+    try:
+        return detect_salient_piece(canvas_bgr, gray)
+    except Exception as exc:  # noqa: BLE001 - solver contract: degrade, never crash
+        logger.warning("Salient piece detection failed: %s", exc)
         return None
 
 
@@ -369,6 +447,19 @@ def detect_outlined_hole(canvas_bgr: Any, gray: Any = None) -> Optional[Dict[str
         std = float(np.std(interior))
         if std > 34:
             continue  # textured → that's scenery, not a cut-out
+        # The cut-out has to differ from what surrounds it. On photo scenes a flat *light* patch
+        # (sand, a table top, a highlight) is otherwise as "flat" as a real cavity and used to win
+        # this contest — which pointed the drag away from the hole (mortar & pestle → -119 left
+        # instead of right). A real cavity is the darker of the two in every Shopee variant seen
+        # so far, so contrast is required and darkness is preferred in the score below.
+        outer_pad = max(3, int(min(w, h) * 0.35))
+        outer = gray[max(0, y - outer_pad):min(ch, y + h + outer_pad),
+                     max(0, x - outer_pad):min(cw, x + w + outer_pad)]
+        interior_mean = float(np.mean(interior))
+        outer_mean = float(np.mean(outer)) if outer.size else interior_mean
+        contrast = outer_mean - interior_mean  # > 0 → the patch is darker than its surroundings
+        if contrast < 6.0:
+            continue
         perimeter = float(cv2.arcLength(c, True))
         if perimeter <= 0:
             continue
@@ -376,7 +467,12 @@ def detect_outlined_hole(canvas_bgr: Any, gray: Any = None) -> Optional[Dict[str
         if area < 0.35 * w * h:
             continue
         # A cut-out is flat inside but strongly outlined; prefer the flattest, best enclosed one.
-        score = (area / float(w * h)) * (200.0 / (std + 6.0)) * min(1.0, perimeter / (2.0 * (w + h)))
+        score = (
+            (area / float(w * h))
+            * (200.0 / (std + 6.0))
+            * min(1.0, perimeter / (2.0 * (w + h)))
+            * (1.0 + min(contrast, 60.0) / 30.0)
+        )
         if score > best_score:
             best_score = score
             best = {
@@ -386,6 +482,7 @@ def detect_outlined_hole(canvas_bgr: Any, gray: Any = None) -> Optional[Dict[str
                 "h": float(h),
                 "area": int(area),
                 "std": round(std, 2),
+                "contrast": round(contrast, 1),
             }
     return best
 
@@ -1077,11 +1174,42 @@ def solve_puzzle_cv(
     # colours) the classic methods stay authoritative so their contracts are unchanged.
     is_photographic = distinct_colour_count(canvas_crop) > 400
 
+    # Colour families miss some props (a moss-green disc on a forest photo) and can also latch
+    # onto scenery: on that same frame the "dark" family matched a rock at x=75 while the real
+    # piece sat at x≈20. Shopee always parks the sprite against one of the frame's edges, so a
+    # salient blob hugging an edge outranks a colour match that does not.
+    if is_photographic:
+        salient = detect_salient_piece_safe(canvas_crop, gray)
+        if salient is not None:
+            sbx, _, sbw, _ = salient["bbox"]
+            near_edge = min(sbx, cw - (sbx + sbw)) <= cw * 0.12
+            if sprite_piece is None or near_edge:
+                sprite_piece = salient
+
     # Method 0a: outlined cut-out + solid sprite on a photographic scene. The hole is a flat,
     # strongly outlined region; the movable sprite is a solid blob (warm/bright/blue/dark). Pair
     # them directly and keep the sign, instead of letting edge heuristics pair the hole with a
     # neighbouring edge — the failure that dragged the piece away from the hole.
     if is_photographic:
+        # Prefer the compartment/receptacle solver when it is confident: it was written for
+        # "prop into cavity" props (tablet into dispenser, pestle into mortar) and its cavity
+        # search looks for the low-variance interior *inside* a container, which is exactly the
+        # mortar-bowl case that the outlined-hole scan got wrong.
+        comp_first = solve_compartment_receptacle(
+            canvas_crop,
+            canvas_rect=canvas_rect,
+            track_rect=track_rect,
+            handle_rect=handle_rect,
+            device_pixel_ratio=scale,
+            attempt=attempt,
+        )
+        if (
+            comp_first.get("ok")
+            and float(comp_first.get("confidence", 0) or 0) >= 0.90
+            and 24.0 <= abs(float(comp_first.get("travel", 0) or 0)) <= cw * 0.95
+        ):
+            return comp_first
+
         hole = detect_outlined_hole_safe(canvas_crop, gray)
         if hole is not None and sprite_piece is not None:
             hole_x = float(hole["center"][0])
