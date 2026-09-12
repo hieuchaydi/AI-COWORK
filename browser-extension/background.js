@@ -2929,8 +2929,10 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
     return { attempted: false, reason: "slider_coordinates_missing" };
   }
 
-  const startX = slider.x;
-  const startY = slider.y;
+  // The "drag the missing piece" variant renders the sprite on a canvas, so the DOM handle is
+  // only a hint; the drop below re-anchors the press on the sprite centre the solver measured.
+  let startX = slider.x;
+  let startY = slider.y;
   let distance = await calculatePuzzleDistance(tabId, slider);
   // A blind or low-confidence answer costs one of the few attempts Shopee allows, and a wrong
   // drag also regenerates the puzzle — so skip the drag and report instead.
@@ -2978,10 +2980,16 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
     const holeY = canvasRect.y + geometry.hole_center[1] / dpr;
     const dy = holeY - startY;
     if (Math.abs(dy) > 14) {
+      if (geometry.sprite_center) {
+        // Anchor the press on the sprite itself (canvas → viewport), not on the DOM handle.
+        startX = Math.round(canvasRect.x + geometry.sprite_center[0] / dpr);
+        startY = Math.round(canvasRect.y + geometry.sprite_center[1] / dpr);
+      }
       distance = Math.round(holeX - startX);
       endY = Math.round(holeY);
       dropMode = true;
-      bridgeLog("info", "2D piece drop", "dx", String(distance), "dy", String(Math.round(dy)));
+      bridgeLog("info", "2D piece drop", "from", `${startX},${startY}`, "to", `${Math.round(holeX)},${endY}`,
+        "dx", String(distance), "dy", String(endY - startY));
     }
   }
 
@@ -3013,6 +3021,19 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
           await new Promise((r) => setTimeout(r, 150 + Math.random() * 50));
           await new Promise((r) => setTimeout(r, 140 + Math.random() * 50));
           await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: endY, button: "left", clickCount: 1 });
+          // This variant shows a "Gửi" button: the piece only counts once it is submitted.
+          if (dropMode) {
+            const submit = await findSubmitButtonCentre(tabId);
+            if (submit) {
+              await new Promise((r) => setTimeout(r, 220));
+              await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: submit.x, y: submit.y, button: "none" });
+              await new Promise((r) => setTimeout(r, 60));
+              await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mousePressed", x: submit.x, y: submit.y, button: "left", clickCount: 1 });
+              await new Promise((r) => setTimeout(r, 70));
+              await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: submit.x, y: submit.y, button: "left", clickCount: 1 });
+              bridgeLog("info", "submitted captcha", `${submit.x},${submit.y}`);
+            }
+          }
         })(), 15000, "debugger drag");
         return { error: null, result: { attempted: true, method: "debugger", startX, startY, endX, endY, distance, dropMode } };
       } catch (err) {
@@ -3447,6 +3468,34 @@ function isSubmitLikeElement(el) {
     return false;
   } catch {
     return false;
+  }
+}
+
+/** Centre of the challenge's submit button ("Gửi"), or null when the variant has none. */
+async function findSubmitButtonCentre(tabId) {
+  if (!tabId || !chrome.scripting?.executeScript) return null;
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: (pattern) => {
+        const re = new RegExp(pattern, "i");
+        const els = Array.from(document.querySelectorAll("button, div, span, a"));
+        const el = els.find((e) => {
+          const text = String(e.innerText || "").trim();
+          if (!text || text.length > 24 || !re.test(text)) return false;
+          const r = e.getBoundingClientRect();
+          return r.width >= 40 && r.height >= 24 && r.width <= 260 && r.height <= 90;
+        });
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+      },
+      args: [SUBMIT_LABEL_RE.source],
+    });
+    return res?.result || null;
+  } catch {
+    return null;
   }
 }
 
