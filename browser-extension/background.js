@@ -3448,6 +3448,33 @@ async function detectCaptchaInTab(tabId, options = {}) {
             };
           }
 
+          // A normal Shopee page must never be mistaken for a challenge: the product page's
+          // orange "Mua Ngay" button was picked as the slider handle, so the watcher dragged the
+          // product photo, submitted nothing and burned the challenge's few attempts (observed:
+          // the lock landed at 13:49 with tab=https://shopee.vn/produc...). A real challenge has
+          // its own container or lives on /verify/.
+          const challengeContainer = (() => {
+            try {
+              const selectors = [
+                ".shopee-captcha-slider",
+                ".captcha_container",
+                "[class*='captcha-modal']",
+                "[class*='captcha_wrapper']",
+                "[class*='shopee-captcha']",
+                ".verify-container",
+                ".verify-slider",
+                "[class*='verify-slider']",
+                ".geetest_canvas_bg",
+              ];
+              return selectors.some((sel) => {
+                try { return Boolean(document.querySelector(sel)); } catch { return false; }
+              });
+            } catch { return false; }
+          })();
+          if (!isVerifyPage && !challengeContainer) {
+            return { detected: false, resolved: false, type: "no_challenge_ui", pageUrl: location.href };
+          }
+
           return {
             detected: true,
             resolved: false,
