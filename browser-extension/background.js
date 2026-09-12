@@ -2651,6 +2651,11 @@ function withDebuggerLock(task) {
 const debuggerSessionTokens = new Map();
 let debuggerSessionSeq = 0;
 
+// Focusing the challenge window costs ~1 s; only do it once per challenge/30 s instead of before
+// every single drag attempt (that latency is part of the "5-6 s before anything moves" report).
+let challengeFocusTabId = null;
+let challengeFocusedAt = 0;
+
 function claimDebuggerSession(tabId) {
   const token = ++debuggerSessionSeq;
   debuggerSessionTokens.set(tabId, token);
@@ -3017,19 +3022,33 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
   let debuggerError = null;
   if (chrome.debugger?.attach && chrome.debugger?.sendCommand && chrome.debugger?.detach) {
     const target = { tabId };
+    // Fire-and-forget CDP dispatch: awaiting every sendCommand is what made the drag start 5-6 s
+    // late and then blow past its deadline (one stalled ack per event × ~10 events). The browser
+    // processes commands on a session in order, so we only need to pace the *sleeps*; the ack is
+    // not needed for correctness and a stall must not block the trajectory.
+    const fire = (params) => {
+      try {
+        chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", params).catch(() => {});
+      } catch {}
+    };
     // CDP input dispatch is queued while the tab's *window* is not focused: a trusted drag then
     // sits until it times out (and the untrusted DOM fallback still "works", because synthetic
     // events don't need focus — which is exactly the "it drags into place but Gửi rejects" case).
     // Bring the tab forward first, like a human would.
-    try {
-      const tabInfo = await chrome.tabs.get(tabId);
-      await chrome.tabs.update(tabId, { active: true });
-      if (tabInfo?.windowId && chrome.windows?.update) {
-        await chrome.windows.update(tabInfo.windowId, { focused: true });
+    // Only needed once per challenge: re-focusing before every attempt cost ~1 s of the budget.
+    if (challengeFocusTabId !== tabId || Date.now() - challengeFocusedAt > 30000) {
+      try {
+        const tabInfo = await chrome.tabs.get(tabId);
+        await chrome.tabs.update(tabId, { active: true });
+        if (tabInfo?.windowId && chrome.windows?.update) {
+          await chrome.windows.update(tabInfo.windowId, { focused: true });
+        }
+        challengeFocusTabId = tabId;
+        challengeFocusedAt = Date.now();
+        await new Promise((r) => setTimeout(r, 200));
+      } catch (focusErr) {
+        bridgeLog("warn", "could not focus the challenge tab before dragging:", String(focusErr?.message || focusErr));
       }
-      await new Promise((r) => setTimeout(r, 250));
-    } catch (focusErr) {
-      bridgeLog("warn", "could not focus the challenge tab before dragging:", String(focusErr?.message || focusErr));
     }
     const outcome = await withDebuggerLock(async () => {
       let attached = false;
@@ -3040,9 +3059,9 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
         attached = true;
         sessionToken = claimDebuggerSession(tabId);
         await withTimeout((async () => {
-          await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: startX, y: startY, button: "none" });
+          fire({ type: "mouseMoved", x: startX, y: startY, button: "none" });
           await new Promise((r) => setTimeout(r, 60 + Math.random() * 40));
-          await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mousePressed", x: startX, y: startY, button: "left", clickCount: 1 });
+          fire({ type: "mousePressed", x: startX, y: startY, button: "left", clickCount: 1 });
           // Fewer CDP round-trips. Every sendCommand can stall for seconds on a busy renderer
           // (that stall is what pushed the drag past its deadline and dropped it onto the
           // untrusted DOM-event path, where Shopee always rejects). A ~26-34 point human
@@ -3051,7 +3070,7 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
             ? points.filter((_, index) => index % Math.ceil(points.length / 10) === 0).concat(points[points.length - 1])
             : points;
           for (const point of tracePoints) {
-            await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y, button: "left", buttons: 1 });
+            fire({ type: "mouseMoved", x: point.x, y: point.y, button: "left", buttons: 1 });
             await new Promise((r) => setTimeout(r, point.delay));
           }
           await new Promise((r) => setTimeout(r, 90 + Math.random() * 40));
@@ -3059,17 +3078,17 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
           // Dừng nghỉ ổn định (Settle delay) để DOM và anti-bot script ghi nhận mảnh ghép đã khớp hoàn toàn
           await new Promise((r) => setTimeout(r, 150 + Math.random() * 50));
           await new Promise((r) => setTimeout(r, 140 + Math.random() * 50));
-          await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: endY, button: "left", clickCount: 1 });
+          fire({ type: "mouseReleased", x: endX, y: endY, button: "left", clickCount: 1 });
           // This variant shows a "Gửi" button: the piece only counts once it is submitted.
           if (dropMode) {
             const submit = await findSubmitButtonCentre(tabId);
             if (submit) {
               await new Promise((r) => setTimeout(r, 220));
-              await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: submit.x, y: submit.y, button: "none" });
+              fire({ type: "mouseMoved", x: submit.x, y: submit.y, button: "none" });
               await new Promise((r) => setTimeout(r, 60));
-              await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mousePressed", x: submit.x, y: submit.y, button: "left", clickCount: 1 });
+              fire({ type: "mousePressed", x: submit.x, y: submit.y, button: "left", clickCount: 1 });
               await new Promise((r) => setTimeout(r, 70));
-              await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: submit.x, y: submit.y, button: "left", clickCount: 1 });
+              fire({ type: "mouseReleased", x: submit.x, y: submit.y, button: "left", clickCount: 1 });
               bridgeLog("info", "submitted captcha", `${submit.x},${submit.y}`);
             }
           }
