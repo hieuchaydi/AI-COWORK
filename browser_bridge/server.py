@@ -10,6 +10,7 @@ import os
 import socket
 import socketserver
 import struct
+import sys
 import threading
 import time
 import urllib.parse
@@ -43,6 +44,16 @@ _WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 # duplicate and the whole session wedges ("connected" but every command times out).
 LIVENESS_IDLE_SECONDS = float(os.environ.get("BRIDGE_LIVENESS_IDLE_SECONDS", "90"))
 LIVENESS_SWEEP_SECONDS = float(os.environ.get("BRIDGE_LIVENESS_SWEEP_SECONDS", "10"))
+
+# Opt-in wire tracing: set BRIDGE_DEBUG_FRAMES=1 to print every inbound frame and every
+# socket teardown reason. Diagnosing "the extension stopped answering" needs this — the
+# default logger goes nowhere because nothing configures the logging module.
+FRAME_DEBUG = os.environ.get("BRIDGE_DEBUG_FRAMES", "") not in ("", "0", "false", "False")
+
+
+def _debug(message: str) -> None:
+    if FRAME_DEBUG:
+        print(f"[ws-debug] {message}", file=sys.stderr, flush=True)
 
 
 class WebSocketProtocolError(Exception):
@@ -106,8 +117,6 @@ def _read_frame_raw(source: socket.socket | _BufferedSocketReader, max_bytes: in
 
     if rsv != 0:
         raise WebSocketProtocolError("RSV bits must be 0")
-    if not fin:
-        raise WebSocketProtocolError("Fragmented frames not supported")
     if opcode in (0x8, 0x9, 0xA) and not fin:
         raise WebSocketProtocolError("Control frames must not be fragmented")
     if not masked:
@@ -132,29 +141,45 @@ def _read_frame_raw(source: socket.socket | _BufferedSocketReader, max_bytes: in
 
 
 
-def _read_frame(source: socket.socket | _BufferedSocketReader, max_bytes: int = MAX_MESSAGE_BYTES) -> tuple[int, bytes]:
-    opcode, payload, fin = _read_frame_raw(source, max_bytes)
-    if fin or opcode in (0x8, 0x9, 0xA):
-        return opcode, payload
+def _read_frame(
+    source: socket.socket | _BufferedSocketReader,
+    max_bytes: int = MAX_MESSAGE_BYTES,
+    on_control: Optional[Callable[[int, bytes], None]] = None,
+) -> tuple[int, bytes]:
+    """Read one complete message, reassembling RFC 6455 fragmentation.
 
-    # Reassemble fragmented message
-    message_opcode = opcode
+    Chrome splits large client messages (the extension's ~20 KB evidence screenshots and
+    64 KB upload chunks) across a text frame plus continuation frames. Treating the opening
+    fragment as a protocol error tore the socket down on every large payload — the extension
+    reconnected in a loop and any in-flight job stalled.
+    """
+    opcode, payload, fin = _read_frame_raw(source, max_bytes)
+    if opcode in (0x8, 0x9, 0xA) or fin:
+        return opcode, payload
+    if opcode != 0x1:
+        raise WebSocketProtocolError(f"Fragmented message must start with a text frame, got {opcode:#x}")
+
     chunks = [payload]
     total_size = len(payload)
-
-    while not fin:
-        cont_opcode, cont_payload, fin = _read_frame_raw(source, max_bytes - total_size)
-        if cont_opcode in (0x8, 0x9, 0xA):
-            # Interleaved control frame
+    while True:
+        cont_opcode, cont_payload, cont_fin = _read_frame_raw(source, max(1, max_bytes - total_size))
+        if cont_opcode in (0x9, 0xA):
+            # Control frames may interleave a fragmented message; they never end it.
+            if on_control is not None:
+                on_control(cont_opcode, cont_payload)
+            continue
+        if cont_opcode == 0x8:
             return cont_opcode, cont_payload
         if cont_opcode != 0x0:
-            raise WebSocketProtocolError(f"Expected continuation opcode 0x0, got {cont_opcode}")
+            raise WebSocketProtocolError(f"Expected continuation opcode 0x0, got {cont_opcode:#x}")
         chunks.append(cont_payload)
         total_size += len(cont_payload)
         if total_size > max_bytes:
             raise WebSocketProtocolError(f"Fragmented message size {total_size} exceeds limit {max_bytes}")
+        if cont_fin:
+            break
 
-    return message_opcode, b"".join(chunks)
+    return 0x1, b"".join(chunks)
 
 
 class GatewayClientConnection:
@@ -493,6 +518,7 @@ class BrowserGatewayServer:
                 self.transport.set_state(ExtensionState.DISCONNECTED)
                 self.transport.reset_pending("Extension disconnected")
         conn.close()
+        _debug(f"client {conn.client_id} unregistered (was_active={was_active})")
         if was_active:
             self.audit.record("client.disconnected", details={"extension_id": conn.extension_id})
             if self.on_disconnect:
@@ -561,6 +587,7 @@ class BrowserGatewayServer:
 
         conn = GatewayClientConnection(sock, extension_id=extension_id, client_id=client_id)
         registered, owner = self._register(conn, takeover=takeover)
+        _debug(f"client {client_id} registering (takeover={takeover}) -> registered={registered}")
         if not registered:
             try:
                 conn.send(
@@ -651,8 +678,15 @@ class BrowserGatewayServer:
         reader = _BufferedSocketReader(sock, initial_data)
         try:
             while True:
-                opcode, raw = _read_frame(reader)
+                opcode, raw = _read_frame(
+                    reader,
+                    on_control=lambda op, data: conn.send_control(0xA, data) if op == 0x9 else None,
+                )
                 conn.touch("frame")
+                if FRAME_DEBUG:
+                    kind = {0x1: "text", 0x8: "close", 0x9: "ping", 0xA: "pong"}.get(opcode, hex(opcode))
+                    preview = raw[:90].decode("utf-8", "replace") if opcode == 0x1 else ""
+                    _debug(f"in {kind} {len(raw)}B {preview}")
                 if opcode == 0x8:  # Close
                     if not conn.close_sent:
                         try:
@@ -699,6 +733,10 @@ class BrowserGatewayServer:
                 self.transport.handle_inbound_envelope(payload)
         except (ConnectionError, OSError, WebSocketProtocolError, ValueError) as exc:
             logger.debug("Client socket terminated: %s", exc)
+            _debug(f"closing {conn.client_id}: {type(exc).__name__}: {exc}")
+        except Exception as exc:  # noqa: BLE001 — never lose the reason a socket died
+            logger.warning("Client socket crashed: %s", exc)
+            _debug(f"closing {conn.client_id} on unexpected {type(exc).__name__}: {exc}")
         finally:
             self._unregister(conn)
 

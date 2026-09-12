@@ -2280,6 +2280,42 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
           }) || null;
         }
 
+        // 2b. Layout hiện tại của Shopee dùng class băm (canvas.MqzVM5 ...) nên các selector
+        // cũ ở trên không khớp: bgEl/pieceEl/trackEl đều null và solver CV bị gọi "mù" (chỉ có
+        // ảnh chụp toàn tab) → trả về một con số cố định, kéo gần đúng nhưng không bao giờ khớp.
+        // Suy ra hình học từ chính các canvas: nút kéo là canvas nhỏ ~44px, nền/mảnh ghép là các
+        // canvas lớn cùng kích thước xếp chồng trong một khung.
+        if (!bgEl || !handleEl || !trackEl) {
+          try {
+            const canvases = Array.from(document.querySelectorAll("canvas")).filter((c) => c.offsetWidth > 0);
+            const small = canvases
+              .filter((c) => c.offsetWidth <= 80 && c.offsetHeight <= 80)
+              .sort((a, b) => b.offsetWidth * b.offsetHeight - a.offsetWidth * a.offsetHeight);
+            const large = canvases
+              .filter((c) => c.offsetWidth > 100 && c.offsetHeight > 60)
+              .sort((a, b) => b.offsetWidth * b.offsetHeight - a.offsetWidth * a.offsetHeight);
+            if (!handleEl && small.length) handleEl = small[0];
+            if (!bgEl && large.length) bgEl = large[0];
+            if (!pieceEl && large.length > 1) {
+              const twin = large.find(
+                (c) => c !== bgEl && Math.abs(c.offsetWidth - (bgEl ? bgEl.offsetWidth : 0)) <= 4
+              );
+              if (twin) pieceEl = twin;
+            }
+            if (!trackEl && handleEl) {
+              // Dải chứa nút kéo: cùng hàng, rộng hơn nhiều so với nút và không cao quá.
+              let node = handleEl.parentElement;
+              for (let i = 0; i < 4 && node && node !== document.body; i++) {
+                if (node.offsetWidth > handleEl.offsetWidth * 2 && node.offsetHeight <= 90) {
+                  trackEl = node;
+                  break;
+                }
+                node = node.parentElement;
+              }
+            }
+          } catch {}
+        }
+
         const trackWidth = trackEl ? trackEl.offsetWidth : (bgEl ? bgEl.offsetWidth : 300);
         const handleWidth = handleEl ? handleEl.offsetWidth : 44;
         const maxTravel = Math.max(120, trackWidth - handleWidth);
@@ -2414,7 +2450,7 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
     try {
       const screenshot = await captureTabEvidence(tabId);
       if (screenshot && typeof fetch === "function") {
-        const cvRes = await fetch(`${HELPER}/browser/solve_puzzle_cv`, {
+            const cvRes = await fetch(`${HELPER}/browser/solve_puzzle_cv`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -2442,17 +2478,22 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
               `confidence=${cvData.confidence}, piece=${JSON.stringify(dbg.piece_center || dbg.piece_x_phys || null)}, ` +
               `slot=${JSON.stringify(dbg.slot_center || dbg.target_x_phys || null)}`
             );
+            bridgeLog("info", "cv solver travel", String(travel), "method", String(cvData.method),
+              "conf", String(cvData.confidence), "piece", JSON.stringify(dbg.piece_center || null),
+              "slot", JSON.stringify(dbg.slot_center || null), "dpr", String(domInfo?.devicePixelRatio || 1));
             return travel;
           }
           if (cvData && cvData.ok === false) {
             // Most common cause: the sidecar Python lacks numpy/opencv → say so loudly instead
             // of silently degrading to the crude heuristics below.
             console.warn(`[bridge] CV puzzle solver unavailable: ${cvData.error || "unknown error"}`);
+            bridgeLog("warn", "cv solver unavailable:", String(cvData.error || "unknown error"));
           }
         }
       }
     } catch (cvErr) {
       console.warn("[bridge] CV puzzle solver call failed, falling back to heuristics:", cvErr?.message || cvErr);
+      bridgeLog("warn", "cv solver call failed:", String(cvErr?.message || cvErr));
     }
 
     if (validResult?.result?.travel) {
@@ -2520,6 +2561,32 @@ function generateHumanTrajectory(startX, startY, distance) {
 /**
  * 3. Tự động giải CAPTCHA trượt qua Chrome Debugger API (isTrusted = true)
  */
+/**
+ * Attach the debugger, recovering from a session a previous drag left behind.
+ *
+ * A stale attach makes every later chrome.debugger.attach() fail, which silently downgrades
+ * the CAPTCHA drag to synthetic DOM events (isTrusted=false). Shopee's anti-bot rejects those,
+ * so the slider looks almost right on screen but never validates.
+ */
+async function attachDebuggerSession(target, { retry = true } = {}) {
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    return { ok: true, error: null };
+  } catch (err) {
+    const first = String(err?.message || err);
+    if (!retry) return { ok: false, error: first };
+    try {
+      await chrome.debugger.detach(target);
+      await new Promise((r) => setTimeout(r, 150));
+      await chrome.debugger.attach(target, "1.3");
+      console.warn("[bridge] Re-attached debugger after a stale session:", first);
+      return { ok: true, error: null, recoveredFrom: first };
+    } catch (retryErr) {
+      return { ok: false, error: `${first} | retry: ${String(retryErr?.message || retryErr)}` };
+    }
+  }
+}
+
 async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
   if (!tabId || !detection?.detected) return { attempted: false, reason: "no_captcha_detection" };
 
@@ -2768,11 +2835,18 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
   const points = generateHumanTrajectory(startX, startY, distance);
   const endX = startX + distance;
 
+  let debuggerError = null;
   if (chrome.debugger?.attach && chrome.debugger?.sendCommand && chrome.debugger?.detach) {
     const target = { tabId };
     let attached = false;
+    const session = await attachDebuggerSession(target);
+    if (!session.ok) {
+      debuggerError = session.error;
+      console.warn("[bridge] Debugger attach failed; slider input would be untrusted:", debuggerError);
+      bridgeLog("warn", "debugger attach failed:", debuggerError);
+    }
     try {
-      await chrome.debugger.attach(target, "1.3");
+      if (!session.ok) throw new Error(debuggerError);
       attached = true;
       await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: startX, y: startY, button: "none" });
       await new Promise((r) => setTimeout(r, 60 + Math.random() * 40));
@@ -2790,7 +2864,9 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
       await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: startY, button: "left", clickCount: 1 });
       return { attempted: true, method: "debugger", startX, startY, endX, distance };
     } catch (err) {
-      console.warn("[bridge] Debugger slider drag failed:", err?.message || err);
+      debuggerError = String(err?.message || err);
+      console.warn("[bridge] Debugger slider drag failed:", debuggerError);
+      bridgeLog("warn", "debugger drag failed:", debuggerError);
     } finally {
       if (attached) {
         try { await chrome.debugger.detach(target); } catch {}
@@ -2822,11 +2898,19 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
       },
       args: [points, startX, startY, endX],
     });
-    return res?.result || { attempted: true, method: "dom_events", distance };
-    return res?.result || { attempted: true, method: "dom_events_untrusted", distance };
+    bridgeLog("warn", "captcha drag fell back to untrusted DOM events:", debuggerError || "no debugger", "distance", String(distance));
+    // Shopee's anti-bot ignores untrusted input, so this path can move the piece visually
+    // without ever validating. Report the debugger failure alongside it for diagnosis.
+    const untrusted = {
+      ...(res?.result || { attempted: true, method: "dom_events" }),
+      distance,
+      trusted: false,
+      debuggerError,
+    };
+    return untrusted;
   }
 
-  return { attempted: false, reason: "no_input_backend" };
+  return { attempted: false, reason: "no_input_backend", debuggerError };
 }
 
 async function detectCaptchaInTab(tabId, options = {}) {
@@ -3892,26 +3976,37 @@ async function handleAction(action, params) {
           quality: params.quality,
         });
       } catch (capErr) {
+        const captureError = String(capErr?.message || capErr);
+        let debuggerError = "chrome.debugger unavailable";
         if (chrome.debugger?.attach && chrome.debugger?.sendCommand && chrome.debugger?.detach) {
           const target = { tabId: targetTabId };
-          let attached = false;
-          try {
-            await chrome.debugger.attach(target, "1.3");
-            attached = true;
-            const res = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
-              format: params.format === "jpeg" ? "jpeg" : "png",
-              quality: params.quality,
-            });
-            if (res?.data) {
-              dataUrl = `data:image/${params.format === "jpeg" ? "jpeg" : "png"};base64,${res.data}`;
-            }
-          } catch {} finally {
-            if (attached) {
-              try { await chrome.debugger.detach(target); } catch {}
+          const session = await attachDebuggerSession(target);
+          if (!session.ok) {
+            debuggerError = session.error;
+          } else {
+            let attached = true;
+            try {
+              const res = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
+                format: params.format === "jpeg" ? "jpeg" : "png",
+                quality: params.quality,
+              });
+              if (res?.data) {
+                dataUrl = `data:image/${params.format === "jpeg" ? "jpeg" : "png"};base64,${res.data}`;
+              } else {
+                debuggerError = "Page.captureScreenshot returned no data";
+              }
+            } catch (err) {
+              debuggerError = String(err?.message || err);
+            } finally {
+              if (attached) {
+                try { await chrome.debugger.detach(target); } catch {}
+              }
             }
           }
         }
-        if (!dataUrl) throw capErr;
+        if (!dataUrl) {
+          throw new Error(`captureVisibleTab: ${captureError}; debugger: ${debuggerError}`);
+        }
       }
       return {
         status: "ok",
@@ -4370,6 +4465,26 @@ function bridgeSend(message) {
   if (!bridgeSocket || bridgeSocket.readyState !== WebSocket.OPEN) return false;
   bridgeSocket.send(JSON.stringify(message));
   return true;
+}
+
+/**
+ * Mirror a service-worker warning/error to the helper's log file.
+ *
+ * The MV3 worker's console is invisible unless someone opens chrome://extensions and hits
+ * "Inspect views: service worker" — which made every captcha failure take a manual
+ * round-trip. Warnings land in outputs/logs/extension.log and the launcher console.
+ */
+function bridgeLog(level, ...parts) {
+  try {
+    const message = parts
+      .map((part) => (typeof part === "string" ? part : (part?.message || JSON.stringify(part))))
+      .join(" ");
+    fetch(`${HELPER}/debug/log`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ level, message, at: Date.now(), extensionState, job: currentJobExecution?.job?.id || null }),
+    }).catch(() => {});
+  } catch {}
 }
 
 function clearReconnect() {

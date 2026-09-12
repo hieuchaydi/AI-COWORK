@@ -104,12 +104,20 @@ class SimpleWebSocketTestClient:
             data.extend(chunk)
         return bytes(data)
 
-    def send_json(self, payload: Dict[str, Any]) -> None:
+    def send_json(self, payload: Dict[str, Any], fragment_at: Optional[int] = None) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if fragment_at is not None and 0 < fragment_at < len(data):
+            # Chrome fragments large client messages; exercise that path on purpose.
+            self._send_frame(data[:fragment_at], opcode=0x1, fin=False)
+            self._send_frame(data[fragment_at:], opcode=0x0, fin=True)
+            return
+        self._send_frame(data, opcode=0x1, fin=True)
+
+    def _send_frame(self, data: bytes, *, opcode: int, fin: bool) -> None:
         mask = secrets.token_bytes(4)
         length = len(data)
 
-        header = bytearray([0x81])
+        header = bytearray([(0x80 if fin else 0x00) | opcode])
         if length <= 125:
             header.append(0x80 | length)
         elif length <= 65535:
@@ -663,6 +671,26 @@ def test_e2e_watchdog_drops_silent_connection_and_frees_the_gateway(monkeypatch)
         frozen.close()
         replacement.close()
         server.stop()
+
+
+def test_e2e_fragmented_client_message_is_reassembled_not_dropped(gateway_server):
+    """Chrome fragments large extension messages; the gateway must reassemble, not disconnect."""
+    server, port, token = gateway_server
+    client = SimpleWebSocketTestClient("127.0.0.1", port)
+    try:
+        assert client.connect(token=token) == 101
+        assert client.recv_json(timeout=2.0)["type"] == "hello"
+
+        client.send_json(
+            {"v": 1, "type": "ping", "id": "frag-ping", "params": {"pad": "x" * 5000}},
+            fragment_at=64,
+        )
+        reply = client.recv_json(timeout=3.0)
+        assert reply is not None, "fragmented message must not kill the socket"
+        assert reply["type"] == "pong"
+        assert server.is_connected is True
+    finally:
+        client.close()
 
 
 def test_ingest_finalize_sends_only_metadata_to_store():

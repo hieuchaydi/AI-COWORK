@@ -3628,6 +3628,28 @@ class _HelperHandler(BaseHTTPRequestHandler):
             _reply(200, {"ok": True, "reloaded": True, "sent": sent})
             return
 
+        if path_only == "/debug/log":
+            # Extension service-worker breadcrumbs (debugger attach failures, solver answers).
+            # Without this the MV3 console is invisible and every captcha miss needs a manual
+            # "Inspect views: service worker" round-trip.
+            body = _read_json()
+            line = json.dumps({
+                "at": time.strftime("%H:%M:%S"),
+                "level": str(body.get("level") or "info")[:16],
+                "message": str(body.get("message") or "")[:2000],
+                "state": str(body.get("extensionState") or "")[:40],
+                "job": str(body.get("job") or "")[:60],
+            }, ensure_ascii=False)
+            try:
+                log_path = LOG_DIR / "extension.log"
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[ext-log] could not persist: {exc}", file=sys.stderr)
+            print(f"[ext-log] {line}", file=sys.stderr)
+            _reply(200, {"ok": True})
+            return
+
         if path_only == "/browser/solve_puzzle_cv":
             from browser_bridge.captcha_detector import solve_puzzle_cv
             body = _read_json()
@@ -3647,6 +3669,27 @@ class _HelperHandler(BaseHTTPRequestHandler):
                 piece_rect=piece_rect,
                 device_pixel_ratio=dpr,
                 attempt=attempt,
+            )
+            dbg = result.get("debug_info") or {}
+            print(
+                "[captcha] solve_puzzle_cv attempt={attempt} ok={ok} method={method} "
+                "travel={travel} dir={direction} conf={conf} piece={piece} slot={slot} "
+                "scale={scale} canvas={cw}x{ch} dpr={dpr} piece_rect={piece_rect}".format(
+                    attempt=attempt,
+                    ok=result.get("ok"),
+                    method=result.get("method"),
+                    travel=result.get("travel"),
+                    direction=result.get("direction"),
+                    conf=result.get("confidence"),
+                    piece=dbg.get("piece_center") or dbg.get("piece_x_phys"),
+                    slot=dbg.get("slot_center") or dbg.get("target_x_phys"),
+                    scale=result.get("scale_ratio"),
+                    cw=dbg.get("canvas_w"),
+                    ch=dbg.get("canvas_h"),
+                    dpr=dpr,
+                    piece_rect=piece_rect,
+                ),
+                file=sys.stderr,
             )
             _reply(200 if result.get("ok") else 400, result)
             return

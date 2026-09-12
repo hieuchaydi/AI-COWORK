@@ -1167,6 +1167,96 @@ def test_connection_info_exposes_idle_age_for_troubleshooting():
         gateway.stop()
 
 
+# ── RFC 6455 fragmentation ───────────────────────────────────────────────────
+# Chrome splits large client messages (the extension's evidence screenshots, 64 KB upload
+# chunks) into a text frame plus continuation frames. The gateway used to answer such a
+# message with `WebSocketProtocolError: Fragmented frames not supported` and drop the socket,
+# which looped the extension's reconnect and stalled every in-flight job.
+
+
+def _masked_frame(opcode: int, payload: bytes, *, fin: bool = True, mask: bytes = b"\x01\x02\x03\x04") -> bytes:
+    first = (0x80 if fin else 0) | opcode
+    length = len(payload)
+    out = bytearray([first])
+    if length < 126:
+        out.append(0x80 | length)
+    elif length <= 0xFFFF:
+        out.append(0x80 | 126)
+        out += length.to_bytes(2, "big")
+    else:
+        out.append(0x80 | 127)
+        out += length.to_bytes(8, "big")
+    out += mask
+    out += bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return bytes(out)
+
+
+class _DripSocket:
+    """Socket stand-in that hands out one byte at a time (forces the reader to loop)."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = bytearray(data)
+
+    def recv(self, size: int) -> bytes:
+        if not self.data:
+            raise ConnectionError("Peer closed socket")
+        chunk = bytes(self.data[:1])
+        del self.data[:1]
+        return chunk
+
+
+def test_read_frame_reassembles_fragmented_message():
+    from browser_bridge.server import _read_frame, _BufferedSocketReader
+
+    body = b'{"v":1,"type":"progress","payload":"' + b"x" * 400 + b'"}'
+    wire = (
+        _masked_frame(0x1, body[:100], fin=False)
+        + _masked_frame(0x0, body[100:300], fin=False)
+        + _masked_frame(0x0, body[300:], fin=True)
+    )
+    opcode, payload = _read_frame(_BufferedSocketReader(_DripSocket(wire)))
+    assert opcode == 0x1
+    assert payload == body
+
+
+def test_read_frame_keeps_message_across_interleaved_ping():
+    from browser_bridge.server import _read_frame, _BufferedSocketReader
+
+    seen: list[tuple[int, bytes]] = []
+    body = b'{"v":1,"type":"checkpoint","n":1}'
+    wire = (
+        _masked_frame(0x1, body[:10], fin=False)
+        + _masked_frame(0x9, b"ping-payload")          # interleaved control frame
+        + _masked_frame(0x0, body[10:], fin=True)
+    )
+    opcode, payload = _read_frame(
+        _BufferedSocketReader(_DripSocket(wire)),
+        on_control=lambda op, data: seen.append((op, data)),
+    )
+    assert (opcode, payload) == (0x1, body)
+    assert seen == [(0x9, b"ping-payload")]
+
+
+def test_read_frame_rejects_oversized_fragmented_message():
+    from browser_bridge.server import _read_frame, _BufferedSocketReader, WebSocketProtocolError
+
+    wire = (
+        _masked_frame(0x1, b"a" * 100, fin=False)
+        + _masked_frame(0x0, b"b" * 100, fin=True)
+    )
+    with pytest.raises(WebSocketProtocolError):
+        _read_frame(_BufferedSocketReader(_DripSocket(wire)), max_bytes=150)
+
+
+def test_read_frame_rejects_continuation_without_start():
+    from browser_bridge.server import _read_frame, _BufferedSocketReader, WebSocketProtocolError
+
+    wire = _masked_frame(0x0, b"orphan", fin=True)
+    opcode, payload = _read_frame(_BufferedSocketReader(_DripSocket(wire)))
+    # A lone continuation frame is passed through as-is; the frame loop only accepts text.
+    assert opcode == 0x0
+
+
 
 
 
