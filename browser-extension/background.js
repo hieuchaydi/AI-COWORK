@@ -2135,21 +2135,28 @@ async function captureTabEvidence(tabId) {
     // 2. Dự phòng bằng Chrome Debugger API Page.captureScreenshot (luôn hoạt động)
     if (chrome.debugger?.attach && chrome.debugger?.sendCommand && chrome.debugger?.detach) {
       const target = { tabId: targetId };
-      let attached = false;
-      try {
-        await chrome.debugger.attach(target, "1.3");
-        attached = true;
-        const res = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", { format: "png" });
-        if (res?.data) {
-          return `data:image/png;base64,${res.data}`;
+      return await withDebuggerLock(async () => {
+        const session = await attachDebuggerSession(target);
+        if (!session.ok) {
+          console.warn("[bridge] Debugger Page.captureScreenshot attach failed:", session.error);
+          return null;
         }
-      } catch (dbgErr) {
-        console.warn("[bridge] Debugger Page.captureScreenshot failed:", dbgErr?.message || dbgErr);
-      } finally {
-        if (attached) {
-          try { await chrome.debugger.detach(target); } catch {}
+        let attached = true;
+        try {
+          const res = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", { format: "png" });
+          if (res?.data) {
+            return `data:image/png;base64,${res.data}`;
+          }
+          return null;
+        } catch (dbgErr) {
+          console.warn("[bridge] Debugger Page.captureScreenshot failed:", dbgErr?.message || dbgErr);
+          return null;
+        } finally {
+          if (attached) {
+            try { await chrome.debugger.detach(target); } catch {}
+          }
         }
-      }
+      });
     }
     return null;
   } catch (err) {
@@ -2490,6 +2497,8 @@ async function calculatePuzzleDistance(tabId, sliderInfo, attempt = 1) {
             bridgeLog("warn", "cv solver unavailable:", String(cvData.error || "unknown error"));
           }
         }
+      } else {
+        bridgeLog("warn", "no screenshot for CV solver (capture failed) — falling back to DOM heuristics");
       }
     } catch (cvErr) {
       console.warn("[bridge] CV puzzle solver call failed, falling back to heuristics:", cvErr?.message || cvErr);
@@ -2568,6 +2577,19 @@ function generateHumanTrajectory(startX, startY, distance) {
  * the CAPTCHA drag to synthetic DOM events (isTrusted=false). Shopee's anti-bot rejects those,
  * so the slider looks almost right on screen but never validates.
  */
+// chrome.debugger allows exactly one session per tab. The verification watcher (every 2.5s),
+// a manual captcha.solve and the screenshot fallback all attach/detach the same tab, so two
+// overlapping sessions detach each other mid-command:
+//     debugger drag failed: Detached while handling command.
+//     debugger drag failed: Debugger is not attached to the tab with id: NNN
+// Every session now runs through this queue.
+let debuggerChain = Promise.resolve();
+function withDebuggerLock(task) {
+  const run = debuggerChain.then(task, task);
+  debuggerChain = run.then(() => {}, () => {});
+  return run;
+}
+
 async function attachDebuggerSession(target, { retry = true } = {}) {
   try {
     await chrome.debugger.attach(target, "1.3");
@@ -2838,40 +2860,38 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
   let debuggerError = null;
   if (chrome.debugger?.attach && chrome.debugger?.sendCommand && chrome.debugger?.detach) {
     const target = { tabId };
-    let attached = false;
-    const session = await attachDebuggerSession(target);
-    if (!session.ok) {
-      debuggerError = session.error;
-      console.warn("[bridge] Debugger attach failed; slider input would be untrusted:", debuggerError);
-      bridgeLog("warn", "debugger attach failed:", debuggerError);
-    }
-    try {
-      if (!session.ok) throw new Error(debuggerError);
-      attached = true;
-      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: startX, y: startY, button: "none" });
-      await new Promise((r) => setTimeout(r, 60 + Math.random() * 40));
-      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mousePressed", x: startX, y: startY, button: "left", clickCount: 1 });
-      for (const point of points) {
-        await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y, button: "left", buttons: 1 });
-        await new Promise((r) => setTimeout(r, point.delay));
+    const outcome = await withDebuggerLock(async () => {
+      let attached = false;
+      const session = await attachDebuggerSession(target);
+      if (!session.ok) return { error: session.error, result: null };
+      try {
+        attached = true;
+        await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: startX, y: startY, button: "none" });
+        await new Promise((r) => setTimeout(r, 60 + Math.random() * 40));
+        await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mousePressed", x: startX, y: startY, button: "left", clickCount: 1 });
+        for (const point of points) {
+          await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y, button: "left", buttons: 1 });
+          await new Promise((r) => setTimeout(r, point.delay));
+        }
+        await new Promise((r) => setTimeout(r, 90 + Math.random() * 40));
+        await new Promise((r) => setTimeout(r, 140 + Math.random() * 40));
+        // Dừng nghỉ ổn định (Settle delay) để DOM và anti-bot script ghi nhận mảnh ghép đã khớp hoàn toàn
+        await new Promise((r) => setTimeout(r, 150 + Math.random() * 50));
+        await new Promise((r) => setTimeout(r, 140 + Math.random() * 50));
+        await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: startY, button: "left", clickCount: 1 });
+        return { error: null, result: { attempted: true, method: "debugger", startX, startY, endX, distance } };
+      } catch (err) {
+        return { error: String(err?.message || err), result: null };
+      } finally {
+        if (attached) {
+          try { await chrome.debugger.detach(target); } catch {}
+        }
       }
-      await new Promise((r) => setTimeout(r, 90 + Math.random() * 40));
-      await new Promise((r) => setTimeout(r, 140 + Math.random() * 40));
-      // Dừng nghỉ ổn định (Settle delay) để DOM và anti-bot script ghi nhận mảnh ghép đã khớp hoàn toàn
-      await new Promise((r) => setTimeout(r, 150 + Math.random() * 50));
-      // Dừng nghỉ ổn định (Settle delay: 140-190ms) để DOM và anti-bot script ghi nhận mảnh ghép đã khớp hoàn toàn
-      await new Promise((r) => setTimeout(r, 140 + Math.random() * 50));
-      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: startY, button: "left", clickCount: 1 });
-      return { attempted: true, method: "debugger", startX, startY, endX, distance };
-    } catch (err) {
-      debuggerError = String(err?.message || err);
-      console.warn("[bridge] Debugger slider drag failed:", debuggerError);
-      bridgeLog("warn", "debugger drag failed:", debuggerError);
-    } finally {
-      if (attached) {
-        try { await chrome.debugger.detach(target); } catch {}
-      }
-    }
+    });
+    if (outcome.result) return outcome.result;
+    debuggerError = outcome.error;
+    console.warn("[bridge] Debugger slider drag failed:", debuggerError);
+    bridgeLog("warn", "debugger drag failed:", debuggerError);
   }
 
   // P1-4: DOM synthetic events fallback (warning: isTrusted=false, Shopee anti-bot usually rejects synthetic events)
@@ -3980,10 +4000,12 @@ async function handleAction(action, params) {
         let debuggerError = "chrome.debugger unavailable";
         if (chrome.debugger?.attach && chrome.debugger?.sendCommand && chrome.debugger?.detach) {
           const target = { tabId: targetTabId };
-          const session = await attachDebuggerSession(target);
-          if (!session.ok) {
-            debuggerError = session.error;
-          } else {
+          await withDebuggerLock(async () => {
+            const session = await attachDebuggerSession(target);
+            if (!session.ok) {
+              debuggerError = session.error;
+              return;
+            }
             let attached = true;
             try {
               const res = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
@@ -4002,7 +4024,7 @@ async function handleAction(action, params) {
                 try { await chrome.debugger.detach(target); } catch {}
               }
             }
-          }
+          });
         }
         if (!dataUrl) {
           throw new Error(`captureVisibleTab: ${captureError}; debugger: ${debuggerError}`);
