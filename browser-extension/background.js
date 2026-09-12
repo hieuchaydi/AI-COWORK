@@ -3075,8 +3075,13 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
     bridgeLog("warn", "debugger drag failed:", debuggerError);
   }
 
-  // P1-4: DOM synthetic events fallback (warning: isTrusted=false, Shopee anti-bot usually rejects synthetic events)
-  if (chrome.scripting?.executeScript) {
+  // P1-4: DOM synthetic events fallback.
+  // Shopee's validator only accepts trusted input: the page *renders* a synthetic drag landing
+  // in the cut-out ("it looks right") but the submit is refused, and each rejected drag also
+  // regenerates the puzzle and burns one of the ~3 attempts before the challenge locks. So this
+  // path stays off unless someone explicitly wants a visual rehearsal.
+  const allowUntrustedDrag = false;
+  if (allowUntrustedDrag && chrome.scripting?.executeScript) {
     console.warn("[bridge] Debugger unavailable; falling back to synthetic DOM mouse events (isTrusted=false, may be rejected by Shopee anti-bot)");
     const [res] = await chrome.scripting.executeScript({
       target: { tabId },
@@ -3111,7 +3116,12 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
     return untrusted;
   }
 
-  return { attempted: false, reason: "no_input_backend", debuggerError };
+  // No trusted input available: report it instead of rehearsing the drag with synthetic events
+  // (which Shopee rejects and which costs one of the challenge's few attempts).
+  if (chrome.scripting?.executeScript) {
+    bridgeLog("warn", "captcha drag skipped: trusted debugger input unavailable", String(debuggerError || "no debugger"));
+  }
+  return { attempted: false, reason: "trusted_input_unavailable", distance, debuggerError };
 }
 
 async function detectCaptchaInTab(tabId, options = {}) {
