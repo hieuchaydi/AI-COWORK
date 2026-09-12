@@ -3013,6 +3013,20 @@ async function tryAutoDragShopeeCaptcha(tabId, detection, options = {}) {
   let debuggerError = null;
   if (chrome.debugger?.attach && chrome.debugger?.sendCommand && chrome.debugger?.detach) {
     const target = { tabId };
+    // CDP input dispatch is queued while the tab's *window* is not focused: a trusted drag then
+    // sits until it times out (and the untrusted DOM fallback still "works", because synthetic
+    // events don't need focus — which is exactly the "it drags into place but Gửi rejects" case).
+    // Bring the tab forward first, like a human would.
+    try {
+      const tabInfo = await chrome.tabs.get(tabId);
+      await chrome.tabs.update(tabId, { active: true });
+      if (tabInfo?.windowId && chrome.windows?.update) {
+        await chrome.windows.update(tabInfo.windowId, { focused: true });
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    } catch (focusErr) {
+      bridgeLog("warn", "could not focus the challenge tab before dragging:", String(focusErr?.message || focusErr));
+    }
     const outcome = await withDebuggerLock(async () => {
       let attached = false;
       let sessionToken = null;
