@@ -47,7 +47,11 @@ async function worker(options = {}) {
           }
           return Promise.resolve(result);
         },
-        set: async value => { Object.assign(stored, value); },
+        set: (value, callback) => {
+          Object.assign(stored, value);
+          if (typeof callback === 'function') callback();
+          return Promise.resolve();
+        },
         remove: async keys => {
           for (const key of Array.isArray(keys) ? keys : [keys]) delete stored[key];
         },
@@ -207,6 +211,36 @@ test('manual disconnect persists and prevents alarm reconnect', async () => {
   assert.equal(timeouts.size, 0);
   const restarted = await worker({ stored });
   assert.equal(restarted.sockets.length, 0);
+});
+
+test('autoPair wakes a live socket instead of orphaning it', async () => {
+  // Regression: the content script fires autoPair on every Shopee page load (document_start).
+  // Bumping connectionGeneration while a socket is open made ownsSocket() false, so the
+  // service worker silently ignored every inbound frame (commands, verification.resolved,
+  // extension.reload) while its crawl kept streaming progress — the gateway saw a healthy
+  // client that never answered, and the CAPTCHA pause never resolved.
+  const { context, sockets, frames, getMessageListener } = await worker();
+  sockets[0].onopen();
+  assert.equal(vm.runInContext('bridgeSocket.readyState', context), 1);
+
+  let response;
+  assert.equal(getMessageListener()({ action: 'autoPair' }, {}, value => { response = value; }), true);
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(response.ok, true);
+  assert.equal(response.reused, true);
+  assert.equal(sockets.length, 1, 'autoPair must not open a second socket');
+  assert.equal(vm.runInContext('bridgeSocket.readyState', context), 1);
+
+  // An inbound command must still be dispatched and answered on the live socket.
+  const before = frames.length;
+  sockets[0].onmessage({ data: JSON.stringify({
+    v: 1, type: 'command', id: 'cmd-auto-pair', action: 'browser.health', params: {}, deadlineMs: 5000,
+  }) });
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  const answered = frames.slice(before).some(frame => frame.id === 'cmd-auto-pair' && frame.type === 'result');
+  assert.equal(answered, true, 'the live socket must still receive commands after autoPair');
 });
 
 test('connect saves new configuration before pairing and clears stale callbacks', async () => {

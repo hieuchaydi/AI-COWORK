@@ -4722,16 +4722,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
   if (msg.action === "autoPair") {
-    connectionGeneration++;
+    // A live socket must survive this wake-up. Bumping connectionGeneration here used to
+    // orphan it: ownsSocket() compares the socket's captured generation with the current one,
+    // so every inbound frame (commands, verification.resolved, extension.reload) was silently
+    // dropped while outgoing crawl progress kept flowing — the gateway saw a healthy client
+    // that never answered, the Shopee CAPTCHA was never solved and the job hung in
+    // awaiting_user_verification forever. connectBridge() would not have replaced it either:
+    // it returns early whenever the socket is not CLOSED.
     connectionEnabled = true;
     const updates = { connectionEnabled: true, connectionConflict: null, lastConnectionError: "" };
     if (typeof msg.url === "string" && msg.url.trim()) {
       updates.gatewayUrl = msg.url.trim();
     }
     chrome.storage.local.set(updates, () => {
+      if (bridgeSocket && bridgeSocket.readyState !== WebSocket.CLOSED) {
+        sendResponse({ ok: true, reused: true });
+        return;
+      }
+      connectionGeneration++;
       connectBridge();
+      sendResponse({ ok: true });
     });
-    sendResponse({ ok: true });
     return true;
   }
   if (msg.action === "connect" || msg.action === "disconnect") {
